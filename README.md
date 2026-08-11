@@ -78,4 +78,5 @@ Unit tests cover synth/DSP math and the WAV exporter, but can't prove the live a
 
 ## License
 
-No license file yet — all rights reserved by default until one is added.
+GNU GENERAL PUBLIC LICENSE Version 3
+
