@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Effects — simple-daw</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="index.html">simple-daw</a>
+    <a href="index.html">Overview &amp; Setup</a>
+    <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">Synth Engines</a>
+    <a href="effects.html" class="active">Effects</a>
+    <a href="audio-and-io.html">Audio, MIDI &amp; Files</a>
+    <a href="ai-control.html">AI Control (MCP)</a>
+  </nav>
+  <main>
+    <h1>Effects</h1>
+    <p class="lead">Effects can be inserted per track and on the master bus, mixing built-in DSP
+      with hosted CLAP plugins.</p>
+
+    <h2>Built-in effects</h2>
+    <p>Available from any FX chain's <strong>+ Add Effect</strong> menu:</p>
+    <div class="card-grid">
+      <div class="card"><h4>Delay</h4></div>
+      <div class="card"><h4>Bitcrusher</h4></div>
+      <div class="card"><h4>Distortion</h4></div>
+      <div class="card"><h4>Reverb</h4></div>
+      <div class="card"><h4>Chorus</h4></div>
+      <div class="card"><h4>Filter</h4></div>
+      <div class="card"><h4>Tremolo</h4></div>
+      <div class="card"><h4>Compressor</h4></div>
+      <div class="card"><h4>Flanger</h4></div>
+      <div class="card"><h4>Phaser</h4></div>
+      <div class="card"><h4>Ring Modulator</h4></div>
+      <div class="card"><h4>Noise Gate</h4></div>
+    </div>
+
+    <h2>Per-track FX chain</h2>
+    <p>Open a track's <strong>FX</strong> menu from its Channel Rack row. Effects added there run
+      in order, on that track's signal only. Each slot shows a <strong>Params</strong> button (to
+      edit the effect), any load/status message, and a remove button.</p>
+
+    <h2>Master bus FX</h2>
+    <p>The master bus has its own effect chain, applied after every track has been mixed together,
+      configured the same way as a per-track chain.</p>
+
+    <h2>CLAP plugin hosting</h2>
+    <p>Any FX slot (per-track or master) can instead host a CLAP plugin:</p>
+    <ul>
+      <li><strong>+ Add Effect → CLAP Plugin…</strong> creates an empty slot, then either browse
+        for a <code>.clap</code> file on disk or pick one from the project's plugin library.</li>
+      <li>Once loaded, its <strong>Params</strong> button opens a generic parameter window built
+        from the plugin's own declared CLAP parameters.</li>
+    </ul>
+    <div class="note warn">
+      CLAP hosting is intentionally minimal: there's no plugin-native GUI (only the generic
+      host-side Params window), no host-side automation of plugin parameters, and no unloading a
+      plugin once it's loaded mid-session.
+    </div>
+    <p>Loaded plugin paths and their parameter values are saved with the song (see
+      <a href="audio-and-io.html">Audio, MIDI &amp; Files</a>) and restored on load.</p>
+    <div class="note">
+      WAV export (bounce) is dry-only — CLAP effects are not included in the exported file, only
+      the built-in synths, samples, and step/note sequencing.
+    </div>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

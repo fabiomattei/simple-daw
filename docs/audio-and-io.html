@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audio, MIDI &amp; Files — simple-daw</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="index.html">simple-daw</a>
+    <a href="index.html">Overview &amp; Setup</a>
+    <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">Synth Engines</a>
+    <a href="effects.html">Effects</a>
+    <a href="audio-and-io.html" class="active">Audio, MIDI &amp; Files</a>
+    <a href="ai-control.html">AI Control (MCP)</a>
+  </nav>
+  <main>
+    <h1>Audio, MIDI &amp; Files</h1>
+    <p class="lead">Sample playback, recording and importing audio, MIDI import, and getting a
+      song in and out of the app.</p>
+
+    <h2>Sample playback</h2>
+    <p>Any Step Grid lane can be backed by a loaded WAV sample instead of a synth, via the
+      sample-load controls on that lane's row in the Beats window. Samples play through a
+      per-track 32-voice one-shot pool, resampled to the output device's sample rate at load time.
+      A loaded sample always takes priority over a synth on that lane.</p>
+
+    <h2>Audio tracks</h2>
+    <p>An Audio track holds recorded or imported WAV clips positioned on the Playlist timeline,
+      the audio equivalent of a Step Grid/Piano Roll track's Regions.</p>
+    <ul>
+      <li>A newly-created Audio track is armed for recording automatically; use the
+        <strong>Input</strong> device picker on its Channel Rack row to choose a source (or leave
+        it on Default).</li>
+      <li>The toolbar's <strong>⏺ Record</strong> button starts/stops recording live input
+        straight to a WAV file, dropped onto the armed track's timeline as a clip. A level meter
+        shows input while recording.</li>
+      <li>To bring in an existing WAV file instead, import it the same way onto an Audio track.</li>
+    </ul>
+
+    <h2>MIDI import</h2>
+    <p>Use <strong>File → Import MIDI…</strong> to load a standard <code>.mid</code> file into a
+      track's Piano Roll. There's an option to also apply the file's detected tempo to the song's
+      BPM.</p>
+
+    <h2>Saving and loading songs</h2>
+    <p>The whole song — tracks, Regions, sample paths, loaded effect paths and their parameter
+      values — round-trips through the <strong>File</strong> menu as a JSON file:</p>
+    <ul>
+      <li><strong>Load…</strong> — open a song file.</li>
+      <li><strong>Save</strong> — save to the currently-open path.</li>
+      <li><strong>Save As…</strong> — save to a new path.</li>
+    </ul>
+    <p>Old save files predating the Region-based model still load, migrated automatically.</p>
+
+    <h2>WAV export</h2>
+    <p><strong>File → Export…</strong> opens the export dialog: set an output path and a loop
+      count (how many times the arrangement repeats in the bounced file), then click
+      <strong>Export</strong>.</p>
+    <div class="note">
+      Export reuses the exact same sequencing/mixing code as live playback, but it's dry only —
+      CLAP effects aren't included in the bounce (see <a href="effects.html">Effects</a>).
+    </div>
+
+    <h2>Transport &amp; output device</h2>
+    <p>The top toolbar has the main transport (<strong>▶/⏹</strong> play/stop, <strong>⏺</strong>
+      record, <strong>🔔</strong> metronome toggle) and, on the right, pickers for the output audio
+      device and its sample rate — switching either restarts the audio engine.</p>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

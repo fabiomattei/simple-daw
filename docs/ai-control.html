@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Control (MCP) — simple-daw</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="index.html">simple-daw</a>
+    <a href="index.html">Overview &amp; Setup</a>
+    <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">Synth Engines</a>
+    <a href="effects.html">Effects</a>
+    <a href="audio-and-io.html">Audio, MIDI &amp; Files</a>
+    <a href="ai-control.html" class="active">AI Control (MCP)</a>
+  </nav>
+  <main>
+    <h1>AI Control (MCP)</h1>
+    <p class="lead">Let an LLM (Claude Desktop, Claude Code, or any other MCP-capable client) drive
+      a running <strong>simple-daw</strong> instance directly — add tracks, program a beat, tweak
+      a synth patch, hit play — through a small local companion process.</p>
+
+    <h2>How it works</h2>
+    <p>Two pieces, both running entirely on your machine:</p>
+    <ul>
+      <li><strong>simple-daw itself</strong> opens a local control socket in the background as
+        soon as it starts (a Unix domain socket at
+        <code>$TMPDIR/simple-daw.sock</code>). Any command it receives is applied to the live song
+        through the same code paths the UI uses, so changes appear on screen — and play back —
+        immediately.</li>
+      <li><strong>simple-daw-mcp</strong> is a separate binary built from the same repository. It
+        speaks the Model Context Protocol over stdio to whatever launched it (Claude Desktop,
+        Claude Code, etc.) and forwards each tool call to that socket.</li>
+    </ul>
+    <div class="note">
+      Nothing about the song leaves your machine through this feature. <code>simple-daw</code> and
+      <code>simple-daw-mcp</code> talk over a local socket only — whether the LLM host itself
+      sends your conversation to a cloud API is a separate matter, unrelated to this integration.
+    </div>
+
+    <h2>Requirements</h2>
+    <ul>
+      <li>macOS or Linux — the control socket is Unix-domain-only. It's simply not compiled in on
+        other platforms.</li>
+      <li><strong>simple-daw must already be running</strong> before a tool call is made; the
+        companion binary doesn't launch it for you.</li>
+      <li>Only one <code>simple-daw</code> instance at a time — the socket path is fixed, so a
+        second instance would fight the first for it.</li>
+    </ul>
+
+    <h2>Setup</h2>
+    <p>Build both binaries:</p>
+    <pre><code>cargo build --release</code></pre>
+    <p>This produces <code>target/release/simple-daw</code> (the app) and
+      <code>target/release/simple-daw-mcp</code> (the MCP server) side by side.</p>
+
+    <p>Point your MCP client at <code>simple-daw-mcp</code>. For Claude Desktop, add it to the
+      MCP servers section of the app's config file:</p>
+    <pre><code>{
+  "mcpServers": {
+    "simple-daw": {
+      "command": "/absolute/path/to/target/release/simple-daw-mcp"
+    }
+  }
+}</code></pre>
+    <p>Restart the MCP client after editing its config, launch <code>simple-daw</code>, and the
+      tools below become available in your conversation.</p>
+
+    <h2>Using it</h2>
+    <p>Once connected, you can ask in plain language and the model will call the tools it needs,
+      for example:</p>
+    <ul>
+      <li>"Add a step-grid track called Drums and program a basic four-on-the-floor kick pattern."</li>
+      <li>"What tracks are in the song right now?"</li>
+      <li>"Set the tempo to 128 BPM and hit play."</li>
+      <li>"Apply the Warm Pad preset to track 2."</li>
+      <li>"Export the song to <code>~/Desktop/demo.wav</code>, looping it twice."</li>
+    </ul>
+    <div class="note">
+      Tracks, regions, lanes and steps are all referenced by <strong>0-based index</strong> — the
+      same indices <code>list_tracks</code>/<code>list_presets</code> report. Ask the model to
+      list tracks first if you're not sure which index something is.
+    </div>
+
+    <h2>Available tools</h2>
+    <table>
+      <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>list_tracks</code></td><td>List every track — name, kind, mute/solo, volume, synth engine.</td></tr>
+        <tr><td><code>add_track</code></td><td>Add a track (<code>step_grid</code>, <code>piano_roll</code>, or <code>audio</code>). Returns its index.</td></tr>
+        <tr><td><code>remove_track</code></td><td>Delete a track and everything it owns.</td></tr>
+        <tr><td><code>set_track_volume</code></td><td>Set a track's mix volume.</td></tr>
+        <tr><td><code>set_track_mute</code></td><td>Mute/unmute a track.</td></tr>
+        <tr><td><code>set_track_solo</code></td><td>Solo/unsolo a track.</td></tr>
+        <tr><td><code>add_region</code></td><td>Add a one-bar region to a track at a given step. Returns its index.</td></tr>
+        <tr><td><code>add_lane</code></td><td>Add a step-grid lane (e.g. a drum voice) to every region on a track.</td></tr>
+        <tr><td><code>set_step</code></td><td>Set or clear one step in a step-grid lane — the core beat-programming tool.</td></tr>
+        <tr><td><code>add_note</code></td><td>Add a note to a piano-roll region.</td></tr>
+        <tr><td><code>list_presets</code></td><td>List factory and song-local synth presets, optionally filtered by engine.</td></tr>
+        <tr><td><code>apply_preset</code></td><td>Apply a preset to a track by name, switching its synth engine to match.</td></tr>
+        <tr><td><code>set_bpm</code></td><td>Set the song's tempo.</td></tr>
+        <tr><td><code>play</code> / <code>stop</code></td><td>Start/stop playback.</td></tr>
+        <tr><td><code>get_playback_state</code></td><td>Whether the song is playing, the playhead position, bpm, song name.</td></tr>
+        <tr><td><code>save_song</code></td><td>Save the song to a JSON file at the given path.</td></tr>
+        <tr><td><code>load_song</code></td><td>Load a song from a JSON file, replacing the currently open one.</td></tr>
+        <tr><td><code>export_wav</code></td><td>Bounce the song to a WAV file (dry mix, no CLAP effects — same scope cut as
+          <a href="audio-and-io.html">manual export</a>).</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Current limitations</h2>
+    <div class="note warn">
+      <ul>
+        <li>No tool yet for loading or configuring CLAP effects — that's still UI-only (see
+          <a href="effects.html">Effects</a>).</li>
+        <li><code>load_song</code>/<code>save_song</code> mirror the File menu's Load/Save, but
+          there's no MCP equivalent of Save As — it always writes to the given path.</li>
+        <li>Audio-track clips (recording/importing WAV) aren't exposed as tools yet; use the app's
+          own <a href="audio-and-io.html">recording workflow</a> for those.</li>
+      </ul>
+    </div>
+
+    <h2>Troubleshooting</h2>
+    <table>
+      <thead><tr><th>Symptom</th><th>Likely cause</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Tool calls fail with "couldn't reach simple-daw … is the app running?"</td>
+          <td>Launch <code>simple-daw</code> first — the companion binary only forwards to an
+            already-running instance.</td>
+        </tr>
+        <tr>
+          <td>A tool call errors with something like "no track at index 3"</td>
+          <td>Indices shifted since you last checked — call <code>list_tracks</code> (or
+            <code>list_presets</code>) again before referencing one.</td>
+        </tr>
+        <tr>
+          <td>Nothing happens after restarting <code>simple-daw</code></td>
+          <td>A stale socket file from a crashed previous run can linger; the app removes and
+            re-binds it on startup automatically, so this normally resolves itself — if not,
+            quit every <code>simple-daw</code> process and relaunch one.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

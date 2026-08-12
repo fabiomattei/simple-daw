@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tracks &amp; Playlist — simple-daw</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="index.html">simple-daw</a>
+    <a href="index.html">Overview &amp; Setup</a>
+    <a href="tracks-and-playlist.html" class="active">Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">Synth Engines</a>
+    <a href="effects.html">Effects</a>
+    <a href="audio-and-io.html">Audio, MIDI &amp; Files</a>
+    <a href="ai-control.html">AI Control (MCP)</a>
+  </nav>
+  <main>
+    <h1>Tracks &amp; Playlist</h1>
+    <p class="lead">How tracks are created, arranged in time, and edited.</p>
+
+    <h2>The Channel Rack</h2>
+    <p>The Channel Rack (dockable left panel, or its own detached window) is where tracks are
+      created and managed. Use <strong>+ Add</strong> to create one of three track kinds:</p>
+    <div class="card-grid">
+      <div class="card">
+        <h4>Piano Roll Track</h4>
+        <p>Free-form melodic editing — its Regions hold Notes.</p>
+      </div>
+      <div class="card">
+        <h4>Step Grid Track</h4>
+        <p>Drum-machine style lanes and steps — its Regions hold a step grid.</p>
+      </div>
+      <div class="card">
+        <h4>Audio Track</h4>
+        <p>Holds recorded or imported WAV clips instead of Regions. Newly added, it's immediately
+          armed for recording.</p>
+      </div>
+    </div>
+
+    <p>Each row in the rack shows the track name, and:</p>
+    <ul>
+      <li><strong>M</strong> — mute the track.</li>
+      <li><strong>S</strong> — solo the track.</li>
+      <li><strong>FX</strong> — open the track's effect chain menu (see <a href="effects.html">Effects</a>).</li>
+      <li><strong>✕</strong> — delete the track.</li>
+      <li>For Audio tracks, an <strong>Input</strong> device picker appears while the track is armed.</li>
+    </ul>
+    <p>Clicking a Piano Roll or Step Grid track's row selects it as the target for its respective
+      editor window; the row is highlighted while selected.</p>
+
+    <h2>The Playlist</h2>
+    <p>The Playlist is the song-wide arrangement timeline. Each track owns its own independent
+      Regions positioned along its row — placing similar material twice always means two
+      independent copies, never a shared reference (unlike FL Studio–style patterns).</p>
+    <ul>
+      <li><strong>Click empty space</strong> on a track's row — create a new Region there.</li>
+      <li><strong>Drag a Region's right edge</strong> — resize it: shorter truncates its content,
+        longer loops it.</li>
+      <li><strong>Drag a Region's body</strong> — move it in time.</li>
+      <li><strong>Double-click a Region</strong> — open it in the Piano Roll or Beats window for
+        editing.</li>
+      <li><strong>Right-click a Region</strong> — remove it.</li>
+    </ul>
+    <p>Audio tracks get their own row for their recorded/imported clips instead of Regions — the
+      two kinds never share a row. The <strong>Zoom</strong> slider at the top of the Playlist
+      scales the whole timeline.</p>
+
+    <h2>The Beats window (step grid)</h2>
+    <p>Double-clicking a Step Grid track's Region opens it in the always-detached Beats window.</p>
+    <ul>
+      <li><strong>+ Lane</strong> — add a new lane to the grid.</li>
+      <li>Each lane has a name, a MIDI pitch (used when the lane is driven by a synth rather than
+        a sample), a <strong>🎹</strong> button to give the lane its own synth engine/patch that
+        overrides the track's, sample-load controls, and its row of step buttons.</li>
+      <li>Click a step to toggle it on/off. Active steps default to velocity 100.</li>
+      <li>If a lane has a loaded sample, that sample always takes priority over any synth
+        (the lane's own, or the track's) when that lane plays.</li>
+    </ul>
+
+    <h2>The Piano Roll</h2>
+    <p>Double-clicking a Piano Roll track's Region opens it in the Piano Roll window: pitch on the
+      vertical axis, time on the horizontal axis, drawn on a free-form canvas.</p>
+    <table>
+      <thead><tr><th>Gesture</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>Click empty space</td><td>Drop a note at the default length (set via the "Length" buttons).</td></tr>
+        <tr><td>Click-drag from empty space</td><td>Draw a new note out to any length.</td></tr>
+        <tr><td>Drag a note's body</td><td>Move it (pitch and time).</td></tr>
+        <tr><td>Drag a note's right edge</td><td>Resize it (hover near the edge for the resize cursor).</td></tr>
+        <tr><td>Click a note</td><td>Select only that note.</td></tr>
+        <tr><td>Ctrl/Cmd-click a note</td><td>Toggle it into/out of the current selection.</td></tr>
+        <tr><td>Shift-drag from empty space</td><td>Rubber-band select every note it touches.</td></tr>
+        <tr><td>Drag within a multi-note selection</td><td>Move the whole selection together.</td></tr>
+        <tr><td>Right-click a note</td><td>Delete it (or the whole selection, if it's part of one).</td></tr>
+        <tr><td>Delete / Backspace</td><td>Delete the current selection.</td></tr>
+      </tbody>
+    </table>
+    <p>A note's velocity is set from the velocity lane below the grid — drag a note's bar up or
+      down. The roll grows automatically as notes reach its right edge. The <strong>Zoom</strong>
+      and <strong>Roll height</strong> controls in the top toolbar resize every track's piano roll
+      at once.</p>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

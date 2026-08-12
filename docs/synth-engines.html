@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Synth Engines — simple-daw</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="index.html">simple-daw</a>
+    <a href="index.html">Overview &amp; Setup</a>
+    <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a>
+    <a href="synth-engines.html" class="active">Synth Engines</a>
+    <a href="effects.html">Effects</a>
+    <a href="audio-and-io.html">Audio, MIDI &amp; Files</a>
+    <a href="ai-control.html">AI Control (MCP)</a>
+  </nav>
+  <main>
+    <h1>Synth Engines</h1>
+    <p class="lead">Every track picks one of three independently-parameterized synth engines.
+      They're parallel options, not layers stacked on top of each other.</p>
+
+    <table>
+      <thead><tr><th>Engine</th><th>Character</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Simple</strong></td>
+          <td>The original engine: a sine-family oscillator with an exponential-decay envelope.
+            Percussive only — good for kicks, claps, simple blips.</td>
+        </tr>
+        <tr>
+          <td><strong>Trine</strong></td>
+          <td>Multi-oscillator, with a filter and modulation matrix (mod sources routed to mod
+            targets via configurable slots). The most flexible general-purpose engine.</td>
+        </tr>
+        <tr>
+          <td><strong>Wave</strong></td>
+          <td>Two wavetable oscillators with position-morphing and phase-warp, built on the same
+            dual-filter/mod-matrix machinery as Trine.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Pick a track's engine from its editor panel; each engine has its own parameter layout
+      tailored to how it synthesizes sound.</p>
+
+    <h2>Presets</h2>
+    <p>Each track's synth editor has a <strong>Preset</strong> picker, split into two groups:</p>
+    <ul>
+      <li><strong>Factory</strong> — the built-in preset library shipped with the app (several
+        patches per engine: leads, pads, basses, plucks, FX). Not saved into your song file —
+        they're always available.</li>
+      <li><strong>Custom</strong> — presets you've saved or imported into the current song. These
+        <em>are</em> saved with the song.</li>
+    </ul>
+    <p>Selecting a preset from either group loads its parameters into the track's current engine.
+      Use <strong>Import…</strong> to load a preset from a standalone JSON file.</p>
+
+    <h2>Per-lane synth override</h2>
+    <p>Inside a Step Grid track's Beats window, each lane has a <strong>🎹</strong> button. Enabling
+      it gives that one lane its own synth engine and patch, completely independent of the track's
+      synth — so a single step-grid track can, for example, play a kick patch on one lane and a
+      hi-hat patch on another. A lane's loaded sample (if any) still takes priority over both its
+      own synth and the track's.</p>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

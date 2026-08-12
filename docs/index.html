@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>simple-daw — Documentation</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="index.html">simple-daw</a>
+    <a href="index.html" class="active">Overview &amp; Setup</a>
+    <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">Synth Engines</a>
+    <a href="effects.html">Effects</a>
+    <a href="audio-and-io.html">Audio, MIDI &amp; Files</a>
+    <a href="ai-control.html">AI Control (MCP)</a>
+  </nav>
+  <main>
+    <h1>simple-daw</h1>
+    <p class="lead">A native Rust MIDI sequencer / groovebox for composing video game music — deliberately
+      not a general-purpose DAW.</p>
+
+    <p>Its scope is narrow and on purpose: a step sequencer, a piano roll, three built-in synth
+      engines, sample playback, a Logic/Ableton-style Playlist timeline, WAV bounce, MIDI import,
+      JSON song persistence, and CLAP effect hosting. This site walks through how to use each part
+      of the app.</p>
+
+    <h2>Prerequisites</h2>
+    <ul>
+      <li>A Rust toolchain, installed via <a href="https://rustup.rs/">rustup</a>.</li>
+      <li>On Linux: ALSA development headers for cpal's audio backend
+        (<code>alsa-lib-devel</code> on Fedora, <code>libasound2-dev</code> on Debian/Ubuntu).</li>
+      <li>Optional: a <code>.clap</code> plugin on disk if you want to try CLAP effect hosting —
+        none ship with the repo. See <a href="effects.html">Effects</a>.</li>
+    </ul>
+
+    <h2>Build &amp; run</h2>
+    <pre><code>cargo build       # debug build
+cargo run         # launch the GUI app</code></pre>
+
+    <h2>Tests</h2>
+    <pre><code>cargo test              # unit tests: audio DSP math, model editing logic, WAV export
+cargo test &lt;test_name&gt;  # run a single test</code></pre>
+    <div class="note">
+      Unit tests cover synth/DSP math and the WAV exporter, but can't prove the live audio path
+      actually produces sound. There's no automated harness for that — audio-affecting changes
+      should be verified by running the app and listening.
+    </div>
+
+    <h2>Where to go next</h2>
+    <div class="card-grid">
+      <a class="card" href="tracks-and-playlist.html">
+        <h4>Tracks &amp; Playlist</h4>
+        <p>Channel Rack, arranging Regions on the Playlist, the step-grid Beats window, and the
+          Piano Roll.</p>
+      </a>
+      <a class="card" href="synth-engines.html">
+        <h4>Synth Engines</h4>
+        <p>Simple, Trine and Wave — how they differ, and working with presets.</p>
+      </a>
+      <a class="card" href="effects.html">
+        <h4>Effects</h4>
+        <p>Built-in effect chains, the master bus, and hosting CLAP plugins.</p>
+      </a>
+      <a class="card" href="audio-and-io.html">
+        <h4>Audio, MIDI &amp; Files</h4>
+        <p>Sample playback, recording/importing audio, MIDI import, saving songs, and WAV export.</p>
+      </a>
+      <a class="card" href="ai-control.html">
+        <h4>AI Control (MCP)</h4>
+        <p>Let an LLM drive a running instance — add tracks, program beats, apply presets, play.</p>
+      </a>
+    </div>
+
+    <h2>Project layout</h2>
+    <p>For contributors: the crate is a flat set of top-level <code>src/*.rs</code> files, each one
+      responsibility (data model, audio engine, UI, built-in effect DSP, CLAP hosting, sample
+      loading, wavetables, MIDI import). See the repository's own
+      <code>CLAUDE.md</code> for the full architecture notes.</p>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>
