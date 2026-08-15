@@ -158,6 +158,12 @@ pub fn new_master_effect_slots() -> MasterEffectSlots {
     new_track_effect_slots(1)
 }
 
+/// One effect chain per send bus, indexed the same as `Song::sends` — structurally identical to
+/// `TrackEffectSlots` (one row per send, resized in lockstep with `Song::sends` the same way
+/// `TrackEffectSlots` resizes with `Song::tracks`), and built with the same `new_track_effect_slots`
+/// constructor.
+pub type SendEffectSlots = TrackEffectSlots;
+
 /// A `TrackEffectSlots` with `track_count` empty per-track chains.
 pub fn new_track_effect_slots(track_count: usize) -> TrackEffectSlots {
     // `LoadedEffect` isn't `Clone` (it owns a live plugin instance), so `vec![Vec::new(); n]`

@@ -17,20 +17,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use audio::{AudioEngine, Transport};
-use builtin_fx::BuiltInEffect;
+use builtin_fx::{BuiltInEffect, automatable_params_for_config};
 use clack_host::prelude::PluginInstance;
 use factory_presets::factory_presets;
 use metering::{MeterHandles, MeterReadings};
 use model::{
-    AudioClip, EqBandType, FilterMode, FilterRouting, FilterSlope, FilterType, Lane,
-    LfoTarget, ModSlot, ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, Song,
-    SynthEngine, SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP, Track, TrackEffectConfig,
-    TrackKind, TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams, add_note,
-    clear_overlaps, find_note_mut, remove_note,
+    AudioClip, AutomationLane, AutomationPoint, AutomationTarget, EffectParamKey, EqBandType,
+    FilterMode, FilterRouting, FilterSlope, FilterType, Lane, LfoTarget, ModSlot, ModSource,
+    ModTarget, Note, ProjectPlugin, Region, RegionContent, SendBus, Song, SynthEngine,
+    SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP, Track, TrackEffectConfig, TrackKind,
+    TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams, add_note, clear_overlaps,
+    find_note_mut, remove_note,
 };
 use plugin_host::{
     DawHost, EffectInstance, LoadedEffect, MasterEffectSlots, PluginGuiHandle, PluginParamInfo,
-    TrackEffectSlots,
+    SendEffectSlots, TrackEffectSlots,
 };
 use sample::SampleBuffer;
 use wavetable::{WaveWarpMode, WavetableId};
@@ -304,6 +305,15 @@ struct PianoRollDrag {
     mode: PianoRollDragMode,
 }
 
+/// At most one automation lane point is being dragged at a time, shared by the Piano Roll's and
+/// Beats' automation panels (see `automation_lanes_ui`) the same way `PlaylistDrag` is shared by
+/// the region-move/resize/fade gestures. `lane_index`/`point_index` re-check bounds every frame,
+/// in case the lane or point was removed (right-click) since the drag began.
+struct AutomationDrag {
+    lane_index: usize,
+    point_index: usize,
+}
+
 /// What the currently in-progress Playlist drag (if any) is doing — the region counterpart of
 /// `PianoRollDragMode`. A region is addressed by which track owns it plus its index into that
 /// track's own `regions` (rather than a stable id, unlike `Note::id`); every arm below re-checks
@@ -324,6 +334,16 @@ enum PlaylistDragMode {
     },
     /// Drawing a brand-new region out from a click on empty space.
     Create {
+        track_index: usize,
+        region_index: usize,
+    },
+    /// Dragging the fade-in handle: changes `Region::fade_in_ticks` only.
+    FadeIn {
+        track_index: usize,
+        region_index: usize,
+    },
+    /// Dragging the fade-out handle: changes `Region::fade_out_ticks` only.
+    FadeOut {
         track_index: usize,
         region_index: usize,
     },
@@ -360,13 +380,25 @@ struct AudioClipDrag {
 }
 
 /// Which effect's parameter-editor window (if any) is currently open. There's only ever one such
-/// window at a time, shared by the master bus and every track. `Master(slot_index)`/
-/// `Track(track_index, slot_index)` identify one slot within the master chain/that track's chain
-/// respectively.
+/// window at a time, shared by the master bus, every track, and every send bus. `Master(slot_index)`/
+/// `Track(track_index, slot_index)`/`Send(send_index, slot_index)` identify one slot within the
+/// master chain/that track's chain/that send bus's chain respectively.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EffectEditorTarget {
     Master(usize),
     Track(usize, usize),
+    Send(usize, usize),
+}
+
+/// Which chain `TrackFxUi` is editing — only changes which `EffectEditorTarget` variant its
+/// "Params" button opens (see `fx_chain_ui`), so each location's editor state doesn't collide with
+/// the others'. The chain's own index within `slots` (a real track's index, or a send bus's index;
+/// meaningless — always 0 — for `Master`) still comes from `TrackFxUi::track_index`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FxChainKind {
+    Track,
+    Master,
+    Send,
 }
 
 /// What kind of row `track_ui` should draw for one FX chain slot — determined by peeking at the
@@ -436,6 +468,15 @@ struct SimpleDawApp {
     track_effect_guis: Vec<Vec<Option<PluginGuiHandle>>>,
     track_effect_paths: Vec<Vec<String>>,
     track_effect_messages: Vec<Vec<Option<(bool, String)>>>,
+    /// Every send bus's own effect-chain bookkeeping — same shape as the per-track `track_effect_*`
+    /// fields above (one entry per `Song::sends` row), kept in sync via `resize_track_effects`/
+    /// `remove_track_effects`, the same helpers the per-track fields use. `send_effect_slots` is
+    /// the live chain shared with the audio thread (see `plugin_host::SendEffectSlots`).
+    send_effect_slots: SendEffectSlots,
+    send_effect_instances: Vec<Vec<Option<PluginInstance<DawHost>>>>,
+    send_effect_guis: Vec<Vec<Option<PluginGuiHandle>>>,
+    send_effect_paths: Vec<Vec<String>>,
+    send_effect_messages: Vec<Vec<Option<(bool, String)>>>,
     /// Live peak/RMS/LUFS readings published by the audio thread — one entry per track, kept in
     /// sync with `song.tracks` via `resize_track_meters`/`remove_track_meter` the same way
     /// `track_effect_slots` is kept in sync via `resize_track_effects`/`remove_track_effects`. The
@@ -464,6 +505,9 @@ struct SimpleDawApp {
     /// At most one piano-roll note is being dragged at a time, across every
     /// track's piano roll (there's only one mouse).
     piano_roll_drag: Option<PianoRollDrag>,
+    /// See `AutomationDrag` — shared by the Piano Roll's and Beats' automation panels the same
+    /// way `piano_roll_drag` is shared across every track's piano roll.
+    automation_drag: Option<AutomationDrag>,
     /// Currently selected piano-roll note ids, shared across every track's piano roll (like
     /// `piano_roll_drag`, there's only one selection active at a time). Note ids are unique
     /// across the whole song, so a selection only ever matches notes in the one track it was
@@ -563,6 +607,8 @@ impl SimpleDawApp {
         let master_effect_slots = plugin_host::new_master_effect_slots();
         let track_count = song.lock().unwrap().tracks.len();
         let track_effect_slots = plugin_host::new_track_effect_slots(track_count);
+        let send_count = song.lock().unwrap().sends.len();
+        let send_effect_slots = plugin_host::new_track_effect_slots(send_count);
         let track_meters = metering::new_track_meter_handles(track_count);
         let master_meter = metering::new_master_meter_handles();
         let engine = AudioEngine::start(
@@ -570,6 +616,7 @@ impl SimpleDawApp {
             transport.clone(),
             master_effect_slots.clone(),
             track_effect_slots.clone(),
+            send_effect_slots.clone(),
             track_meters.clone(),
             master_meter.clone(),
             None,
@@ -631,6 +678,11 @@ impl SimpleDawApp {
             track_effect_guis: (0..track_count).map(|_| Vec::new()).collect(),
             track_effect_paths: (0..track_count).map(|_| Vec::new()).collect(),
             track_effect_messages: (0..track_count).map(|_| Vec::new()).collect(),
+            send_effect_slots,
+            send_effect_instances: (0..send_count).map(|_| Vec::new()).collect(),
+            send_effect_guis: (0..send_count).map(|_| Vec::new()).collect(),
+            send_effect_paths: (0..send_count).map(|_| Vec::new()).collect(),
+            send_effect_messages: (0..send_count).map(|_| Vec::new()).collect(),
             track_meters,
             master_meter,
             effect_editor: None,
@@ -639,6 +691,7 @@ impl SimpleDawApp {
             new_preset_name: String::new(),
             preset_message: None,
             piano_roll_drag: None,
+            automation_drag: None,
             selected_notes: HashSet::new(),
             piano_roll_zoom: 1.0,
             piano_roll_scale_root: 0,
@@ -769,7 +822,7 @@ fn channel_rack_contents_ui(
         for (track_index, track) in song.tracks.iter_mut().enumerate() {
             let mut fx = TrackFxUi {
                 track_index,
-                is_master: false,
+                chain_kind: FxChainKind::Track,
                 paths: &mut rack.track_effect_paths[track_index],
                 messages: &mut rack.track_effect_messages[track_index],
                 slots: rack.track_effect_slots.clone(),
@@ -818,6 +871,14 @@ struct MixerUi<'a> {
     master_effect_guis: &'a mut Vec<Option<PluginGuiHandle>>,
     master_effect_messages: &'a mut Vec<Option<(bool, String)>>,
     master_meter: &'a MeterHandles,
+    /// Every send bus's own effect-chain bookkeeping — same shape as `track_effect_*` (one entry
+    /// per `Song::sends` row), kept in sync via `resize_track_effects`/`remove_track_effects`, the
+    /// same helpers `track_effect_*`/`send_effect_*` both reuse (see `SimpleDawApp::send_effect_slots`).
+    send_effect_slots: &'a SendEffectSlots,
+    send_effect_instances: &'a mut Vec<Vec<Option<PluginInstance<DawHost>>>>,
+    send_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
+    send_effect_paths: &'a mut Vec<Vec<String>>,
+    send_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
 }
 
 /// The Mixer's heading/Detach toggle plus one classic vertical channel strip per track, ending in
@@ -854,7 +915,7 @@ fn mixer_contents_ui(
                 let mut unused_remove_requested: Option<usize> = None;
                 let mut fx = TrackFxUi {
                     track_index,
-                    is_master: false,
+                    chain_kind: FxChainKind::Track,
                     paths: &mut mixer.track_effect_paths[track_index],
                     messages: &mut mixer.track_effect_messages[track_index],
                     slots: mixer.track_effect_slots.clone(),
@@ -872,14 +933,14 @@ fn mixer_contents_ui(
                     .ok()
                     .and_then(|handles| handles.get(track_index).map(|m| m.snapshot()))
                     .unwrap_or_default();
-                mixer_channel_strip_ui(ui, track, track_index, &mut fx, meter);
+                mixer_channel_strip_ui(ui, track, track_index, &song.sends, &mut fx, meter);
             }
 
             let mut unused_synth_editor: Option<usize> = None;
             let mut unused_remove_requested: Option<usize> = None;
             let mut master_fx = TrackFxUi {
                 track_index: 0,
-                is_master: true,
+                chain_kind: FxChainKind::Master,
                 paths: mixer.master_effect_paths,
                 messages: mixer.master_effect_messages,
                 slots: mixer.master_effect_slots.clone(),
@@ -898,6 +959,53 @@ fn mixer_contents_ui(
                 .and_then(|handles| handles.first().map(|m| m.snapshot()))
                 .unwrap_or_default();
             mixer_master_strip_ui(ui, &mut master_fx, master_meter);
+
+            ui.separator();
+            let mut send_to_remove: Option<usize> = None;
+            for (send_index, send) in song.sends.iter_mut().enumerate() {
+                let mut unused_synth_editor: Option<usize> = None;
+                let mut unused_remove_requested: Option<usize> = None;
+                let mut send_fx = TrackFxUi {
+                    track_index: send_index,
+                    chain_kind: FxChainKind::Send,
+                    paths: &mut mixer.send_effect_paths[send_index],
+                    messages: &mut mixer.send_effect_messages[send_index],
+                    slots: mixer.send_effect_slots.clone(),
+                    instances: &mut mixer.send_effect_instances[send_index],
+                    guis: &mut mixer.send_effect_guis[send_index],
+                    engine_config,
+                    known_plugins: &song.plugins,
+                    editor: &mut *mixer.effect_editor,
+                    synth_editor: &mut unused_synth_editor,
+                    remove_requested: &mut unused_remove_requested,
+                };
+                mixer_send_strip_ui(ui, send, send_index, &mut send_fx, &mut send_to_remove);
+            }
+            if let Some(index) = send_to_remove {
+                song.remove_send(index);
+                remove_track_effects(
+                    mixer.send_effect_slots,
+                    mixer.send_effect_instances,
+                    mixer.send_effect_guis,
+                    mixer.send_effect_paths,
+                    mixer.send_effect_messages,
+                    index,
+                );
+            }
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                if ui.button("+ Add Send").clicked() {
+                    song.add_send(format!("Send {}", song.sends.len() + 1));
+                    resize_track_effects(
+                        mixer.send_effect_slots,
+                        mixer.send_effect_instances,
+                        mixer.send_effect_guis,
+                        mixer.send_effect_paths,
+                        mixer.send_effect_messages,
+                        song.sends.len(),
+                    );
+                }
+            });
         });
     });
 }
@@ -967,13 +1075,15 @@ fn format_lufs(value: f32) -> String {
 }
 
 /// One track's classic vertical channel strip in the Mixer: name, an "FX" menu (the same
-/// `fx_chain_ui` the Channel Rack's "FX" button opens), a pan slider, Mute/Solo buttons, a peak/RMS
-/// bar meter beside a tall vertical volume fader, and an integrated-LUFS readout (momentary/
-/// short-term available via tooltip) — see `mixer_contents_ui`.
+/// `fx_chain_ui` the Channel Rack's "FX" button opens), a "Sends" menu (one level slider per
+/// `Song::sends` entry, writing into `track.send_levels`), a pan slider, Mute/Solo buttons, a
+/// peak/RMS bar meter beside a tall vertical volume fader, and an integrated-LUFS readout
+/// (momentary/short-term available via tooltip) — see `mixer_contents_ui`.
 fn mixer_channel_strip_ui(
     ui: &mut egui::Ui,
     track: &mut Track,
     track_index: usize,
+    sends: &[SendBus],
     fx: &mut TrackFxUi,
     meter: MeterReadings,
 ) {
@@ -998,6 +1108,27 @@ fn mixer_channel_strip_ui(
                 ui.menu_button("FX", |ui| {
                     fx_chain_ui(ui, fx);
                 });
+
+                if !sends.is_empty() {
+                    // Self-heals a `send_levels` shorter than `sends` (e.g. a `Song` mutated
+                    // outside `Song::add_send`) rather than panicking on an out-of-range index —
+                    // `Song::add_send`/`add_track` already keep the two in lockstep in the normal
+                    // path, so this only ever actually runs after unusual external edits.
+                    while track.send_levels.len() < sends.len() {
+                        track.send_levels.push(0.0);
+                    }
+                    ui.menu_button("Sends", |ui| {
+                        for (send_index, send) in sends.iter().enumerate() {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut track.send_levels[send_index],
+                                    0.0..=1.5,
+                                )
+                                .text(&send.name),
+                            );
+                        }
+                    });
+                }
 
                 ui.add(egui::Slider::new(&mut track.pan, -1.0..=1.0).show_value(false))
                     .on_hover_text(format!("Pan: {}", pan_label(track.pan)));
@@ -1088,6 +1219,40 @@ fn mixer_master_strip_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi, meter: MeterRead
         });
 }
 
+/// One send bus's compact strip in the Mixer: an editable name, its own "FX" menu (the same
+/// `fx_chain_ui` a track/master chain uses), and a remove button — no pan/mute/solo/fader/meter,
+/// since a send bus has no fader of its own in this minimal model (see `audio.rs`'s mixdown: a
+/// send's chain output sums straight into the master mix at whatever level each track sent it).
+fn mixer_send_strip_ui(
+    ui: &mut egui::Ui,
+    send: &mut SendBus,
+    send_index: usize,
+    fx: &mut TrackFxUi,
+    remove_requested: &mut Option<usize>,
+) {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(34, 42, 46))
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::same(4))
+        .show(ui, |ui| {
+            ui.set_width(92.0);
+            ui.vertical_centered(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut send.name)
+                        .desired_width(64.0)
+                        .font(egui::TextStyle::Small),
+                );
+                ui.menu_button("FX", |ui| {
+                    fx_chain_ui(ui, fx);
+                });
+                ui.add_space(4.0);
+                if ui.small_button("✕ Remove").clicked() {
+                    *remove_requested = Some(send_index);
+                }
+            });
+        });
+}
+
 /// Bundles the Piano Roll's mutable app-state borrows for the same reason as `ChannelRackUi`.
 struct PianoRollPanelUi<'a> {
     selected_track: Option<usize>,
@@ -1103,6 +1268,11 @@ struct PianoRollPanelUi<'a> {
     editing_region_index: &'a mut Option<usize>,
     /// See `SimpleDawApp::piano_roll_scroll_to`.
     scroll_to: &'a mut Option<usize>,
+    /// The open region's own track's live effect chain — read by `automation_lanes_ui`'s "+ Add
+    /// Lane" menu to offer a currently-loaded CLAP plugin's real parameter names.
+    track_effect_slots: &'a TrackEffectSlots,
+    /// See `AutomationDrag`.
+    automation_drag: &'a mut Option<AutomationDrag>,
 }
 
 /// The Piano Roll's header (selected track name/mute badge) and note grid, rendered inside the
@@ -1166,11 +1336,17 @@ fn piano_roll_contents_ui(
         }
         Some((index, region_index)) => {
             let color = track_color(index);
-            let visible_height = ui.available_height().max(PIANO_ROLL_HEIGHT_MIN);
+            // Reserve room below the note grid for the automation panel (header + roughly one
+            // lane's graph; more lanes than that scroll within their own area instead of pushing
+            // the note grid further up).
+            let automation_reserved = 110.0;
+            let visible_height =
+                (ui.available_height() - automation_reserved).max(PIANO_ROLL_HEIGHT_MIN);
             let steps_per_bar = song.steps_per_bar();
             let steps_per_beat = song.steps_per_beat();
             let next_note_id = &mut song.next_note_id;
             let track = &mut song.tracks[index];
+            let track_effects_snapshot = track.effects.clone();
             let default_note_length_ticks = &mut track.default_note_length_ticks;
             let region = &mut track.regions[region_index];
             if let RegionContent::PianoRoll(notes) = &mut region.content {
@@ -1193,6 +1369,22 @@ fn piano_roll_contents_ui(
                     panel.scale,
                 );
             }
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(automation_reserved.max(60.0)).show(
+                ui,
+                |ui| {
+                    automation_lanes_ui(
+                        ui,
+                        region,
+                        index,
+                        &track_effects_snapshot,
+                        panel.track_effect_slots,
+                        &song.sends,
+                        *panel.piano_roll_zoom,
+                        panel.automation_drag,
+                    );
+                },
+            );
         }
     }
 }
@@ -1286,6 +1478,11 @@ struct McpContext<'a> {
     track_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
     track_effect_paths: &'a mut Vec<Vec<String>>,
     track_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
+    send_effect_slots: &'a SendEffectSlots,
+    send_effect_instances: &'a mut Vec<Vec<Option<PluginInstance<DawHost>>>>,
+    send_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
+    send_effect_paths: &'a mut Vec<Vec<String>>,
+    send_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
     track_meters: &'a MeterHandles,
 }
 
@@ -1703,6 +1900,8 @@ fn apply_mcp_command(
                 ctx.master_effect_slots,
                 ctx.track_effect_paths,
                 ctx.track_effect_slots,
+                ctx.send_effect_paths,
+                ctx.send_effect_slots,
             );
             let path = p.path.trim().to_string();
             let (ok, message) = perform_save(song, &path);
@@ -1718,9 +1917,12 @@ fn apply_mcp_command(
             let path = p.path.trim().to_string();
             let loaded = perform_load(&path, ctx.sample_rate)?;
             let track_count = loaded.tracks.len();
+            let send_count = loaded.sends.len();
             let master_effect_specs = loaded.master_effects.clone();
             let track_effect_specs: Vec<Vec<TrackEffectConfig>> =
                 loaded.tracks.iter().map(|t| t.effects.clone()).collect();
+            let send_effect_specs: Vec<Vec<TrackEffectConfig>> =
+                loaded.sends.iter().map(|s| s.effects.clone()).collect();
             *song = loaded;
             *ctx.song_path = path;
             resize_track_effects(
@@ -1732,6 +1934,14 @@ fn apply_mcp_command(
                 track_count,
             );
             resize_track_meters(ctx.track_meters, track_count);
+            resize_track_effects(
+                ctx.send_effect_slots,
+                ctx.send_effect_instances,
+                ctx.send_effect_guis,
+                ctx.send_effect_paths,
+                ctx.send_effect_messages,
+                send_count,
+            );
             apply_loaded_effects(
                 ctx.master_effect_paths,
                 ctx.master_effect_instances,
@@ -1745,6 +1955,12 @@ fn apply_mcp_command(
                 ctx.track_effect_messages,
                 ctx.track_effect_slots,
                 track_effect_specs,
+                ctx.send_effect_paths,
+                ctx.send_effect_instances,
+                ctx.send_effect_guis,
+                ctx.send_effect_messages,
+                ctx.send_effect_slots,
+                send_effect_specs,
                 ctx.engine_config,
             );
             Ok(json!({ "track_count": track_count }))
@@ -4120,14 +4336,18 @@ fn chain_to_config(chain: &[Option<EffectInstance>], paths: &[String]) -> Vec<Tr
         .collect()
 }
 
-/// Writes the app's live effect state (master bus + every track's effect chain) into `song`'s
-/// `master_effects`/`Track::effects` fields so `save_to_file` captures it.
+/// Writes the app's live effect state (master bus + every track's effect chain + every send bus's
+/// effect chain) into `song`'s `master_effects`/`Track::effects`/`SendBus::effects` fields so
+/// `save_to_file` captures it.
+#[allow(clippy::too_many_arguments)]
 fn sync_song_effects(
     song: &mut Song,
     master_effect_paths: &[String],
     master_effect_slots: &MasterEffectSlots,
     track_effect_paths: &[Vec<String>],
     track_effect_slots: &TrackEffectSlots,
+    send_effect_paths: &[Vec<String>],
+    send_effect_slots: &SendEffectSlots,
 ) {
     if let Ok(chains) = master_effect_slots.lock() {
         song.master_effects = chains
@@ -4140,6 +4360,16 @@ fn sync_song_effects(
         for (index, track) in song.tracks.iter_mut().enumerate() {
             let paths = track_effect_paths.get(index).map(Vec::as_slice).unwrap_or(&[]);
             track.effects = chains
+                .get(index)
+                .map(|chain| chain_to_config(chain, paths))
+                .unwrap_or_default();
+        }
+    }
+
+    if let Ok(chains) = send_effect_slots.lock() {
+        for (index, send) in song.sends.iter_mut().enumerate() {
+            let paths = send_effect_paths.get(index).map(Vec::as_slice).unwrap_or(&[]);
+            send.effects = chains
                 .get(index)
                 .map(|chain| chain_to_config(chain, paths))
                 .unwrap_or_default();
@@ -4233,11 +4463,46 @@ fn build_effect_chain(
     (paths, instances, guis, messages, chain)
 }
 
-/// Re-loads the master bus's and every track's effect chain after a `Song` is loaded from a file,
-/// restoring each CLAP plugin's saved parameter values and re-instantiating every built-in effect.
-/// Takes the loaded specs by value (extracted from the `Song` before it's swapped into place)
-/// rather than the `Song` itself, so it can run as a free function alongside the caller's
-/// `&mut Song` borrow.
+/// Rebuilds one indexed chain slot (a real track's, or a send bus's) from its saved specs and
+/// writes the result into that index's bookkeeping entries — the shared body behind
+/// `apply_loaded_effects`'s per-track and per-send loops, which differ only in which parallel
+/// `Vec`s/`slots` they're writing into.
+#[allow(clippy::too_many_arguments)]
+fn apply_chain_specs_at(
+    index: usize,
+    specs: Vec<TrackEffectConfig>,
+    engine_config: Option<(f64, u32, u32)>,
+    slots: &TrackEffectSlots,
+    paths_out: &mut [Vec<String>],
+    instances_out: &mut [Vec<Option<PluginInstance<DawHost>>>],
+    guis_out: &mut [Vec<Option<PluginGuiHandle>>],
+    messages_out: &mut [Vec<Option<(bool, String)>>],
+) {
+    let (paths, instances, guis, messages, chain) = build_effect_chain(specs, engine_config);
+    if let Ok(mut slots) = slots.lock()
+        && let Some(slot) = slots.get_mut(index)
+    {
+        *slot = chain;
+    }
+    if let Some(field) = paths_out.get_mut(index) {
+        *field = paths;
+    }
+    if let Some(field) = instances_out.get_mut(index) {
+        *field = instances;
+    }
+    if let Some(field) = guis_out.get_mut(index) {
+        *field = guis;
+    }
+    if let Some(field) = messages_out.get_mut(index) {
+        *field = messages;
+    }
+}
+
+/// Re-loads the master bus's, every track's, and every send bus's effect chain after a `Song` is
+/// loaded from a file, restoring each CLAP plugin's saved parameter values and re-instantiating
+/// every built-in effect. Takes the loaded specs by value (extracted from the `Song` before it's
+/// swapped into place) rather than the `Song` itself, so it can run as a free function alongside
+/// the caller's `&mut Song` borrow.
 #[allow(clippy::too_many_arguments)]
 fn apply_loaded_effects(
     master_effect_paths: &mut Vec<String>,
@@ -4252,6 +4517,12 @@ fn apply_loaded_effects(
     track_effect_messages: &mut [Vec<Option<(bool, String)>>],
     track_effect_slots: &TrackEffectSlots,
     loaded_track_specs: Vec<Vec<TrackEffectConfig>>,
+    send_effect_paths: &mut [Vec<String>],
+    send_effect_instances: &mut [Vec<Option<PluginInstance<DawHost>>>],
+    send_effect_guis: &mut [Vec<Option<PluginGuiHandle>>],
+    send_effect_messages: &mut [Vec<Option<(bool, String)>>],
+    send_effect_slots: &SendEffectSlots,
+    loaded_send_specs: Vec<Vec<TrackEffectConfig>>,
     engine_config: Option<(f64, u32, u32)>,
 ) {
     let (paths, instances, guis, messages, chain) =
@@ -4267,24 +4538,29 @@ fn apply_loaded_effects(
     }
 
     for (index, track_specs) in loaded_track_specs.into_iter().enumerate() {
-        let (paths, instances, guis, messages, chain) = build_effect_chain(track_specs, engine_config);
-        if let Ok(mut slots) = track_effect_slots.lock() {
-            if let Some(slot) = slots.get_mut(index) {
-                *slot = chain;
-            }
-        }
-        if let Some(field) = track_effect_paths.get_mut(index) {
-            *field = paths;
-        }
-        if let Some(field) = track_effect_instances.get_mut(index) {
-            *field = instances;
-        }
-        if let Some(field) = track_effect_guis.get_mut(index) {
-            *field = guis;
-        }
-        if let Some(field) = track_effect_messages.get_mut(index) {
-            *field = messages;
-        }
+        apply_chain_specs_at(
+            index,
+            track_specs,
+            engine_config,
+            track_effect_slots,
+            track_effect_paths,
+            track_effect_instances,
+            track_effect_guis,
+            track_effect_messages,
+        );
+    }
+
+    for (index, send_specs) in loaded_send_specs.into_iter().enumerate() {
+        apply_chain_specs_at(
+            index,
+            send_specs,
+            engine_config,
+            send_effect_slots,
+            send_effect_paths,
+            send_effect_instances,
+            send_effect_guis,
+            send_effect_messages,
+        );
     }
 }
 
@@ -4512,6 +4788,11 @@ impl eframe::App for SimpleDawApp {
                     track_effect_guis: &mut self.track_effect_guis,
                     track_effect_paths: &mut self.track_effect_paths,
                     track_effect_messages: &mut self.track_effect_messages,
+                    send_effect_slots: &self.send_effect_slots,
+                    send_effect_instances: &mut self.send_effect_instances,
+                    send_effect_guis: &mut self.send_effect_guis,
+                    send_effect_paths: &mut self.send_effect_paths,
+                    send_effect_messages: &mut self.send_effect_messages,
                     track_meters: &self.track_meters,
                 };
                 let result = apply_mcp_command(&req.cmd, req.params, song, &mut mcp_ctx);
@@ -4547,12 +4828,19 @@ impl eframe::App for SimpleDawApp {
                                 match perform_load(&self.song_path, self.sample_rate) {
                                     Ok(loaded) => {
                                         let track_count = loaded.tracks.len();
+                                        let send_count = loaded.sends.len();
                                         let master_effect_specs = loaded.master_effects.clone();
                                         let track_effect_specs: Vec<Vec<TrackEffectConfig>> =
                                             loaded
                                                 .tracks
                                                 .iter()
                                                 .map(|t| t.effects.clone())
+                                                .collect();
+                                        let send_effect_specs: Vec<Vec<TrackEffectConfig>> =
+                                            loaded
+                                                .sends
+                                                .iter()
+                                                .map(|s| s.effects.clone())
                                                 .collect();
                                         *song = loaded;
                                         self.transport.set_playing(false);
@@ -4575,6 +4863,14 @@ impl eframe::App for SimpleDawApp {
                                             track_count,
                                         );
                                         resize_track_meters(&self.track_meters, track_count);
+                                        resize_track_effects(
+                                            &self.send_effect_slots,
+                                            &mut self.send_effect_instances,
+                                            &mut self.send_effect_guis,
+                                            &mut self.send_effect_paths,
+                                            &mut self.send_effect_messages,
+                                            send_count,
+                                        );
                                         let engine_config = self.engine.as_ref().ok().map(|e| {
                                             (
                                                 e.status.sample_rate as f64,
@@ -4595,6 +4891,12 @@ impl eframe::App for SimpleDawApp {
                                             &mut self.track_effect_messages,
                                             &self.track_effect_slots,
                                             track_effect_specs,
+                                            &mut self.send_effect_paths,
+                                            &mut self.send_effect_instances,
+                                            &mut self.send_effect_guis,
+                                            &mut self.send_effect_messages,
+                                            &self.send_effect_slots,
+                                            send_effect_specs,
                                             engine_config,
                                         );
                                         self.song_message = Some((
@@ -4616,6 +4918,8 @@ impl eframe::App for SimpleDawApp {
                                 &self.master_effect_slots,
                                 &self.track_effect_paths,
                                 &self.track_effect_slots,
+                                &self.send_effect_paths,
+                                &self.send_effect_slots,
                             );
                             self.song_message = Some(perform_save(song, &self.song_path));
                             ui.close();
@@ -4879,6 +5183,8 @@ impl eframe::App for SimpleDawApp {
                                     &self.master_effect_slots,
                                     &self.track_effect_paths,
                                     &self.track_effect_slots,
+                                    &self.send_effect_paths,
+                                    &self.send_effect_slots,
                                 );
                                 // The old engine (if any) is kept alive until the new one succeeds, so a
                                 // bad device/rate doesn't leave the app silent.
@@ -4887,6 +5193,7 @@ impl eframe::App for SimpleDawApp {
                                     self.transport.clone(),
                                     self.master_effect_slots.clone(),
                                     self.track_effect_slots.clone(),
+                                    self.send_effect_slots.clone(),
                                     self.track_meters.clone(),
                                     self.master_meter.clone(),
                                     self.selected_output_device.as_deref(),
@@ -4915,6 +5222,12 @@ impl eframe::App for SimpleDawApp {
                                             &mut self.track_effect_messages,
                                             &self.track_effect_slots,
                                             song.tracks.iter().map(|t| t.effects.clone()).collect(),
+                                            &mut self.send_effect_paths,
+                                            &mut self.send_effect_instances,
+                                            &mut self.send_effect_guis,
+                                            &mut self.send_effect_messages,
+                                            &self.send_effect_slots,
+                                            song.sends.iter().map(|s| s.effects.clone()).collect(),
                                             engine_config,
                                         );
                                         self.output_device_message = None;
@@ -5003,6 +5316,8 @@ impl eframe::App for SimpleDawApp {
                                 &self.master_effect_slots,
                                 &self.track_effect_paths,
                                 &self.track_effect_slots,
+                                &self.send_effect_paths,
+                                &self.send_effect_slots,
                             );
                             self.song_message = Some(perform_save(song, &self.song_path));
                             self.show_save_as = false;
@@ -5075,6 +5390,9 @@ impl eframe::App for SimpleDawApp {
                                             content_length_steps: length_steps,
                                             loop_length_steps: length_steps,
                                             content: RegionContent::PianoRoll(imported_track.notes),
+                                            fade_in_ticks: 0,
+                                            fade_out_ticks: 0,
+                                            automation: Vec::new(),
                                         });
                                     }
                                     resize_track_effects(
@@ -5184,7 +5502,7 @@ impl eframe::App for SimpleDawApp {
                     let mut unused_remove_requested: Option<usize> = None;
                     let mut master_fx = TrackFxUi {
                         track_index: 0,
-                        is_master: true,
+                        chain_kind: FxChainKind::Master,
                         paths: &mut self.master_effect_paths,
                         messages: &mut self.master_effect_messages,
                         slots: self.master_effect_slots.clone(),
@@ -5262,6 +5580,9 @@ impl eframe::App for SimpleDawApp {
                 EffectEditorTarget::Track(track_index, slot_index) => {
                     format!("Track {} FX {} Params", track_index + 1, slot_index + 1)
                 }
+                EffectEditorTarget::Send(send_index, slot_index) => {
+                    format!("Send {} FX {} Params", send_index + 1, slot_index + 1)
+                }
             };
             let gui_title = title.clone();
             let mut open = true;
@@ -5320,6 +5641,35 @@ impl eframe::App for SimpleDawApp {
                                 .and_then(|instance| instance.as_mut()),
                             self.track_effect_guis
                                 .get_mut(track_index)
+                                .and_then(|slots| slots.get_mut(slot_index))
+                                .and_then(|gui| gui.as_mut()),
+                        ) {
+                            plugin_gui_button_ui(ui, instance, gui, &gui_title);
+                        }
+                    }
+                    EffectEditorTarget::Send(send_index, slot_index) => {
+                        if let Ok(mut guard) = self.send_effect_slots.lock() {
+                            let slot = guard
+                                .get_mut(send_index)
+                                .and_then(|chain| chain.get_mut(slot_index))
+                                .and_then(|slot| slot.as_mut());
+                            match slot {
+                                Some(EffectInstance::Clap(effect)) => {
+                                    effect_params_ui(ui, Some(effect))
+                                }
+                                Some(EffectInstance::BuiltIn(effect)) => {
+                                    built_in_effect_params_ui(ui, effect)
+                                }
+                                None => effect_params_ui(ui, None),
+                            }
+                        }
+                        if let (Some(instance), Some(gui)) = (
+                            self.send_effect_instances
+                                .get_mut(send_index)
+                                .and_then(|slots| slots.get_mut(slot_index))
+                                .and_then(|instance| instance.as_mut()),
+                            self.send_effect_guis
+                                .get_mut(send_index)
                                 .and_then(|slots| slots.get_mut(slot_index))
                                 .and_then(|gui| gui.as_mut()),
                         ) {
@@ -5654,6 +6004,11 @@ impl eframe::App for SimpleDawApp {
                 master_effect_guis: &mut self.master_effect_guis,
                 master_effect_messages: &mut self.master_effect_messages,
                 master_meter: &self.master_meter,
+                send_effect_slots: &self.send_effect_slots,
+                send_effect_instances: &mut self.send_effect_instances,
+                send_effect_guis: &mut self.send_effect_guis,
+                send_effect_paths: &mut self.send_effect_paths,
+                send_effect_messages: &mut self.send_effect_messages,
             };
 
             if mixer_already_detached {
@@ -5708,6 +6063,8 @@ impl eframe::App for SimpleDawApp {
                 scale: &mut self.piano_roll_scale,
                 editing_region_index: &mut self.piano_roll_region,
                 scroll_to: &mut self.piano_roll_scroll_to,
+                track_effect_slots: &self.track_effect_slots,
+                automation_drag: &mut self.automation_drag,
             };
             let ctx = ui.ctx().clone();
             let mut still_open = true;
@@ -5749,6 +6106,8 @@ impl eframe::App for SimpleDawApp {
             let sample_rate = self.sample_rate;
             let beats_region = &mut self.beats_region;
             let lane_synth_editor = &mut self.lane_synth_editor;
+            let track_effect_slots = &self.track_effect_slots;
+            let automation_drag = &mut self.automation_drag;
             let ctx = ui.ctx().clone();
             let mut still_open = true;
             ctx.show_viewport_immediate(
@@ -5768,6 +6127,8 @@ impl eframe::App for SimpleDawApp {
                                 selected_beats_track,
                                 beats_region,
                                 lane_synth_editor,
+                                track_effect_slots,
+                                automation_drag,
                             );
                         });
                     if ui.ctx().input(|i| i.viewport().close_requested()) {
@@ -5816,14 +6177,12 @@ impl eframe::App for SimpleDawApp {
 /// as `Track::effects`/`Song::master_effects` (slot 0 first, feeding into slot 1, and so on) — one
 /// entry per effect slot, whether or not that slot has successfully loaded a plugin yet.
 struct TrackFxUi<'a> {
-    /// Row into `slots` this chain lives at — always 0 when `is_master` (see
+    /// Row into `slots` this chain lives at — always 0 when `chain_kind` is `Master` (see
     /// `plugin_host::MasterEffectSlots`'s doc comment on why the master chain still uses the
     /// per-track `TrackEffectSlots` shape, just pinned to one row).
     track_index: usize,
-    /// Whether this is the master bus's chain rather than a real track's — only changes which
-    /// `EffectEditorTarget` variant the "Params" button opens, so master's editor state doesn't
-    /// collide with `Track(0, ..)`'s.
-    is_master: bool,
+    /// Which location this chain belongs to — see `FxChainKind`.
+    chain_kind: FxChainKind,
     paths: &'a mut Vec<String>,
     messages: &'a mut Vec<Option<(bool, String)>>,
     slots: TrackEffectSlots,
@@ -5846,14 +6205,15 @@ struct TrackFxUi<'a> {
     remove_requested: &'a mut Option<usize>,
 }
 
-/// This chain's `fx.editor` target for `slot_index` — `Master` for the master bus, `Track` for a
-/// real track, so the two never collide even though the master chain's own `TrackEffectSlots` row
-/// index is always 0 (same as a real track 0 would use).
+/// This chain's `fx.editor` target for `slot_index` — `Master`/`Track`/`Send` per `fx.chain_kind`,
+/// so none of the three ever collide even though a send bus's own `TrackEffectSlots` row index can
+/// coincide with a real track's (and the master chain's row index is always 0, same as a real
+/// track 0 would use).
 fn fx_editor_target(fx: &TrackFxUi, slot_index: usize) -> EffectEditorTarget {
-    if fx.is_master {
-        EffectEditorTarget::Master(slot_index)
-    } else {
-        EffectEditorTarget::Track(fx.track_index, slot_index)
+    match fx.chain_kind {
+        FxChainKind::Master => EffectEditorTarget::Master(slot_index),
+        FxChainKind::Track => EffectEditorTarget::Track(fx.track_index, slot_index),
+        FxChainKind::Send => EffectEditorTarget::Send(fx.track_index, slot_index),
     }
 }
 
@@ -6131,6 +6491,8 @@ fn beats_contents_ui(
     selected_beats_track: Option<usize>,
     editing_region_index: &mut Option<usize>,
     lane_synth_editor: &mut Option<(usize, usize, usize)>,
+    track_effect_slots: &TrackEffectSlots,
+    automation_drag: &mut Option<AutomationDrag>,
 ) {
     let selected = selected_beats_track
         .filter(|&i| i < song.tracks.len())
@@ -6176,9 +6538,11 @@ fn beats_contents_ui(
                 };
                 song.tracks[index].add_lane(format!("Lane {}", lane_count + 1), 60);
             }
+            let track_effects_snapshot = song.tracks[index].effects.clone();
+            let mut lane_to_remove = None;
             let region = &mut song.tracks[index].regions[region_index];
             if let RegionContent::StepGrid(lanes) = &mut region.content {
-                if let Some(lane_index) = step_grid_lanes_ui(
+                lane_to_remove = step_grid_lanes_ui(
                     ui,
                     lanes,
                     current_tick,
@@ -6187,9 +6551,26 @@ fn beats_contents_ui(
                     index,
                     region_index,
                     lane_synth_editor,
-                ) {
-                    song.tracks[index].remove_lane(lane_index);
-                }
+                );
+            }
+            ui.separator();
+            // Beats has no continuous zoom of its own (its step grid is fixed-width cells) —
+            // a fixed default keeps the automation graph at a reasonable density regardless.
+            let zoom = 1.0;
+            egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
+                automation_lanes_ui(
+                    ui,
+                    region,
+                    index,
+                    &track_effects_snapshot,
+                    track_effect_slots,
+                    &song.sends,
+                    zoom,
+                    automation_drag,
+                );
+            });
+            if let Some(lane_index) = lane_to_remove {
+                song.tracks[index].remove_lane(lane_index);
             }
         }
     }
@@ -7221,6 +7602,48 @@ fn draw_region_note_preview(painter: &egui::Painter, rect: egui::Rect, region: &
     }
 }
 
+/// Draws `region`'s fade-in/fade-out ramps as the usual DAW convention: a semi-transparent
+/// triangular wedge over the faded portion of the clip, tapering from full shade at the region's
+/// own edge down to none at the point `region.fade_gain_at` reaches 1.0 — dragging that point
+/// (see `handle_playlist_interaction`'s `near_fade_in_handle`/`near_fade_out_handle`) is how
+/// `fade_in_ticks`/`fade_out_ticks` get set in the first place. Draws nothing for a fade of 0.
+fn draw_region_fade_overlays(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    region: &Region,
+    zoom: f32,
+) {
+    let span_ticks = region.loop_length_steps * TICKS_PER_STEP;
+    if span_ticks == 0 {
+        return;
+    }
+    let fade_shade = egui::Color32::from_black_alpha(110);
+    if region.fade_in_ticks > 0 {
+        let fade_w = tick_to_x(region.fade_in_ticks.min(span_ticks), zoom).min(rect.width());
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                rect.left_top(),
+                egui::pos2(rect.left() + fade_w, rect.top()),
+                rect.left_bottom(),
+            ],
+            fade_shade,
+            egui::Stroke::NONE,
+        ));
+    }
+    if region.fade_out_ticks > 0 {
+        let fade_w = tick_to_x(region.fade_out_ticks.min(span_ticks), zoom).min(rect.width());
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                rect.right_top(),
+                egui::pos2(rect.right() - fade_w, rect.top()),
+                rect.right_bottom(),
+            ],
+            fade_shade,
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
 /// Draws a Logic-style min/max waveform for an `Audio`-track clip's whole buffer, stretched across
 /// `rect` (a clip has no stored length — see `model::AudioClip` — so its rect already spans the
 /// buffer's full real-time duration; one column of pixels covers a proportional slice of samples).
@@ -7465,6 +7888,7 @@ fn playlist_contents_ui(
                         ),
                     );
                     draw_region_note_preview(&painter, preview_rect, region);
+                    draw_region_fade_overlays(&painter, region_rect, region, zoom);
                     painter.rect_stroke(
                         region_rect,
                         2u8,
@@ -7631,6 +8055,43 @@ fn handle_playlist_interaction(
         (0..song.tracks[track_index].regions.len())
             .find(|&i| near_right_edge(song, track_index, i, local_x))
     };
+    // Fade handles sit at the point on the region's top edge where its fade ramp ends (fade-in)
+    // or begins (fade-out) — see the matching drawing code in `playlist_contents_ui`. Restricted
+    // to the top half of the row (`row_frac`) so a fade handle at fade_*_ticks == 0 (sitting right
+    // at the region's corner) doesn't shadow the whole-height Move/Resize hit-tests below.
+    let near_fade_in_handle = |song: &Song, track_index: usize, region_index: usize, local_x: f32| {
+        let region = &song.tracks[track_index].regions[region_index];
+        let span_ticks = region.loop_length_steps * TICKS_PER_STEP;
+        let fade_ticks = region.fade_in_ticks.min(span_ticks);
+        let x = tick_to_x(region.start_tick + fade_ticks, zoom);
+        (local_x - x).abs() <= RESIZE_HANDLE_PX
+    };
+    let near_fade_out_handle = |song: &Song, track_index: usize, region_index: usize, local_x: f32| {
+        let region = &song.tracks[track_index].regions[region_index];
+        let span_ticks = region.loop_length_steps * TICKS_PER_STEP;
+        let fade_ticks = region.fade_out_ticks.min(span_ticks);
+        let x = tick_to_x(region.start_tick + span_ticks - fade_ticks, zoom);
+        (local_x - x).abs() <= RESIZE_HANDLE_PX
+    };
+    let region_at_fade_in_handle =
+        |song: &Song, track_index: usize, local_x: f32, row_frac: f32| -> Option<usize> {
+            if row_frac > 0.5 {
+                return None;
+            }
+            (0..song.tracks[track_index].regions.len())
+                .find(|&i| near_fade_in_handle(song, track_index, i, local_x))
+        };
+    let region_at_fade_out_handle =
+        |song: &Song, track_index: usize, local_x: f32, row_frac: f32| -> Option<usize> {
+            if row_frac > 0.5 {
+                return None;
+            }
+            (0..song.tracks[track_index].regions.len())
+                .find(|&i| near_fade_out_handle(song, track_index, i, local_x))
+        };
+    let row_frac_at = |ly: f32, row: usize| -> f32 {
+        ((ly - PLAYLIST_RULER_HEIGHT) / PLAYLIST_LANE_HEIGHT) - row as f32
+    };
 
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
@@ -7692,7 +8153,26 @@ fn handle_playlist_interaction(
             if let Some(row) = y_to_row(ly) {
                 let track_index = lane_track_indices[row];
                 let step = x_to_step(lx);
-                if let Some(region_index) = region_at_right_edge(song, track_index, lx) {
+                let row_frac = row_frac_at(ly, row);
+                if let Some(region_index) =
+                    region_at_fade_in_handle(song, track_index, lx, row_frac)
+                {
+                    *drag = Some(PlaylistDrag {
+                        mode: PlaylistDragMode::FadeIn {
+                            track_index,
+                            region_index,
+                        },
+                    });
+                } else if let Some(region_index) =
+                    region_at_fade_out_handle(song, track_index, lx, row_frac)
+                {
+                    *drag = Some(PlaylistDrag {
+                        mode: PlaylistDragMode::FadeOut {
+                            track_index,
+                            region_index,
+                        },
+                    });
+                } else if let Some(region_index) = region_at_right_edge(song, track_index, lx) {
                     *drag = Some(PlaylistDrag {
                         mode: PlaylistDragMode::Resize {
                             track_index,
@@ -7737,6 +8217,14 @@ fn handle_playlist_interaction(
             | PlaylistDragMode::Create {
                 track_index,
                 region_index,
+            }
+            | PlaylistDragMode::FadeIn {
+                track_index,
+                region_index,
+            }
+            | PlaylistDragMode::FadeOut {
+                track_index,
+                region_index,
             } => (*track_index, *region_index),
         };
         let region_count = song.tracks.get(track_index).map_or(0, |t| t.regions.len());
@@ -7770,6 +8258,36 @@ fn handle_playlist_interaction(
                             let region = &mut song.tracks[track_index].regions[region_index];
                             let start_step = region.start_tick / TICKS_PER_STEP;
                             region.loop_length_steps = step.max(start_step + 1) - start_step;
+                        }
+                    }
+                    if response.drag_stopped() {
+                        *drag = None;
+                    }
+                }
+                PlaylistDragMode::FadeIn { .. } => {
+                    if response.dragged() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let (lx, _ly) = local(pos);
+                            let tick = x_to_tick(lx.max(0.0), zoom);
+                            let region = &mut song.tracks[track_index].regions[region_index];
+                            let span_ticks = region.loop_length_steps * TICKS_PER_STEP;
+                            let offset = tick.saturating_sub(region.start_tick);
+                            region.fade_in_ticks = offset.min(span_ticks);
+                        }
+                    }
+                    if response.drag_stopped() {
+                        *drag = None;
+                    }
+                }
+                PlaylistDragMode::FadeOut { .. } => {
+                    if response.dragged() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let (lx, _ly) = local(pos);
+                            let tick = x_to_tick(lx.max(0.0), zoom);
+                            let region = &mut song.tracks[track_index].regions[region_index];
+                            let span_ticks = region.loop_length_steps * TICKS_PER_STEP;
+                            let end_tick = region.start_tick + span_ticks;
+                            region.fade_out_ticks = end_tick.saturating_sub(tick).min(span_ticks);
                         }
                     }
                     if response.drag_stopped() {
@@ -7952,6 +8470,349 @@ fn velocity_lane_ui(
             }
         }
     });
+}
+
+/// Height of one automation lane's point-graph canvas — see `automation_lane_graph_ui`.
+const AUTOMATION_LANE_HEIGHT: f32 = 44.0;
+/// Pixel radius of an automation point's drawn dot and its click/drag hit-test — matches
+/// `RESIZE_HANDLE_PX`'s role for the Playlist's region-edge/fade handles.
+const AUTOMATION_POINT_RADIUS: f32 = 4.0;
+
+/// Human label for an effect chain slot's kind, straight from its saved config (no live instance
+/// needed) — the automation target picker's counterpart to `BuiltInEffect::label()`, which only
+/// works on a live instance.
+fn track_effect_config_label(config: &TrackEffectConfig) -> &'static str {
+    match config {
+        TrackEffectConfig::Clap { .. } => "CLAP",
+        TrackEffectConfig::Delay { .. } => "Delay",
+        TrackEffectConfig::Bitcrusher { .. } => "Bitcrusher",
+        TrackEffectConfig::Distortion { .. } => "Distortion",
+        TrackEffectConfig::Reverb { .. } => "Reverb",
+        TrackEffectConfig::Chorus { .. } => "Chorus",
+        TrackEffectConfig::Filter { .. } => "Filter",
+        TrackEffectConfig::Tremolo { .. } => "Tremolo",
+        TrackEffectConfig::Compressor { .. } => "Compressor",
+        TrackEffectConfig::Flanger { .. } => "Flanger",
+        TrackEffectConfig::Phaser { .. } => "Phaser",
+        TrackEffectConfig::RingModulator { .. } => "Ring Mod",
+        TrackEffectConfig::NoiseGate { .. } => "Noise Gate",
+        TrackEffectConfig::PhaseInvert { .. } => "Phase Invert",
+        TrackEffectConfig::ChannelEq { .. } => "Channel EQ",
+        TrackEffectConfig::Limiter { .. } => "Limiter",
+    }
+}
+
+/// This chain slot's automatable parameters, as (display name, min, max, target key) — for a
+/// built-in effect this is static (from the saved config alone, via `automatable_params_for_config`);
+/// for a CLAP plugin it comes from whatever's actually currently loaded there (`PluginParamInfo`,
+/// only known once the plugin's loaded and declared its parameters), so a CLAP slot offers nothing
+/// here until it's been loaded at least once. Owned `String`s rather than borrowing from the
+/// locked chain, so the result outlives the lock.
+fn effect_slot_automatable_params(
+    config: &TrackEffectConfig,
+    track_effect_slots: &TrackEffectSlots,
+    track_index: usize,
+    slot_index: usize,
+) -> Vec<(String, f32, f32, EffectParamKey)> {
+    match config {
+        TrackEffectConfig::Clap { .. } => {
+            let Ok(chains) = track_effect_slots.lock() else {
+                return Vec::new();
+            };
+            let Some(Some(EffectInstance::Clap(effect))) =
+                chains.get(track_index).and_then(|chain| chain.get(slot_index))
+            else {
+                return Vec::new();
+            };
+            effect
+                .params
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        p.min_value as f32,
+                        p.max_value as f32,
+                        EffectParamKey::Clap { param_id: p.id.get() },
+                    )
+                })
+                .collect()
+        }
+        _ => automatable_params_for_config(config)
+            .iter()
+            .map(|&(name, min, max)| {
+                (
+                    name.to_string(),
+                    min,
+                    max,
+                    EffectParamKey::BuiltIn { param_name: name.to_string() },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Human label for an already-existing lane's target, for its row header — `Volume`/`Pan` as-is,
+/// `Send: <name>` (falling back to the index if the send was since removed), and
+/// `FX <slot+1> (<kind>): <param>` for an effect param (again falling back to a generic label if
+/// the slot's contents changed since the lane was created).
+fn automation_target_label(
+    target: &AutomationTarget,
+    track_effects: &[TrackEffectConfig],
+    sends: &[SendBus],
+) -> String {
+    match target {
+        AutomationTarget::Volume => "Volume".to_string(),
+        AutomationTarget::Pan => "Pan".to_string(),
+        AutomationTarget::SendLevel { send_index } => match sends.get(*send_index) {
+            Some(send) => format!("Send: {}", send.name),
+            None => format!("Send {}", send_index + 1),
+        },
+        AutomationTarget::EffectParam { slot_index, key } => {
+            let param_name = match key {
+                EffectParamKey::Clap { param_id } => format!("param {param_id}"),
+                EffectParamKey::BuiltIn { param_name } => param_name.clone(),
+            };
+            match track_effects.get(*slot_index) {
+                Some(config) => format!(
+                    "FX {} ({}): {param_name}",
+                    slot_index + 1,
+                    track_effect_config_label(config)
+                ),
+                None => format!("FX {}: {param_name}", slot_index + 1),
+            }
+        }
+    }
+}
+
+/// This target's value range, for the lane graph's y-axis and new-point clamping — static ranges
+/// for `Volume`/`Pan`/`SendLevel` (matching their sliders elsewhere in the Mixer), or whatever
+/// `effect_slot_automatable_params` reports for an `EffectParam` target (falling back to 0.0..1.0
+/// if the slot's contents no longer match the key the lane was created for, e.g. a different
+/// effect was loaded into that slot since).
+fn automation_target_range(
+    target: &AutomationTarget,
+    track_effects: &[TrackEffectConfig],
+    track_effect_slots: &TrackEffectSlots,
+    track_index: usize,
+) -> (f32, f32) {
+    match target {
+        AutomationTarget::Volume => (0.0, 1.5),
+        AutomationTarget::Pan => (-1.0, 1.0),
+        AutomationTarget::SendLevel { .. } => (0.0, 1.5),
+        AutomationTarget::EffectParam { slot_index, key } => {
+            let Some(config) = track_effects.get(*slot_index) else {
+                return (0.0, 1.0);
+            };
+            let params =
+                effect_slot_automatable_params(config, track_effect_slots, track_index, *slot_index);
+            params
+                .iter()
+                .find(|(_, _, _, k)| k == key)
+                .map(|&(_, min, max, _)| (min, max))
+                .unwrap_or((0.0, 1.0))
+        }
+    }
+}
+
+/// One automation lane's point graph: a connecting line through every point (sorted by tick for
+/// display only — see `AutomationLane::value_at`'s doc comment on why storage order doesn't
+/// matter), a dot per point, click-empty-space to add a point, drag a point to move it (both tick
+/// and value), right-click a point to delete it. The `Region` fade triangles' visual counterpart
+/// for a full multi-point "ride" rather than a single ramp.
+fn automation_lane_graph_ui(
+    ui: &mut egui::Ui,
+    lane: &mut AutomationLane,
+    lane_index: usize,
+    span_ticks: usize,
+    value_range: (f32, f32),
+    zoom: f32,
+    drag: &mut Option<AutomationDrag>,
+) {
+    let canvas_width = tick_to_x(span_ticks, zoom).max(40.0);
+    let (response, painter) = ui.allocate_painter(
+        egui::vec2(canvas_width, AUTOMATION_LANE_HEIGHT),
+        egui::Sense::click_and_drag(),
+    );
+    let rect = response.rect;
+    painter.rect_filled(rect, 0u8, ui.visuals().extreme_bg_color);
+
+    let (min, max) = value_range;
+    let value_to_y = |value: f32| {
+        let frac = if max > min { (value - min) / (max - min) } else { 0.5 };
+        rect.bottom() - frac.clamp(0.0, 1.0) * rect.height()
+    };
+    let y_to_value = |y: f32| {
+        let frac = ((rect.bottom() - y) / rect.height()).clamp(0.0, 1.0);
+        min + frac * (max - min)
+    };
+    let point_pos = |point: &AutomationPoint| {
+        egui::pos2(rect.left() + tick_to_x(point.tick, zoom), value_to_y(point.value))
+    };
+
+    let mut sorted_points: Vec<AutomationPoint> = lane.points.clone();
+    sorted_points.sort_by_key(|p| p.tick);
+    if sorted_points.len() >= 2 {
+        let line: Vec<egui::Pos2> = sorted_points.iter().map(point_pos).collect();
+        painter.add(egui::Shape::line(line, egui::Stroke::new(1.5, FL_ACCENT_GREEN)));
+    }
+    for point in &lane.points {
+        painter.circle_filled(point_pos(point), AUTOMATION_POINT_RADIUS, egui::Color32::WHITE);
+    }
+
+    let point_near = |lane: &AutomationLane, pos: egui::Pos2| -> Option<usize> {
+        lane.points
+            .iter()
+            .position(|p| (point_pos(p) - pos).length() <= AUTOMATION_POINT_RADIUS + 3.0)
+    };
+
+    if drag.is_none() && response.drag_started() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(point_index) = point_near(lane, pos) {
+                *drag = Some(AutomationDrag { lane_index, point_index });
+            }
+        }
+    }
+
+    if let Some(state) = drag {
+        if state.lane_index == lane_index {
+            if state.point_index >= lane.points.len() {
+                *drag = None;
+            } else {
+                if response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let tick = x_to_tick((pos.x - rect.left()).max(0.0), zoom).min(span_ticks);
+                        let value = y_to_value(pos.y).clamp(min, max);
+                        if let Some(point) = lane.points.get_mut(state.point_index) {
+                            point.tick = tick;
+                            point.value = value;
+                        }
+                    }
+                }
+                if response.drag_stopped() {
+                    *drag = None;
+                }
+            }
+        }
+    }
+
+    if response.clicked() && drag.is_none() && point_near(lane, response.interact_pointer_pos().unwrap_or_default()).is_none() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let tick = x_to_tick((pos.x - rect.left()).max(0.0), zoom).min(span_ticks);
+            let value = y_to_value(pos.y).clamp(min, max);
+            lane.points.push(AutomationPoint { tick, value });
+        }
+    }
+    if response.secondary_clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(point_index) = point_near(lane, pos) {
+                lane.points.remove(point_index);
+            }
+        }
+    }
+}
+
+/// The automation panel shown under a region's own content editor (Piano Roll or Beats) — an
+/// "+ Add Lane" menu (Volume/Pan/every send/every automatable param on this track's own effect
+/// chain) plus one `automation_lane_graph_ui` row per existing lane, each with a remove button.
+/// `track_effects`/`track_effect_slots` are this region's own track's — automation only ever
+/// targets its own track, never another track, a send's own chain, or the master bus (see
+/// `AutomationTarget`'s doc comment).
+fn automation_lanes_ui(
+    ui: &mut egui::Ui,
+    region: &mut Region,
+    track_index: usize,
+    track_effects: &[TrackEffectConfig],
+    track_effect_slots: &TrackEffectSlots,
+    sends: &[SendBus],
+    zoom: f32,
+    drag: &mut Option<AutomationDrag>,
+) {
+    let span_ticks = region.loop_length_steps * TICKS_PER_STEP;
+    ui.horizontal(|ui| {
+        ui.strong("Automation");
+        ui.menu_button("+ Add Lane", |ui| {
+            if ui.button("Volume").clicked() {
+                region.automation.push(AutomationLane { target: AutomationTarget::Volume, points: Vec::new() });
+                ui.close();
+            }
+            if ui.button("Pan").clicked() {
+                region.automation.push(AutomationLane { target: AutomationTarget::Pan, points: Vec::new() });
+                ui.close();
+            }
+            if !sends.is_empty() {
+                ui.menu_button("Send Level", |ui| {
+                    for (send_index, send) in sends.iter().enumerate() {
+                        if ui.button(&send.name).clicked() {
+                            region.automation.push(AutomationLane {
+                                target: AutomationTarget::SendLevel { send_index },
+                                points: Vec::new(),
+                            });
+                            ui.close();
+                        }
+                    }
+                });
+            }
+            for (slot_index, config) in track_effects.iter().enumerate() {
+                let params =
+                    effect_slot_automatable_params(config, track_effect_slots, track_index, slot_index);
+                if params.is_empty() {
+                    continue;
+                }
+                let label = format!("FX {} ({})", slot_index + 1, track_effect_config_label(config));
+                ui.menu_button(label, |ui| {
+                    for (name, _min, _max, key) in &params {
+                        if ui.button(name).clicked() {
+                            region.automation.push(AutomationLane {
+                                target: AutomationTarget::EffectParam {
+                                    slot_index,
+                                    key: key.clone(),
+                                },
+                                points: Vec::new(),
+                            });
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        });
+    });
+
+    if region.automation.is_empty() {
+        ui.weak("No automation lanes yet.");
+        return;
+    }
+
+    let mut lane_to_remove = None;
+    for lane_index in 0..region.automation.len() {
+        let label = automation_target_label(&region.automation[lane_index].target, track_effects, sends);
+        let value_range = automation_target_range(
+            &region.automation[lane_index].target,
+            track_effects,
+            track_effect_slots,
+            track_index,
+        );
+        ui.horizontal(|ui| {
+            ui.label(&label);
+            if ui.small_button("✕").on_hover_text("Remove lane").clicked() {
+                lane_to_remove = Some(lane_index);
+            }
+        });
+        automation_lane_graph_ui(
+            ui,
+            &mut region.automation[lane_index],
+            lane_index,
+            span_ticks,
+            value_range,
+            zoom,
+            drag,
+        );
+    }
+    if let Some(index) = lane_to_remove {
+        region.automation.remove(index);
+        if drag.as_ref().is_some_and(|d| d.lane_index == index) {
+            *drag = None;
+        }
+    }
 }
 
 fn note_name(pitch: u8) -> String {

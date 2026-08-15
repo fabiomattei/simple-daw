@@ -7,11 +7,12 @@ use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, Stream, StreamConf
 
 use crate::metering::{LoudnessMeter, MeterHandles};
 use crate::model::{
-    FilterRouting, FilterSlope, FilterType, LfoTarget, ModSlot, ModSource, ModTarget,
-    RegionContent, Song, SynthEngine, SynthParams, SynthWaveform, TICKS_PER_STEP, Track,
-    TrackKind, TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams,
+    AutomationTarget, EffectParamKey, FilterRouting, FilterSlope, FilterType, LfoTarget, ModSlot,
+    ModSource, ModTarget, RegionContent, Song, SynthEngine, SynthParams, SynthWaveform,
+    TICKS_PER_STEP, Track, TrackKind, TrineParams, WaveModSlot, WaveModSource, WaveModTarget,
+    WaveParams,
 };
-use crate::plugin_host::{self, MasterEffectSlots, TrackEffectSlots};
+use crate::plugin_host::{self, MasterEffectSlots, SendEffectSlots, TrackEffectSlots};
 use crate::sample::SampleBuffer;
 use crate::wavetable::{self, WaveWarpMode, WavetableId};
 
@@ -174,6 +175,7 @@ impl AudioEngine {
         transport: Transport,
         master_effects: MasterEffectSlots,
         track_effects: TrackEffectSlots,
+        send_effects: SendEffectSlots,
         track_meters: MeterHandles,
         master_meter: MeterHandles,
         device_name: Option<&str>,
@@ -231,6 +233,7 @@ impl AudioEngine {
                 transport,
                 master_effects,
                 track_effects,
+                send_effects,
                 track_meters,
                 master_meter,
                 max_frames as usize,
@@ -242,6 +245,7 @@ impl AudioEngine {
                 transport,
                 master_effects,
                 track_effects,
+                send_effects,
                 track_meters,
                 master_meter,
                 max_frames as usize,
@@ -253,6 +257,7 @@ impl AudioEngine {
                 transport,
                 master_effects,
                 track_effects,
+                send_effects,
                 track_meters,
                 master_meter,
                 max_frames as usize,
@@ -2028,6 +2033,14 @@ struct Sequencer {
     tick_index: usize,
     samples_until_next_tick: f64,
     last_triggered_tick: usize,
+    /// This track's current region-fade gain (0.0..1.0, see `Region::fade_gain_at`), recomputed
+    /// once per tick (in lockstep with the trigger loop, not per-sample — see `process`'s doc
+    /// comment on why tick granularity is smooth enough here) and held across every sample until
+    /// the next tick. Reverts to 1.0 whenever no region is currently active on that track, even if
+    /// a still-ringing voice's own envelope (untouched by this) plays on past the region's end —
+    /// this engine already tolerates that same "notes ring past their trigger" gap for mute/regions
+    /// generally, not something fades need to newly solve. Indexed the same as `track_voices`.
+    track_fade_gain: Vec<f32>,
     /// How many samples into its decaying click envelope the metronome currently is —
     /// `>= metronome_click_len` means silent (see `next_metronome_click_sample`).
     metronome_click_pos: usize,
@@ -2051,6 +2064,7 @@ impl Sequencer {
             tick_index: 0,
             samples_until_next_tick: 0.0,
             last_triggered_tick: 0,
+            track_fade_gain: Vec::new(),
             metronome_click_pos: 0,
             metronome_click_len: 0,
             metronome_click_freq: 0.0,
@@ -2114,6 +2128,7 @@ impl Sequencer {
             self.track_voices.push(TrackVoices::new());
         }
         self.track_voices.truncate(snapshot.tracks.len());
+        self.track_fade_gain.resize(snapshot.tracks.len(), 1.0);
 
         track_out_l.resize_with(snapshot.tracks.len(), Vec::new);
         track_out_r.resize_with(snapshot.tracks.len(), Vec::new);
@@ -2155,15 +2170,26 @@ impl Sequencer {
                     if track_silent(track) {
                         continue;
                     }
+                    // No region active this tick reverts to unfaded (1.0) — see
+                    // `track_fade_gain`'s doc comment. Recomputed from scratch each tick rather
+                    // than only lowered, so raising a region's fade values back down (or moving
+                    // off a region entirely) takes effect immediately, not just on the next fade-in.
+                    self.track_fade_gain[track_index] = 1.0;
                     for region in track.regions.iter().filter(|region| {
                         self.tick_index >= region.start_tick
                             && self.tick_index
                                 < region.start_tick + region.loop_length_steps * TICKS_PER_STEP
                     }) {
+                        // Offset from the region's on-timeline start — feeds both the fade curve
+                        // (against the on-timeline span) and, modulo the content's own length
+                        // below, which step/note is playing right now.
+                        let region_offset_ticks = self.tick_index - region.start_tick;
+                        self.track_fade_gain[track_index] = self.track_fade_gain[track_index]
+                            .min(region.fade_gain_at(region_offset_ticks));
                         // The region's on-timeline span may be shorter than its own content
                         // (truncating it) or longer (looping it) — both fall out of this modulo.
-                        let region_local_tick = (self.tick_index - region.start_tick)
-                            % region.content_length_ticks().max(1);
+                        let region_local_tick =
+                            region_offset_ticks % region.content_length_ticks().max(1);
                         let tv = &mut self.track_voices[track_index];
                         match &region.content {
                             RegionContent::StepGrid(lanes) => {
@@ -2366,8 +2392,12 @@ impl Sequencer {
                     mixed_l += s;
                     mixed_r += s;
                 }
-                track_out_l[track_index][sample_index] = mixed_l;
-                track_out_r[track_index][sample_index] = mixed_r;
+                // Region fades (see `track_fade_gain`) scale this track's whole mixed output for
+                // the sample, same point pan/volume apply further downstream in the mixdown — not
+                // per-voice, since a voice doesn't know which region (if any) triggered it.
+                let fade_gain = self.track_fade_gain[track_index];
+                track_out_l[track_index][sample_index] = mixed_l * fade_gain;
+                track_out_r[track_index][sample_index] = mixed_r * fade_gain;
             }
             metronome_out[sample_index] = self.next_metronome_click_sample();
         }
@@ -2382,6 +2412,64 @@ fn equal_power_pan_gains(pan: f32) -> (f32, f32) {
     (theta.cos(), theta.sin())
 }
 
+/// One track's automated overrides (if any) for this buffer, evaluated once from whichever of
+/// that track's regions is active at the buffer's start tick — see `track_automation_override`.
+/// `Volume`/`Pan` read at buffer granularity, the same rate `Track::volume`/`Track::pan`
+/// themselves are already read at in `build_playback_stream` (unlike `Sequencer`'s per-tick
+/// `track_fade_gain`, which needs tick granularity because it scales already-triggered, freely
+/// ringing voices — a continuously-held control parameter like volume/pan/send-level/effect-param
+/// doesn't have that same constraint).
+#[derive(Default)]
+struct TrackAutomationOverride {
+    volume: Option<f32>,
+    pan: Option<f32>,
+    /// (send_index, level) pairs — only sends this track actually has a `SendLevel` lane for.
+    send_levels: Vec<(usize, f32)>,
+    /// (chain slot_index, param key, value) triples for this track's own effect chain.
+    effect_params: Vec<(usize, EffectParamKey, f32)>,
+}
+
+/// The region (if any) on `track` whose on-timeline span currently contains `tick` — the same
+/// active-region rule `Sequencer::process`'s trigger loop and `track_fade_gain` use. A region
+/// shorter than its own automation lanes' furthest point simply never reaches those points; lanes
+/// don't extend a region's span the way `fade_out_ticks` doesn't either.
+fn active_region_at(track: &Track, tick: usize) -> Option<&crate::model::Region> {
+    track.regions.iter().find(|region| {
+        tick >= region.start_tick && tick < region.start_tick + region.loop_length_steps * TICKS_PER_STEP
+    })
+}
+
+/// Evaluates `track`'s currently-active region's automation lanes (if any) at `tick`, into a
+/// per-target override set. Two lanes on the same target within one region (not offered by the
+/// UI, but not prevented either) would just have the later one in iteration order win — the same
+/// "unusual but not prevented" tolerance already extended to overlapping regions elsewhere in this
+/// file. An empty lane (no points yet) contributes nothing (`AutomationLane::value_at` returns
+/// `None`), so adding an automation lane in the UI before placing any points doesn't silently
+/// zero out that parameter.
+fn track_automation_override(track: &Track, tick: usize) -> TrackAutomationOverride {
+    let mut result = TrackAutomationOverride::default();
+    let Some(region) = active_region_at(track, tick) else {
+        return result;
+    };
+    let offset = tick - region.start_tick;
+    for lane in &region.automation {
+        let Some(value) = lane.value_at(offset) else {
+            continue;
+        };
+        match &lane.target {
+            AutomationTarget::Volume => result.volume = Some(value),
+            AutomationTarget::Pan => result.pan = Some(value),
+            AutomationTarget::SendLevel { send_index } => {
+                result.send_levels.push((*send_index, value));
+            }
+            AutomationTarget::EffectParam { slot_index, key } => {
+                result.effect_params.push((*slot_index, key.clone(), value));
+            }
+        }
+    }
+    result
+}
+
 fn build_playback_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -2389,6 +2477,7 @@ fn build_playback_stream<T>(
     transport: Transport,
     master_effects: MasterEffectSlots,
     track_effects: TrackEffectSlots,
+    send_effects: SendEffectSlots,
     track_meters: MeterHandles,
     master_meter: MeterHandles,
     max_frames: usize,
@@ -2426,6 +2515,20 @@ where
     // `LoudnessMeter` (see below) — not summed anywhere itself, just a metering tap.
     let mut track_meter_l: Vec<f32> = Vec::with_capacity(max_frames);
     let mut track_meter_r: Vec<f32> = Vec::with_capacity(max_frames);
+
+    // One accumulation buffer per send bus (resized in lockstep with `Song::sends`), fed by every
+    // track's post-fader/pan signal scaled by that track's `Track::send_levels` entry for this
+    // send — the same tap point `track_meter_l/r` reads, just scaled per-send instead of summed
+    // straight into the master mix. Plus per-send CLAP/built-in effect-chain scratch, mirroring
+    // `track_scratch`'s per-track shape, and a pair of reusable output/run buffers (sends are
+    // processed one at a time, so one reusable pair covers all of them per callback).
+    let mut send_mix_l: Vec<Vec<f32>> = Vec::new();
+    let mut send_mix_r: Vec<Vec<f32>> = Vec::new();
+    let mut send_scratch: Vec<Vec<plugin_host::EffectScratch>> = Vec::new();
+    let mut send_chain_out_l: Vec<f32> = Vec::with_capacity(max_frames);
+    let mut send_chain_out_r: Vec<f32> = Vec::with_capacity(max_frames);
+    let mut send_chain_run_l: Vec<f32> = Vec::with_capacity(max_frames);
+    let mut send_chain_run_r: Vec<f32> = Vec::with_capacity(max_frames);
 
     // Scratch for the master bus's own effect chain — same shape as `track_scratch`'s per-track
     // entries (one `EffectScratch` per chain slot), since the master chain runs through the exact
@@ -2470,6 +2573,17 @@ where
             let mut s = plugin_host::EffectScratch::new();
             s.reserve(max_frames);
             master_scratch.push(s);
+        }
+    }
+    if let Ok(chains) = send_effects.lock() {
+        for chain in chains.iter() {
+            let mut stage_scratch = Vec::with_capacity(chain.len());
+            for _ in chain {
+                let mut s = plugin_host::EffectScratch::new();
+                s.reserve(max_frames);
+                stage_scratch.push(s);
+            }
+            send_scratch.push(stage_scratch);
         }
     }
 
@@ -2530,6 +2644,15 @@ where
                     .current_tick
                     .store(sequencer.current_tick(), Ordering::Relaxed);
 
+                // One automated-override snapshot per track for this whole buffer — see
+                // `TrackAutomationOverride`'s doc comment on why buffer granularity (not per-tick)
+                // is the right rate here.
+                let track_automation: Vec<TrackAutomationOverride> = snapshot
+                    .tracks
+                    .iter()
+                    .map(|track| track_automation_override(track, sequencer.current_tick()))
+                    .collect();
+
                 // Track count can change between callbacks (tracks added/removed) — resize in
                 // lockstep with `track_dry_l`, same as `sequencer.track_voices` above.
                 while track_loudness.len() < track_dry_l.len() {
@@ -2550,6 +2673,17 @@ where
                 track_effect_out_r.resize(frames, 0.0);
                 track_meter_l.resize(frames, 0.0);
                 track_meter_r.resize(frames, 0.0);
+
+                // Send bus count can change between callbacks (buses added/removed) — resize in
+                // lockstep with `Song::sends`, same as `track_loudness` above.
+                send_mix_l.resize_with(snapshot.sends.len(), Vec::new);
+                send_mix_r.resize_with(snapshot.sends.len(), Vec::new);
+                for buf in send_mix_l.iter_mut().chain(send_mix_r.iter_mut()) {
+                    buf.clear();
+                    buf.resize(frames, 0.0);
+                }
+                send_scratch.resize_with(snapshot.sends.len(), Vec::new);
+
                 if let Ok(mut chains) = track_effects.lock() {
                     while track_scratch.len() < track_dry_l.len() {
                         track_scratch.push(Vec::new());
@@ -2558,11 +2692,38 @@ where
                         track_dry_l.iter().zip(track_dry_r.iter()).enumerate()
                     {
                         let track = snapshot.tracks.get(track_index);
-                        let volume = track.map_or(1.0, |t| t.volume);
-                        let (pan_l, pan_r) = equal_power_pan_gains(track.map_or(0.0, |t| t.pan));
+                        let automation = track_automation.get(track_index);
+                        let volume = automation
+                            .and_then(|a| a.volume)
+                            .unwrap_or_else(|| track.map_or(1.0, |t| t.volume));
+                        let pan = automation
+                            .and_then(|a| a.pan)
+                            .unwrap_or_else(|| track.map_or(0.0, |t| t.pan));
+                        let (pan_l, pan_r) = equal_power_pan_gains(pan);
                         let chain = chains
                             .get_mut(track_index)
                             .map_or(&mut [][..], Vec::as_mut_slice);
+                        // Push this buffer's automated effect-param values (if any) into the live
+                        // chain before running it, so `process_effect_chain` below picks them up
+                        // immediately rather than a buffer late.
+                        if let Some(automation) = automation {
+                            for (slot_index, key, value) in &automation.effect_params {
+                                let Some(Some(instance)) = chain.get_mut(*slot_index) else {
+                                    continue;
+                                };
+                                match (instance, key) {
+                                    (
+                                        plugin_host::EffectInstance::Clap(effect),
+                                        EffectParamKey::Clap { param_id },
+                                    ) => effect.set_param_by_id(*param_id, *value as f64),
+                                    (
+                                        plugin_host::EffectInstance::BuiltIn(effect),
+                                        EffectParamKey::BuiltIn { param_name },
+                                    ) => effect.set_automatable_param(param_name, *value),
+                                    _ => {}
+                                }
+                            }
+                        }
                         let stage_scratch = &mut track_scratch[track_index];
                         while stage_scratch.len() < chain.len() {
                             stage_scratch.push(plugin_host::EffectScratch::new());
@@ -2602,14 +2763,48 @@ where
                         {
                             handle.publish(&readings);
                         }
+
+                        // Feed this track's post-fader/pan signal (`track_meter_l/r`, just
+                        // published to the meter above) into every send bus it has a nonzero
+                        // level for — the same tap point a channel strip's send knob reads from.
+                        // A `SendLevel` automation lane on that send overrides the static level.
+                        if let Some(send_levels) = track.map(|t| t.send_levels.as_slice()) {
+                            for (send_index, &level) in send_levels.iter().enumerate() {
+                                let level = automation
+                                    .and_then(|a| {
+                                        a.send_levels
+                                            .iter()
+                                            .find(|(i, _)| *i == send_index)
+                                            .map(|(_, v)| *v)
+                                    })
+                                    .unwrap_or(level);
+                                if level == 0.0 {
+                                    continue;
+                                }
+                                if let (Some(mix_l), Some(mix_r)) =
+                                    (send_mix_l.get_mut(send_index), send_mix_r.get_mut(send_index))
+                                {
+                                    for i in 0..frames {
+                                        mix_l[i] += track_meter_l[i] * level;
+                                        mix_r[i] += track_meter_r[i] * level;
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else {
                     for (track_index, (dry_l, dry_r)) in
                         track_dry_l.iter().zip(track_dry_r.iter()).enumerate()
                     {
                         let track = snapshot.tracks.get(track_index);
-                        let volume = track.map_or(1.0, |t| t.volume);
-                        let (pan_l, pan_r) = equal_power_pan_gains(track.map_or(0.0, |t| t.pan));
+                        let automation = track_automation.get(track_index);
+                        let volume = automation
+                            .and_then(|a| a.volume)
+                            .unwrap_or_else(|| track.map_or(1.0, |t| t.volume));
+                        let pan = automation
+                            .and_then(|a| a.pan)
+                            .unwrap_or_else(|| track.map_or(0.0, |t| t.pan));
+                        let (pan_l, pan_r) = equal_power_pan_gains(pan);
                         for i in 0..frames {
                             let l = volume * pan_l * dry_l[i];
                             let r = volume * pan_r * dry_r[i];
@@ -2624,6 +2819,72 @@ where
                         {
                             handle.publish(&readings);
                         }
+
+                        // See the matching comment in the `Ok(mut chains)` branch above.
+                        if let Some(send_levels) = track.map(|t| t.send_levels.as_slice()) {
+                            for (send_index, &level) in send_levels.iter().enumerate() {
+                                let level = automation
+                                    .and_then(|a| {
+                                        a.send_levels
+                                            .iter()
+                                            .find(|(i, _)| *i == send_index)
+                                            .map(|(_, v)| *v)
+                                    })
+                                    .unwrap_or(level);
+                                if level == 0.0 {
+                                    continue;
+                                }
+                                if let (Some(mix_l), Some(mix_r)) =
+                                    (send_mix_l.get_mut(send_index), send_mix_r.get_mut(send_index))
+                                {
+                                    for i in 0..frames {
+                                        mix_l[i] += track_meter_l[i] * level;
+                                        mix_r[i] += track_meter_r[i] * level;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Run each send bus's own effect chain (same `process_effect_chain` machinery a
+                // track's or the master's chain uses) over its accumulated `send_mix_l/r`, then
+                // sum the result straight into the master mix — a send bus has no fader of its
+                // own in this minimal model, just its chain and whatever level each track sent it.
+                send_chain_out_l.resize(frames, 0.0);
+                send_chain_out_r.resize(frames, 0.0);
+                for (send_index, (mix_l, mix_r)) in
+                    send_mix_l.iter().zip(send_mix_r.iter()).enumerate()
+                {
+                    if let Ok(mut chains) = send_effects.lock() {
+                        let chain = chains
+                            .get_mut(send_index)
+                            .map_or(&mut [][..], Vec::as_mut_slice);
+                        let stage_scratch = &mut send_scratch[send_index];
+                        while stage_scratch.len() < chain.len() {
+                            stage_scratch.push(plugin_host::EffectScratch::new());
+                        }
+                        let used = plugin_host::process_effect_chain(
+                            chain,
+                            mix_l,
+                            mix_r,
+                            &mut send_chain_out_l,
+                            &mut send_chain_out_r,
+                            stage_scratch,
+                            &mut send_chain_run_l,
+                            &mut send_chain_run_r,
+                        );
+                        if used {
+                            for i in 0..frames {
+                                scratch_l[i] += send_chain_out_l[i];
+                                scratch_r[i] += send_chain_out_r[i];
+                            }
+                            continue;
+                        }
+                    }
+                    for i in 0..frames {
+                        scratch_l[i] += mix_l[i];
+                        scratch_r[i] += mix_r[i];
                     }
                 }
 
@@ -3438,6 +3699,7 @@ mod tests {
             synth_presets: Vec::new(),
             time_signature_numerator: 4,
             time_signature_denominator: 4,
+            sends: Vec::new(),
         }
     }
 
@@ -3460,7 +3722,191 @@ mod tests {
                 length_ticks: note_length_ticks,
                 velocity: 127,
             }]),
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            automation: Vec::new(),
         }
+    }
+
+    /// Same as `one_note_region`, but with a note sustained for the whole on-timeline span (so its
+    /// amplitude envelope is already well past its own attack by the time the region's fade would
+    /// matter) and an explicit `fade_in_ticks` — for testing `Sequencer::process`'s region-fade
+    /// gain, isolated from the synth's own envelope shape.
+    fn sustained_note_region_with_fade_in(
+        loop_length_steps: usize,
+        fade_in_ticks: usize,
+    ) -> crate::model::Region {
+        crate::model::Region {
+            name: "Hit".to_string(),
+            start_tick: 0,
+            content_length_steps: loop_length_steps,
+            loop_length_steps,
+            content: RegionContent::PianoRoll(vec![crate::model::Note {
+                id: 0,
+                pitch: 60,
+                start_tick: 0,
+                length_ticks: loop_length_steps * TICKS_PER_STEP,
+                velocity: 127,
+            }]),
+            fade_in_ticks,
+            fade_out_ticks: 0,
+            automation: Vec::new(),
+        }
+    }
+
+    fn region_with_automation(
+        loop_length_steps: usize,
+        lanes: Vec<crate::model::AutomationLane>,
+    ) -> crate::model::Region {
+        crate::model::Region {
+            name: "Automated".to_string(),
+            start_tick: 0,
+            content_length_steps: loop_length_steps,
+            loop_length_steps,
+            content: RegionContent::PianoRoll(Vec::new()),
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            automation: lanes,
+        }
+    }
+
+    #[test]
+    fn track_automation_override_is_default_with_no_active_region() {
+        let track = crate::model::Track::new_piano_roll("Lead", 1);
+        let result = track_automation_override(&track, 0);
+        assert_eq!(result.volume, None);
+        assert_eq!(result.pan, None);
+        assert!(result.send_levels.is_empty());
+        assert!(result.effect_params.is_empty());
+    }
+
+    #[test]
+    fn track_automation_override_is_default_when_the_active_region_has_no_lanes() {
+        let mut track = crate::model::Track::new_piano_roll("Lead", 1);
+        track.regions.push(region_with_automation(4, Vec::new()));
+        let result = track_automation_override(&track, 10);
+        assert_eq!(result.volume, None);
+        assert_eq!(result.pan, None);
+    }
+
+    #[test]
+    fn track_automation_override_reads_volume_and_pan_from_the_active_region() {
+        use crate::model::{AutomationLane, AutomationPoint, AutomationTarget};
+        let mut track = crate::model::Track::new_piano_roll("Lead", 1);
+        track.regions.push(region_with_automation(
+            4,
+            vec![
+                AutomationLane {
+                    target: AutomationTarget::Volume,
+                    points: vec![
+                        AutomationPoint { tick: 0, value: 0.0 },
+                        AutomationPoint { tick: 96, value: 1.0 },
+                    ],
+                },
+                AutomationLane {
+                    target: AutomationTarget::Pan,
+                    points: vec![AutomationPoint { tick: 0, value: -1.0 }],
+                },
+            ],
+        ));
+        let result = track_automation_override(&track, 48);
+        assert!((result.volume.unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(result.pan, Some(-1.0));
+    }
+
+    #[test]
+    fn track_automation_override_ignores_a_region_that_is_not_active_at_this_tick() {
+        use crate::model::{AutomationLane, AutomationPoint, AutomationTarget};
+        let mut track = crate::model::Track::new_piano_roll("Lead", 1);
+        track.regions.push(region_with_automation(
+            4,
+            vec![AutomationLane {
+                target: AutomationTarget::Volume,
+                points: vec![AutomationPoint { tick: 0, value: 0.25 }],
+            }],
+        ));
+        // Past the region's on-timeline span (4 steps * TICKS_PER_STEP).
+        let result = track_automation_override(&track, 4 * TICKS_PER_STEP + 1);
+        assert_eq!(result.volume, None);
+    }
+
+    #[test]
+    fn track_automation_override_collects_send_level_and_effect_param_lanes() {
+        use crate::model::{AutomationLane, AutomationPoint, AutomationTarget, EffectParamKey};
+        let mut track = crate::model::Track::new_piano_roll("Lead", 1);
+        track.regions.push(region_with_automation(
+            4,
+            vec![
+                AutomationLane {
+                    target: AutomationTarget::SendLevel { send_index: 2 },
+                    points: vec![AutomationPoint { tick: 0, value: 0.6 }],
+                },
+                AutomationLane {
+                    target: AutomationTarget::EffectParam {
+                        slot_index: 0,
+                        key: EffectParamKey::BuiltIn { param_name: "Mix".to_string() },
+                    },
+                    points: vec![AutomationPoint { tick: 0, value: 0.3 }],
+                },
+            ],
+        ));
+        let result = track_automation_override(&track, 0);
+        assert_eq!(result.send_levels, vec![(2, 0.6)]);
+        assert_eq!(result.effect_params.len(), 1);
+        let (slot_index, key, value) = &result.effect_params[0];
+        assert_eq!(*slot_index, 0);
+        assert_eq!(*key, EffectParamKey::BuiltIn { param_name: "Mix".to_string() });
+        assert_eq!(*value, 0.3);
+    }
+
+    #[test]
+    fn region_fade_in_silences_the_first_tick_then_reaches_full_volume() {
+        let sample_rate = 48_000.0;
+        // A generous fade relative to one tick's worth of samples at a typical tempo/sample rate,
+        // so "well past the fade" isn't razor-close to the boundary computed below.
+        let fade_in_ticks = 20;
+        let region = sustained_note_region_with_fade_in(8, fade_in_ticks);
+        let mut song = song_with_regions(vec![region]);
+        // The default `SynthParams` is percussive (sustain_level 0.0 — decays to silence after
+        // `decay_seconds` regardless of gate length, see the type's own doc comment), which would
+        // confound this test's "still audible well after the fade" check with the synth's own
+        // decay. Hold at full amplitude instead, isolating the region fade's effect.
+        song.tracks[0].synth.attack_seconds = 0.0;
+        song.tracks[0].synth.decay_seconds = 0.0;
+        song.tracks[0].synth.sustain_level = 1.0;
+
+        let mut sequencer = Sequencer::new(sample_rate);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        // Enough frames to cover the fade-in window several times over regardless of tempo.
+        sequencer.process(
+            &song,
+            48_000,
+            &mut track_out_l,
+            &mut track_out_r,
+            false,
+            &mut metronome_out,
+        );
+
+        let samples_per_tick = (sample_rate as f64 * 60.0
+            / (song.bpm.max(1.0) as f64)
+            / STEPS_PER_BEAT
+            / TICKS_PER_STEP as f64)
+            .max(1.0);
+        let first_tick_samples = samples_per_tick as usize;
+        assert!(
+            track_out_l[0][..first_tick_samples].iter().all(|&s| s == 0.0),
+            "the region's first tick should be fully silenced by fade_gain_at(0) == 0.0"
+        );
+
+        let well_past_fade = ((fade_in_ticks + 4) as f64 * samples_per_tick) as usize;
+        assert!(
+            track_out_l[0][well_past_fade..]
+                .iter()
+                .any(|&s| s.abs() > 0.1),
+            "well after fade_in_ticks the note should be audible at full gain"
+        );
     }
 
     #[test]
@@ -3570,6 +4016,7 @@ mod tests {
             synth_presets: Vec::new(),
             time_signature_numerator: 4,
             time_signature_denominator: 4,
+            sends: Vec::new(),
         };
 
         let mut sequencer = Sequencer::new(48_000.0);
@@ -3621,6 +4068,7 @@ mod tests {
             synth_presets: Vec::new(),
             time_signature_numerator: 4,
             time_signature_denominator: 4,
+            sends: Vec::new(),
         };
 
         // The clip alone (no regions at all) should still determine a nonzero loop length —

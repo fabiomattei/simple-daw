@@ -293,6 +293,98 @@ impl BuiltInEffect {
         }
     }
 
+    /// Live-sets one of `automatable_params_for_config`'s names on this effect (clamped to its
+    /// declared range) — the real-time-safe write path automation uses every buffer (see
+    /// `audio.rs`'s mixdown). Silently ignores an unknown name rather than panicking: an
+    /// automation lane's saved param name isn't revalidated against whatever effect actually ended
+    /// up loaded in that chain slot (e.g. after swapping which effect is loaded there).
+    pub fn set_automatable_param(&mut self, name: &str, value: f32) {
+        let clamp = |lo: f32, hi: f32| value.clamp(lo, hi);
+        match self {
+            BuiltInEffect::Delay(e) => match name {
+                "Time" => e.time_ms = clamp(1.0, 2000.0),
+                "Feedback" => e.feedback = clamp(0.0, 0.95),
+                "Mix" => e.mix = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::Bitcrusher(e) => match name {
+                "Bit depth" => e.bit_depth = clamp(1.0, 16.0),
+                "Rate divisor" => e.rate_divisor = clamp(1.0, 50.0).round() as u32,
+                "Mix" => e.mix = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::Distortion(e) => match name {
+                "Drive" => e.drive = clamp(1.0, 20.0),
+                "Mix" => e.mix = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::Reverb(e) => match name {
+                "Room size" => e.room_size = clamp(0.0, 1.0),
+                "Damping" => e.damping = clamp(0.0, 1.0),
+                "Mix" => e.mix = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::Chorus(e) => match name {
+                "Rate" => e.rate_hz = clamp(0.05, 10.0),
+                "Depth" => e.depth_ms = clamp(0.0, 30.0),
+                "Mix" => e.mix = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::Filter(e) => match name {
+                "Cutoff" => e.cutoff_hz = clamp(20.0, 18000.0),
+                "Resonance" => e.resonance = clamp(0.0, 0.99),
+                "Mix" => e.mix = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::Tremolo(e) => match name {
+                "Rate" => e.rate_hz = clamp(0.1, 20.0),
+                "Depth" => e.depth = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::Compressor(e) => match name {
+                "Threshold" => e.threshold_db = clamp(-60.0, 0.0),
+                "Ratio" => e.ratio = clamp(1.0, 20.0),
+                "Attack" => e.attack_ms = clamp(0.1, 200.0),
+                "Release" => e.release_ms = clamp(5.0, 1000.0),
+                "Makeup" => e.makeup_db = clamp(0.0, 24.0),
+                _ => {}
+            },
+            BuiltInEffect::Flanger(e) => match name {
+                "Rate" => e.rate_hz = clamp(0.05, 5.0),
+                "Depth" => e.depth_ms = clamp(0.0, 10.0),
+                "Feedback" => e.feedback = clamp(0.0, 0.95),
+                "Mix" => e.mix = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::Phaser(e) => match name {
+                "Rate" => e.rate_hz = clamp(0.05, 5.0),
+                "Depth" => e.depth = clamp(0.0, 1.0),
+                "Feedback" => e.feedback = clamp(0.0, 0.95),
+                "Mix" => e.mix = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::RingModulator(e) => match name {
+                "Carrier" => e.carrier_hz = clamp(20.0, 5000.0),
+                "Mix" => e.mix = clamp(0.0, 1.0),
+                _ => {}
+            },
+            BuiltInEffect::NoiseGate(e) => match name {
+                "Threshold" => e.threshold_db = clamp(-80.0, 0.0),
+                "Attack" => e.attack_ms = clamp(0.1, 200.0),
+                "Release" => e.release_ms = clamp(5.0, 2000.0),
+                "Range" => e.range_db = clamp(-80.0, 0.0),
+                _ => {}
+            },
+            BuiltInEffect::PhaseInvert(_) | BuiltInEffect::ChannelEq(_) => {}
+            BuiltInEffect::Limiter(e) => match name {
+                "Input gain" => e.input_gain_db = clamp(-24.0, 24.0),
+                "Ceiling" => e.ceiling_db = clamp(-12.0, 0.0),
+                "Release" => e.release_ms = clamp(5.0, 1000.0),
+                _ => {}
+            },
+        }
+    }
+
     /// Runs this effect over one stereo audio block, in place — each channel processed
     /// independently through its own internal state (see this module's doc for the dual-mono
     /// pattern every effect follows).
@@ -314,5 +406,151 @@ impl BuiltInEffect {
             BuiltInEffect::ChannelEq(e) => e.process(l, r),
             BuiltInEffect::Limiter(e) => e.process(l, r),
         }
+    }
+}
+
+/// Every parameter name automation can target on the effect kind `config` names, in the same
+/// order `main.rs`'s `built_in_effect_params_ui` shows their sliders, paired with that parameter's
+/// declared range (used both for the automation lane point editor's value axis and to clamp
+/// incoming automated values in `BuiltInEffect::set_automatable_param`). A "shape" parameter that
+/// isn't a single ramping number (`Filter::mode`, `ChannelEq::bands`) has no entry here — it stays
+/// manual-only, edited through `built_in_effect_params_ui`. Empty for `TrackEffectConfig::Clap`
+/// (a CLAP plugin's parameters come from `plugin_host::PluginParamInfo` instead, once loaded).
+///
+/// Takes the saved `TrackEffectConfig` rather than a live `BuiltInEffect` instance so UI code (the
+/// automation lane target picker) can query a chain slot's available parameters without spinning
+/// up a throwaway effect instance (with its own delay lines/filter state) on every frame just to
+/// ask what its parameters are called.
+pub fn automatable_params_for_config(config: &TrackEffectConfig) -> &'static [(&'static str, f32, f32)] {
+    match config {
+        TrackEffectConfig::Clap { .. } => &[],
+        TrackEffectConfig::Delay { .. } => {
+            &[("Time", 1.0, 2000.0), ("Feedback", 0.0, 0.95), ("Mix", 0.0, 1.0)]
+        }
+        TrackEffectConfig::Bitcrusher { .. } => {
+            &[("Bit depth", 1.0, 16.0), ("Rate divisor", 1.0, 50.0), ("Mix", 0.0, 1.0)]
+        }
+        TrackEffectConfig::Distortion { .. } => &[("Drive", 1.0, 20.0), ("Mix", 0.0, 1.0)],
+        TrackEffectConfig::Reverb { .. } => {
+            &[("Room size", 0.0, 1.0), ("Damping", 0.0, 1.0), ("Mix", 0.0, 1.0)]
+        }
+        TrackEffectConfig::Chorus { .. } => {
+            &[("Rate", 0.05, 10.0), ("Depth", 0.0, 30.0), ("Mix", 0.0, 1.0)]
+        }
+        TrackEffectConfig::Filter { .. } => {
+            &[("Cutoff", 20.0, 18000.0), ("Resonance", 0.0, 0.99), ("Mix", 0.0, 1.0)]
+        }
+        TrackEffectConfig::Tremolo { .. } => &[("Rate", 0.1, 20.0), ("Depth", 0.0, 1.0)],
+        TrackEffectConfig::Compressor { .. } => &[
+            ("Threshold", -60.0, 0.0),
+            ("Ratio", 1.0, 20.0),
+            ("Attack", 0.1, 200.0),
+            ("Release", 5.0, 1000.0),
+            ("Makeup", 0.0, 24.0),
+        ],
+        TrackEffectConfig::Flanger { .. } => &[
+            ("Rate", 0.05, 5.0),
+            ("Depth", 0.0, 10.0),
+            ("Feedback", 0.0, 0.95),
+            ("Mix", 0.0, 1.0),
+        ],
+        TrackEffectConfig::Phaser { .. } => &[
+            ("Rate", 0.05, 5.0),
+            ("Depth", 0.0, 1.0),
+            ("Feedback", 0.0, 0.95),
+            ("Mix", 0.0, 1.0),
+        ],
+        TrackEffectConfig::RingModulator { .. } => &[("Carrier", 20.0, 5000.0), ("Mix", 0.0, 1.0)],
+        TrackEffectConfig::NoiseGate { .. } => &[
+            ("Threshold", -80.0, 0.0),
+            ("Attack", 0.1, 200.0),
+            ("Release", 5.0, 2000.0),
+            ("Range", -80.0, 0.0),
+        ],
+        TrackEffectConfig::PhaseInvert { .. } => &[],
+        TrackEffectConfig::ChannelEq { .. } => &[],
+        TrackEffectConfig::Limiter { .. } => {
+            &[("Input gain", -24.0, 24.0), ("Ceiling", -12.0, 0.0), ("Release", 5.0, 1000.0)]
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn every_default_config() -> Vec<TrackEffectConfig> {
+        vec![
+            TrackEffectConfig::default_delay(),
+            TrackEffectConfig::default_bitcrusher(),
+            TrackEffectConfig::default_distortion(),
+            TrackEffectConfig::default_reverb(),
+            TrackEffectConfig::default_chorus(),
+            TrackEffectConfig::default_filter(),
+            TrackEffectConfig::default_tremolo(),
+            TrackEffectConfig::default_compressor(),
+            TrackEffectConfig::default_flanger(),
+            TrackEffectConfig::default_phaser(),
+            TrackEffectConfig::default_ring_modulator(),
+            TrackEffectConfig::default_noise_gate(),
+            TrackEffectConfig::default_phase_invert(),
+            TrackEffectConfig::default_channel_eq(),
+            TrackEffectConfig::default_limiter(),
+        ]
+    }
+
+    /// Every name `automatable_params_for_config` advertises for a given effect kind must actually
+    /// be recognized by `set_automatable_param` on that same kind — a name only one of the two
+    /// knows about (a typo in either list) would otherwise silently do nothing when automated,
+    /// with no compiler error to catch it.
+    #[test]
+    fn every_automatable_param_name_is_recognized_by_set_automatable_param() {
+        for config in every_default_config() {
+            let mut effect = BuiltInEffect::from_config(&config, 48_000.0).unwrap();
+            for &(name, min, max) in automatable_params_for_config(&config) {
+                let before = format!("{:?}", effect.to_config());
+                // Try both ends of the range: a param whose *default* happens to already sit at
+                // one end (e.g. Bitcrusher's Mix defaults to fully wet, the same as its max) would
+                // otherwise look like a no-op even though `set_automatable_param` handled it fine.
+                effect.set_automatable_param(name, min);
+                let after_min = format!("{:?}", effect.to_config());
+                effect.set_automatable_param(name, max);
+                let after_max = format!("{:?}", effect.to_config());
+                assert!(
+                    after_min != before || after_max != before,
+                    "{}: setting {name:?} to its min ({min}) or max ({max}) had no effect on \
+                     to_config() (before: {before})",
+                    effect.label(),
+                );
+            }
+        }
+    }
+
+    /// `set_automatable_param` clamps to the range `automatable_params_for_config` declares, the same way
+    /// `plugin_host::LoadedEffect::set_param` clamps a CLAP parameter to its declared range.
+    #[test]
+    fn set_automatable_param_clamps_out_of_range_values() {
+        let mut effect =
+            BuiltInEffect::from_config(&TrackEffectConfig::default_delay(), 48_000.0).unwrap();
+        effect.set_automatable_param("Feedback", 999.0);
+        match effect.to_config() {
+            TrackEffectConfig::Delay { feedback, .. } => assert_eq!(feedback, 0.95),
+            other => panic!("expected Delay, got {other:?}"),
+        }
+        effect.set_automatable_param("Feedback", -999.0);
+        match effect.to_config() {
+            TrackEffectConfig::Delay { feedback, .. } => assert_eq!(feedback, 0.0),
+            other => panic!("expected Delay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_automatable_param_ignores_an_unknown_name() {
+        let mut effect =
+            BuiltInEffect::from_config(&TrackEffectConfig::default_delay(), 48_000.0).unwrap();
+        let before = format!("{:?}", effect.to_config());
+        effect.set_automatable_param("not_a_real_param", 1.0);
+        let after = format!("{:?}", effect.to_config());
+        assert_eq!(before, after);
     }
 }

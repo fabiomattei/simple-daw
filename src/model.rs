@@ -702,9 +702,133 @@ pub struct Region {
     /// this, independent of the content's own length.
     pub loop_length_steps: usize,
     pub content: RegionContent,
+    /// Ticks (from `start_tick`) over which this region's on-timeline output ramps up from
+    /// silence — see `fade_gain_at`. `#[serde(default)]` so song files saved before fades existed
+    /// still load with none.
+    #[serde(default)]
+    pub fade_in_ticks: usize,
+    /// Ticks (into the end of the on-timeline span) over which this region's output ramps down to
+    /// silence — see `fade_gain_at`. `#[serde(default)]` for the same reason as `fade_in_ticks`.
+    #[serde(default)]
+    pub fade_out_ticks: usize,
+    /// This region's automation lanes (volume/pan/send-level/effect-param "rides" — see
+    /// `AutomationLane`), evaluated against the same on-timeline offset `fade_gain_at` uses.
+    /// `#[serde(default)]` so song files saved before automation existed still load with none.
+    #[serde(default)]
+    pub automation: Vec<AutomationLane>,
+}
+
+/// Which of a track's continuously-varying parameters an `AutomationLane` rides. Always scoped to
+/// the region's own track — there's no cross-track automation target (a lane on one track can't
+/// ride another track's fader, its sends, or the master bus).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum AutomationTarget {
+    /// Rides `Track::volume`.
+    Volume,
+    /// Rides `Track::pan`.
+    Pan,
+    /// Rides `Track::send_levels[send_index]` (index into `Song::sends`).
+    SendLevel { send_index: usize },
+    /// Rides one parameter of the effect loaded in this track's own `Track::effects[slot_index]`
+    /// — which parameter is identified by `key`, since a CLAP plugin's parameters and a built-in
+    /// effect's parameters are addressed differently (see `EffectParamKey`).
+    EffectParam {
+        slot_index: usize,
+        key: EffectParamKey,
+    },
+}
+
+/// Addresses one parameter within an effect chain slot, for `AutomationTarget::EffectParam`. CLAP
+/// plugins expose a stable numeric id per parameter (`plugin_host::PluginParamInfo::id`, the same
+/// id `TrackEffectConfig::Clap::params` is keyed by); built-in effects have no such id, only named
+/// `pub` fields on their own struct, so they're addressed by name instead (see
+/// `builtin_fx::BuiltInEffect::automatable_param_names`/`set_automatable_param`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum EffectParamKey {
+    Clap { param_id: u32 },
+    BuiltIn { param_name: String },
+}
+
+/// One (tick, value) point on an `AutomationLane`'s curve — `tick` is relative to the owning
+/// `Region`'s own `start_tick` (this region's local time, like `fade_in_ticks`/`fade_out_ticks`),
+/// not an absolute song position. `value` is in whatever unit `AutomationLane::target` naturally
+/// uses (linear gain for `Volume`/`SendLevel`, -1.0..1.0 for `Pan`, the parameter's own declared
+/// range for `EffectParam`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPoint {
+    pub tick: usize,
+    pub value: f32,
+}
+
+/// A single automated parameter's "ride" over a `Region`'s on-timeline span: a target plus an
+/// ordered-by-nothing-in-particular list of (tick, value) points, linearly interpolated between —
+/// see `value_at`. A `fade_in_ticks`/`fade_out_ticks` ramp is conceptually just a 2-point `Volume`
+/// lane; this is the general form ("rides" — riding a fader up/down over multiple points, not
+/// just a straight ramp).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationLane {
+    pub target: AutomationTarget,
+    pub points: Vec<AutomationPoint>,
+}
+
+impl AutomationLane {
+    /// This lane's value at `tick` (relative to the region's `start_tick`, same convention as
+    /// `AutomationPoint::tick`), linearly interpolated between the two points bracketing it —
+    /// holds the nearest point's value outside the lane's own range. `None` if the lane has no
+    /// points at all, meaning "not automated yet" — callers fall back to the target's static value
+    /// (`Track::volume`, etc.) in that case, the same way an empty `points` list reads as "no
+    /// override" rather than "override to 0".
+    ///
+    /// Scans `points` rather than requiring them pre-sorted by tick, so a dragged point can be
+    /// written in place (by index) during a UI drag without needing to keep the whole list sorted
+    /// mid-gesture — an O(n) scan per lookup is the same not-fully-incremental trade-off
+    /// `metering.rs`'s integrated-LUFS rescan already makes, and lanes are short (a handful of
+    /// points, not thousands).
+    pub fn value_at(&self, tick: usize) -> Option<f32> {
+        if self.points.is_empty() {
+            return None;
+        }
+        let before = self.points.iter().filter(|p| p.tick <= tick).max_by_key(|p| p.tick);
+        let after = self.points.iter().filter(|p| p.tick > tick).min_by_key(|p| p.tick);
+        Some(match (before, after) {
+            (Some(before), Some(after)) => {
+                let span = (after.tick - before.tick) as f32;
+                let frac = if span > 0.0 {
+                    (tick - before.tick) as f32 / span
+                } else {
+                    0.0
+                };
+                before.value + (after.value - before.value) * frac
+            }
+            (Some(before), None) => before.value,
+            (None, Some(after)) => after.value,
+            (None, None) => unreachable!("points is non-empty, so at least one side must match"),
+        })
+    }
 }
 
 impl Region {
+    /// This region's fade gain (0.0..1.0) at `ticks_since_start` ticks past `start_tick`, against
+    /// the on-timeline span (`0..loop_length_steps * TICKS_PER_STEP` — the same offset
+    /// `Sequencer::process`'s active-region filter already computes, not the content's own,
+    /// possibly-looped length). A region shorter than `fade_in_ticks + fade_out_ticks` has
+    /// overlapping ramps; at any given point this takes whichever is more attenuated, rather than
+    /// one silently overriding the other.
+    pub fn fade_gain_at(&self, ticks_since_start: usize) -> f32 {
+        let span_ticks = self.loop_length_steps * TICKS_PER_STEP;
+        let mut gain = 1.0f32;
+        if self.fade_in_ticks > 0 {
+            gain = gain.min((ticks_since_start as f32 / self.fade_in_ticks as f32).clamp(0.0, 1.0));
+        }
+        if self.fade_out_ticks > 0 {
+            let ticks_from_end = span_ticks.saturating_sub(ticks_since_start);
+            gain = gain.min((ticks_from_end as f32 / self.fade_out_ticks as f32).clamp(0.0, 1.0));
+        }
+        gain
+    }
+
     /// This region's content length (`content_length_steps`) in ticks.
     pub fn content_length_ticks(&self) -> usize {
         self.content_length_steps * TICKS_PER_STEP
@@ -1434,6 +1558,13 @@ pub struct Track {
     /// (older formats route through `migrate_patterns_song` instead — see that function).
     #[serde(default)]
     pub regions: Vec<Region>,
+    /// Linear send level (0.0 = no send) to each of `Song.sends`, index-aligned with that list and
+    /// tapped post-fader/pan (the same point `volume`/`pan` apply) — see `SendBus`'s doc comment.
+    /// Kept in sync with `Song.sends`'s length by `Song::add_send`/`remove_send`/`add_track`, not
+    /// by this track alone. `#[serde(default)]` so song files saved before sends existed still
+    /// load with none.
+    #[serde(default)]
+    pub send_levels: Vec<f32>,
 }
 
 impl Track {
@@ -1456,6 +1587,7 @@ impl Track {
             wave: WaveParams::default(),
             audio_clips: Vec::new(),
             regions: Vec::new(),
+            send_levels: Vec::new(),
         }
     }
 
@@ -1478,6 +1610,7 @@ impl Track {
             wave: WaveParams::default(),
             audio_clips: Vec::new(),
             regions: Vec::new(),
+            send_levels: Vec::new(),
         }
     }
 
@@ -1500,6 +1633,7 @@ impl Track {
             wave: WaveParams::default(),
             audio_clips: Vec::new(),
             regions: Vec::new(),
+            send_levels: Vec::new(),
         }
     }
 
@@ -1539,6 +1673,9 @@ impl Track {
             content_length_steps: length_steps,
             loop_length_steps: length_steps,
             content,
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            automation: Vec::new(),
         });
         self.regions.len() - 1
     }
@@ -1606,6 +1743,10 @@ pub struct Song {
     /// — `steps_per_beat`/`steps_per_bar` assume that and don't re-validate it.
     #[serde(default = "default_time_signature_denominator")]
     pub time_signature_denominator: u8,
+    /// Aux send buses (see `SendBus`) every track can feed via its own `Track::send_levels`.
+    /// `#[serde(default)]` so song files saved before sends existed still load with none.
+    #[serde(default)]
+    pub sends: Vec<SendBus>,
 }
 
 fn default_time_signature_numerator() -> u8 {
@@ -1622,6 +1763,18 @@ fn default_time_signature_denominator() -> u8 {
 pub struct ProjectPlugin {
     pub name: String,
     pub path: String,
+}
+
+/// An aux send bus (`Song::sends`): a named effect chain (same shape/processing order as
+/// `Track::effects`) that every track can feed at an independent level via its own
+/// `Track::send_levels`, tapped post-fader/pan like a classic send — see `audio.rs`'s mixdown for
+/// where that tap happens. Index-aligned with `Song::sends`; `Song::add_send`/`remove_send` keep
+/// every track's `send_levels` the same length as this list.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SendBus {
+    pub name: String,
+    #[serde(default)]
+    pub effects: Vec<TrackEffectConfig>,
 }
 
 /// A step is fixed at a sixteenth note regardless of time signature (see `TICKS_PER_STEP`) — this
@@ -1771,21 +1924,24 @@ impl Song {
             synth_presets: Vec::new(),
             time_signature_numerator: 4,
             time_signature_denominator: 4,
+            sends: Vec::new(),
         }
     }
 
-    /// Appends a new track. Returns the new track's index.
+    /// Appends a new track, with a send level of 0.0 (no send) to every existing send bus so
+    /// `Track::send_levels` starts index-aligned with `Song::sends`. Returns the new track's index.
     pub fn add_track(
         &mut self,
         name: impl Into<String>,
         midi_channel: u8,
         kind: TrackKind,
     ) -> usize {
-        let track = match kind {
+        let mut track = match kind {
             TrackKind::PianoRoll => Track::new_piano_roll(name, midi_channel),
             TrackKind::StepGrid => Track::new_step_grid(name, midi_channel),
             TrackKind::Audio => Track::new_audio(name, midi_channel),
         };
+        track.send_levels = vec![0.0; self.sends.len()];
         self.tracks.push(track);
         self.tracks.len() - 1
     }
@@ -1794,6 +1950,28 @@ impl Song {
     /// unlike the old shared-pattern model, nothing else references a track's content).
     pub fn remove_track(&mut self, index: usize) {
         self.tracks.remove(index);
+    }
+
+    /// Appends a new, empty-chain send bus and gives every existing track a 0.0 (no send) level
+    /// for it, keeping every `Track::send_levels` index-aligned with `Song::sends`. Returns the
+    /// new send's index.
+    pub fn add_send(&mut self, name: impl Into<String>) -> usize {
+        self.sends.push(SendBus { name: name.into(), effects: Vec::new() });
+        for track in &mut self.tracks {
+            track.send_levels.push(0.0);
+        }
+        self.sends.len() - 1
+    }
+
+    /// Removes a send bus and the corresponding entry from every track's `send_levels`, keeping
+    /// them index-aligned with the now-shorter `Song::sends`.
+    pub fn remove_send(&mut self, index: usize) {
+        self.sends.remove(index);
+        for track in &mut self.tracks {
+            if index < track.send_levels.len() {
+                track.send_levels.remove(index);
+            }
+        }
     }
 
     /// Serializes the song to pretty-printed JSON. Loaded sample audio itself
@@ -2025,6 +2203,7 @@ fn legacy_to_patterns_era(legacy: LegacySong) -> PatternsEraSong {
             wave: legacy_track.wave,
             audio_clips: Vec::new(),
             regions: Vec::new(),
+            send_levels: Vec::new(),
         });
     }
 
@@ -2091,6 +2270,9 @@ fn migrate_patterns_song(mid: PatternsEraSong) -> Song {
                     content_length_steps: pattern.length_steps,
                     loop_length_steps: clip.length_steps,
                     content: region_content,
+                    fade_in_ticks: 0,
+                    fade_out_ticks: 0,
+                    automation: Vec::new(),
                 });
             }
         }
@@ -2109,12 +2291,127 @@ fn migrate_patterns_song(mid: PatternsEraSong) -> Song {
         synth_presets: mid.synth_presets,
         time_signature_numerator: 4,
         time_signature_denominator: 4,
+        sends: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn region_with_fades(
+        loop_length_steps: usize,
+        fade_in_ticks: usize,
+        fade_out_ticks: usize,
+    ) -> Region {
+        Region {
+            name: "Test".to_string(),
+            start_tick: 0,
+            content_length_steps: loop_length_steps,
+            loop_length_steps,
+            content: RegionContent::PianoRoll(Vec::new()),
+            fade_in_ticks,
+            fade_out_ticks,
+            automation: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn value_at_is_none_for_an_empty_lane() {
+        let lane = AutomationLane { target: AutomationTarget::Volume, points: Vec::new() };
+        assert_eq!(lane.value_at(0), None);
+        assert_eq!(lane.value_at(100), None);
+    }
+
+    #[test]
+    fn value_at_holds_the_single_point_everywhere() {
+        let lane = AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![AutomationPoint { tick: 50, value: 0.75 }],
+        };
+        assert_eq!(lane.value_at(0), Some(0.75));
+        assert_eq!(lane.value_at(50), Some(0.75));
+        assert_eq!(lane.value_at(1000), Some(0.75));
+    }
+
+    #[test]
+    fn value_at_interpolates_linearly_between_bracketing_points() {
+        let lane = AutomationLane {
+            target: AutomationTarget::Pan,
+            points: vec![
+                AutomationPoint { tick: 0, value: -1.0 },
+                AutomationPoint { tick: 100, value: 1.0 },
+            ],
+        };
+        assert_eq!(lane.value_at(0), Some(-1.0));
+        assert!((lane.value_at(50).unwrap() - 0.0).abs() < 1e-6);
+        assert_eq!(lane.value_at(100), Some(1.0));
+    }
+
+    #[test]
+    fn value_at_holds_the_nearest_point_outside_the_lanes_own_range() {
+        let lane = AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![
+                AutomationPoint { tick: 20, value: 0.2 },
+                AutomationPoint { tick: 80, value: 0.8 },
+            ],
+        };
+        assert_eq!(lane.value_at(0), Some(0.2));
+        assert_eq!(lane.value_at(1000), Some(0.8));
+    }
+
+    #[test]
+    fn value_at_does_not_require_points_sorted_by_tick() {
+        let lane = AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![
+                AutomationPoint { tick: 100, value: 1.0 },
+                AutomationPoint { tick: 0, value: 0.0 },
+            ],
+        };
+        assert!((lane.value_at(50).unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fade_gain_at_is_full_with_no_fades_configured() {
+        let region = region_with_fades(4, 0, 0);
+        let span_ticks = 4 * TICKS_PER_STEP;
+        assert_eq!(region.fade_gain_at(0), 1.0);
+        assert_eq!(region.fade_gain_at(span_ticks / 2), 1.0);
+        assert_eq!(region.fade_gain_at(span_ticks - 1), 1.0);
+    }
+
+    #[test]
+    fn fade_gain_at_ramps_from_zero_to_one_over_fade_in_ticks() {
+        let region = region_with_fades(4, 10, 0);
+        assert_eq!(region.fade_gain_at(0), 0.0);
+        assert!((region.fade_gain_at(5) - 0.5).abs() < 1e-6);
+        assert_eq!(region.fade_gain_at(10), 1.0);
+        assert_eq!(region.fade_gain_at(20), 1.0);
+    }
+
+    #[test]
+    fn fade_gain_at_ramps_from_one_to_zero_over_the_last_fade_out_ticks() {
+        let region = region_with_fades(4, 0, 10);
+        let span_ticks = 4 * TICKS_PER_STEP;
+        assert_eq!(region.fade_gain_at(0), 1.0);
+        assert_eq!(region.fade_gain_at(span_ticks - 10), 1.0);
+        assert!((region.fade_gain_at(span_ticks - 5) - 0.5).abs() < 1e-6);
+        assert_eq!(region.fade_gain_at(span_ticks), 0.0);
+    }
+
+    #[test]
+    fn fade_gain_at_takes_the_more_attenuated_ramp_when_fades_overlap() {
+        // A region shorter than fade_in_ticks + fade_out_ticks: at the midpoint, both ramps are
+        // partway through, and the more attenuated one should win rather than one overriding it.
+        let region = region_with_fades(1, TICKS_PER_STEP, TICKS_PER_STEP);
+        let span_ticks = TICKS_PER_STEP;
+        let midpoint_gain = region.fade_gain_at(span_ticks / 2);
+        assert!((midpoint_gain - 0.5).abs() < 1e-6);
+        assert_eq!(region.fade_gain_at(0), 0.0);
+        assert_eq!(region.fade_gain_at(span_ticks), 0.0);
+    }
 
     #[test]
     fn save_then_load_round_trips_song_structure() {
