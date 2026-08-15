@@ -1498,6 +1498,14 @@ impl Song {
         drums.add_lane("Snare", 38);
         drums.add_lane("Closed Hat", 42);
         drums.add_lane("Open Hat", 46);
+        drums.add_lane("Clap", 39);
+        drums.add_lane("Rim", 37);
+        drums.add_lane("Low Tom", 45);
+        drums.add_lane("Crash", 49);
+        drums.add_lane("Mid Tom", 47);
+        drums.add_lane("High Tom", 50);
+        drums.add_lane("Ride", 51);
+        drums.add_lane("Cowbell", 56);
         if let RegionContent::StepGrid(lanes) = &mut drums.regions[drums_region].content {
             for step in [0, 4, 8, 12] {
                 lanes[0].set_step(step, 110);
@@ -1508,6 +1516,22 @@ impl Song {
             for step in [0, 2, 4, 6, 8, 10, 12, 14] {
                 lanes[2].set_step(step, 70);
             }
+            for step in [4, 12] {
+                lanes[4].set_step(step, 90);
+            }
+            for step in [2, 10] {
+                lanes[5].set_step(step, 60);
+            }
+            for step in [14, 15] {
+                lanes[6].set_step(step, 85);
+            }
+            lanes[7].set_step(0, 100);
+            lanes[9].set_step(12, 85); // High Tom
+            lanes[8].set_step(13, 80); // Mid Tom
+            for step in [1, 9] {
+                lanes[10].set_step(step, 55); // Ride
+            }
+            lanes[11].set_step(8, 75); // Cowbell
         }
 
         let mut bass = Track {
@@ -2803,7 +2827,7 @@ mod tests {
         };
         // Same lane names/pitches as the demo's first region on this track, but with fresh
         // (empty) steps.
-        assert_eq!(lanes.len(), 4);
+        assert_eq!(lanes.len(), 12);
         assert_eq!(lanes[0].name, "Kick");
         assert_eq!(lanes[0].pitch, 36);
         assert!(lanes[0].steps.iter().all(|s| s.is_none()));
