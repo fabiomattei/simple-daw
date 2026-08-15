@@ -2,6 +2,7 @@ mod audio;
 mod audio_input;
 mod builtin_fx;
 mod factory_presets;
+mod groove;
 #[cfg(unix)]
 mod mcp_control;
 mod metering;
@@ -9,6 +10,8 @@ mod midi_import;
 mod model;
 mod plugin_host;
 mod sample;
+mod tempo;
+mod tempo_detection;
 mod wavetable;
 
 use std::collections::HashSet;
@@ -20,18 +23,20 @@ use audio::{AudioEngine, Transport};
 use builtin_fx::{BuiltInEffect, automatable_params_for_config};
 use clack_host::prelude::PluginInstance;
 use factory_presets::factory_presets;
+use groove::GROOVE_TEMPLATES;
 use metering::{MeterHandles, MeterReadings};
 use model::{
     AudioClip, AutomationLane, AutomationPoint, AutomationTarget, EffectParamKey, EqBandType,
-    FilterMode, FilterRouting, FilterSlope, FilterType, Lane, LfoTarget, ModSlot, ModSource,
-    ModTarget, Note, ProjectPlugin, Region, RegionContent, SendBus, Song, SynthEngine,
-    SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP, Track, TrackEffectConfig, TrackKind,
-    TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams, add_note, clear_overlaps,
-    find_note_mut, remove_note,
+    FilterMode, FilterRouting, FilterSlope, FilterType, Lane, LfoTarget, MAX_STEP_TIMING_OFFSET_TICKS,
+    ModSlot, ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, SendBus, Song,
+    StepData, SubmixBus, SynthEngine, SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP,
+    Track, TrackEffectConfig, TrackKind,
+    TrackOutput, TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams, add_note,
+    clear_overlaps, find_note_mut, remove_note,
 };
 use plugin_host::{
     DawHost, EffectInstance, LoadedEffect, MasterEffectSlots, PluginGuiHandle, PluginParamInfo,
-    SendEffectSlots, TrackEffectSlots,
+    SendEffectSlots, SubmixEffectSlots, TrackEffectSlots,
 };
 use sample::SampleBuffer;
 use wavetable::{WaveWarpMode, WavetableId};
@@ -388,6 +393,7 @@ enum EffectEditorTarget {
     Master(usize),
     Track(usize, usize),
     Send(usize, usize),
+    Submix(usize, usize),
 }
 
 /// Which chain `TrackFxUi` is editing — only changes which `EffectEditorTarget` variant its
@@ -399,6 +405,7 @@ enum FxChainKind {
     Track,
     Master,
     Send,
+    Submix,
 }
 
 /// What kind of row `track_ui` should draw for one FX chain slot — determined by peeking at the
@@ -417,6 +424,9 @@ struct SimpleDawApp {
     engine: anyhow::Result<AudioEngine>,
     song: Arc<Mutex<Song>>,
     transport: Transport,
+    /// Tap-tempo state for the transport LCD's Tap button — transient UI state, not song data
+    /// (unlike `Song::bpm`, which a tap's resulting estimate is written into).
+    tap_tempo: tempo::TapTempo,
     /// `None` if the audio engine failed to start; lanes can't be pre-resampled without it.
     sample_rate: Option<u32>,
     song_path: String,
@@ -441,6 +451,15 @@ struct SimpleDawApp {
     import_midi_apply_bpm: bool,
     /// (was the last import successful, message to show)
     import_midi_message: Option<(bool, String)>,
+    /// Whether the "Detect Tempo" dialog (analyze a WAV file's audio content — not a MIDI file's
+    /// header, see `import_midi_apply_bpm` — and estimate its BPM via `tempo_detection`) is open.
+    show_detect_tempo: bool,
+    detect_tempo_path: String,
+    /// The last detection's estimate, kept separate from `detect_tempo_message` (a string) so the
+    /// dialog's "Apply to Song Tempo" button doesn't need to re-parse it.
+    detect_tempo_bpm: Option<f32>,
+    /// (was the last detection successful, message to show)
+    detect_tempo_message: Option<(bool, String)>,
     /// Whether the "Plugins" window (project-level CLAP plugin library — import, load onto
     /// master, remove) is open.
     show_plugins_panel: bool,
@@ -477,13 +496,23 @@ struct SimpleDawApp {
     send_effect_guis: Vec<Vec<Option<PluginGuiHandle>>>,
     send_effect_paths: Vec<Vec<String>>,
     send_effect_messages: Vec<Vec<Option<(bool, String)>>>,
+    /// Every submix bus's own effect-chain bookkeeping — same shape/sync mechanism as
+    /// `send_effect_*` above, just one entry per `Song::submixes` row. `submix_effect_slots` is
+    /// the live chain shared with the audio thread (see `plugin_host::SubmixEffectSlots`).
+    submix_effect_slots: SubmixEffectSlots,
+    submix_effect_instances: Vec<Vec<Option<PluginInstance<DawHost>>>>,
+    submix_effect_guis: Vec<Vec<Option<PluginGuiHandle>>>,
+    submix_effect_paths: Vec<Vec<String>>,
+    submix_effect_messages: Vec<Vec<Option<(bool, String)>>>,
     /// Live peak/RMS/LUFS readings published by the audio thread — one entry per track, kept in
     /// sync with `song.tracks` via `resize_track_meters`/`remove_track_meter` the same way
     /// `track_effect_slots` is kept in sync via `resize_track_effects`/`remove_track_effects`. The
     /// master bus's own meter (`master_meter`) is the same type pinned to a single row, mirroring
-    /// `master_effect_slots`/`MasterEffectSlots`.
+    /// `master_effect_slots`/`MasterEffectSlots`. `submix_meters` is one entry per `Song::submixes`
+    /// row, kept in sync the same way `track_meters` is.
     track_meters: MeterHandles,
     master_meter: MeterHandles,
+    submix_meters: MeterHandles,
     /// Which effect's parameter-editor window (if any) is currently open.
     effect_editor: Option<EffectEditorTarget>,
     /// Index of the track whose synth-settings window (waveform/attack/decay) is currently open,
@@ -505,14 +534,30 @@ struct SimpleDawApp {
     /// At most one piano-roll note is being dragged at a time, across every
     /// track's piano roll (there's only one mouse).
     piano_roll_drag: Option<PianoRollDrag>,
-    /// See `AutomationDrag` — shared by the Piano Roll's and Beats' automation panels the same
-    /// way `piano_roll_drag` is shared across every track's piano roll.
+    /// See `AutomationDrag` — shared by the Piano Roll's and Beats' region-scoped automation
+    /// panels the same way `piano_roll_drag` is shared across every track's piano roll.
     automation_drag: Option<AutomationDrag>,
+    /// Same as `automation_drag`, for the separate track-wide automation panel (`Track::automation`,
+    /// not tied to a region) each window also shows whenever a track is selected. A distinct field
+    /// so dragging a point in one panel can't be confused with the other's drag state.
+    track_automation_drag: Option<AutomationDrag>,
     /// Currently selected piano-roll note ids, shared across every track's piano roll (like
     /// `piano_roll_drag`, there's only one selection active at a time). Note ids are unique
     /// across the whole song, so a selection only ever matches notes in the one track it was
     /// made in — other tracks' `Vec<Note>` simply won't contain those ids.
     selected_notes: HashSet<u64>,
+    /// Grid size for the Piano Roll's Quantize/Groove Template toolbar, in ticks — one of a fixed
+    /// set of note-length choices (see `QUANTIZE_GRID_CHOICES`), not freely adjustable.
+    groove_quantize_grid_ticks: usize,
+    /// How fully Quantize snaps notes to `groove_quantize_grid_ticks` (0.0 = no change, 1.0 =
+    /// fully snapped) — see `groove::quantize_notes`.
+    groove_quantize_strength: f32,
+    /// Max random timing nudge (in ticks) Humanize applies — see `groove::humanize_notes`.
+    groove_humanize_timing_ticks: usize,
+    /// Max random velocity nudge Humanize applies — see `groove::humanize_notes`.
+    groove_humanize_velocity: u8,
+    /// Which `groove::GROOVE_TEMPLATES` entry the Groove Template toolbar button applies.
+    groove_template_index: usize,
     /// Shared zoom level for every track's piano roll (1.0 = normal size), so
     /// switching tracks doesn't reset your zoom. Scales both axes together —
     /// see `tick_to_x`/`row_height`. Lives in the top toolbar (not per-roll)
@@ -609,16 +654,21 @@ impl SimpleDawApp {
         let track_effect_slots = plugin_host::new_track_effect_slots(track_count);
         let send_count = song.lock().unwrap().sends.len();
         let send_effect_slots = plugin_host::new_track_effect_slots(send_count);
+        let submix_count = song.lock().unwrap().submixes.len();
+        let submix_effect_slots = plugin_host::new_track_effect_slots(submix_count);
         let track_meters = metering::new_track_meter_handles(track_count);
         let master_meter = metering::new_master_meter_handles();
+        let submix_meters = metering::new_track_meter_handles(submix_count);
         let engine = AudioEngine::start(
             song.clone(),
             transport.clone(),
             master_effect_slots.clone(),
             track_effect_slots.clone(),
             send_effect_slots.clone(),
+            submix_effect_slots.clone(),
             track_meters.clone(),
             master_meter.clone(),
+            submix_meters.clone(),
             None,
             None,
         );
@@ -653,6 +703,7 @@ impl SimpleDawApp {
             engine,
             song,
             transport,
+            tap_tempo: tempo::TapTempo::default(),
             sample_rate,
             song_path: "song.json".to_string(),
             titled_song_path: String::new(),
@@ -667,6 +718,10 @@ impl SimpleDawApp {
             import_midi_path: String::new(),
             import_midi_apply_bpm: false,
             import_midi_message: None,
+            show_detect_tempo: false,
+            detect_tempo_path: String::new(),
+            detect_tempo_bpm: None,
+            detect_tempo_message: None,
             show_plugins_panel: false,
             master_effect_paths,
             master_effect_slots,
@@ -683,8 +738,14 @@ impl SimpleDawApp {
             send_effect_guis: (0..send_count).map(|_| Vec::new()).collect(),
             send_effect_paths: (0..send_count).map(|_| Vec::new()).collect(),
             send_effect_messages: (0..send_count).map(|_| Vec::new()).collect(),
+            submix_effect_slots,
+            submix_effect_instances: (0..submix_count).map(|_| Vec::new()).collect(),
+            submix_effect_guis: (0..submix_count).map(|_| Vec::new()).collect(),
+            submix_effect_paths: (0..submix_count).map(|_| Vec::new()).collect(),
+            submix_effect_messages: (0..submix_count).map(|_| Vec::new()).collect(),
             track_meters,
             master_meter,
+            submix_meters,
             effect_editor: None,
             synth_editor: None,
             lane_synth_editor: None,
@@ -692,7 +753,13 @@ impl SimpleDawApp {
             preset_message: None,
             piano_roll_drag: None,
             automation_drag: None,
+            track_automation_drag: None,
             selected_notes: HashSet::new(),
+            groove_quantize_grid_ticks: TICKS_PER_STEP,
+            groove_quantize_strength: 1.0,
+            groove_humanize_timing_ticks: 6,
+            groove_humanize_velocity: 12,
+            groove_template_index: 0,
             piano_roll_zoom: 1.0,
             piano_roll_scale_root: 0,
             piano_roll_scale: PianoRollScale::Off,
@@ -879,6 +946,14 @@ struct MixerUi<'a> {
     send_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
     send_effect_paths: &'a mut Vec<Vec<String>>,
     send_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
+    /// Every submix bus's own effect-chain bookkeeping — same shape/sync mechanism as
+    /// `send_effect_*` above (one entry per `Song::submixes` row).
+    submix_effect_slots: &'a SubmixEffectSlots,
+    submix_effect_instances: &'a mut Vec<Vec<Option<PluginInstance<DawHost>>>>,
+    submix_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
+    submix_effect_paths: &'a mut Vec<Vec<String>>,
+    submix_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
+    submix_meters: &'a MeterHandles,
 }
 
 /// The Mixer's heading/Detach toggle plus one classic vertical channel strip per track, ending in
@@ -933,7 +1008,15 @@ fn mixer_contents_ui(
                     .ok()
                     .and_then(|handles| handles.get(track_index).map(|m| m.snapshot()))
                     .unwrap_or_default();
-                mixer_channel_strip_ui(ui, track, track_index, &song.sends, &mut fx, meter);
+                mixer_channel_strip_ui(
+                    ui,
+                    track,
+                    track_index,
+                    &song.sends,
+                    &song.submixes,
+                    &mut fx,
+                    meter,
+                );
             }
 
             let mut unused_synth_editor: Option<usize> = None;
@@ -1004,6 +1087,68 @@ fn mixer_contents_ui(
                         mixer.send_effect_messages,
                         song.sends.len(),
                     );
+                }
+            });
+
+            ui.separator();
+            let mut submix_to_remove: Option<usize> = None;
+            for (submix_index, submix) in song.submixes.iter_mut().enumerate() {
+                let mut unused_synth_editor: Option<usize> = None;
+                let mut unused_remove_requested: Option<usize> = None;
+                let mut submix_fx = TrackFxUi {
+                    track_index: submix_index,
+                    chain_kind: FxChainKind::Submix,
+                    paths: &mut mixer.submix_effect_paths[submix_index],
+                    messages: &mut mixer.submix_effect_messages[submix_index],
+                    slots: mixer.submix_effect_slots.clone(),
+                    instances: &mut mixer.submix_effect_instances[submix_index],
+                    guis: &mut mixer.submix_effect_guis[submix_index],
+                    engine_config,
+                    known_plugins: &song.plugins,
+                    editor: &mut *mixer.effect_editor,
+                    synth_editor: &mut unused_synth_editor,
+                    remove_requested: &mut unused_remove_requested,
+                };
+                let meter = mixer
+                    .submix_meters
+                    .lock()
+                    .ok()
+                    .and_then(|handles| handles.get(submix_index).map(|m| m.snapshot()))
+                    .unwrap_or_default();
+                mixer_submix_strip_ui(
+                    ui,
+                    submix,
+                    submix_index,
+                    &mut submix_fx,
+                    meter,
+                    &mut submix_to_remove,
+                );
+            }
+            if let Some(index) = submix_to_remove {
+                song.remove_submix(index);
+                remove_track_effects(
+                    mixer.submix_effect_slots,
+                    mixer.submix_effect_instances,
+                    mixer.submix_effect_guis,
+                    mixer.submix_effect_paths,
+                    mixer.submix_effect_messages,
+                    index,
+                );
+                remove_track_meter(mixer.submix_meters, index);
+            }
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                if ui.button("+ Add Submix").clicked() {
+                    song.add_submix(format!("Submix {}", song.submixes.len() + 1));
+                    resize_track_effects(
+                        mixer.submix_effect_slots,
+                        mixer.submix_effect_instances,
+                        mixer.submix_effect_guis,
+                        mixer.submix_effect_paths,
+                        mixer.submix_effect_messages,
+                        song.submixes.len(),
+                    );
+                    resize_track_meters(mixer.submix_meters, song.submixes.len());
                 }
             });
         });
@@ -1084,6 +1229,7 @@ fn mixer_channel_strip_ui(
     track: &mut Track,
     track_index: usize,
     sends: &[SendBus],
+    submixes: &[SubmixBus],
     fx: &mut TrackFxUi,
     meter: MeterReadings,
 ) {
@@ -1129,6 +1275,30 @@ fn mixer_channel_strip_ui(
                         }
                     });
                 }
+
+                // Where this track's output sums into (see `TrackOutput`) — the "Track Stack"/
+                // alternate-output-routing mechanism, a plain dropdown rather than a wiring UI to
+                // stay consistent with this app's no-patch-cable mixer design.
+                let output_label = match track.output {
+                    TrackOutput::Master => "Master".to_string(),
+                    TrackOutput::Submix(index) => submixes
+                        .get(index)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "Master".to_string()),
+                };
+                egui::ComboBox::from_id_salt(("track-output", track_index))
+                    .selected_text(output_label)
+                    .width(64.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut track.output, TrackOutput::Master, "Master");
+                        for (submix_index, submix) in submixes.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut track.output,
+                                TrackOutput::Submix(submix_index),
+                                &submix.name,
+                            );
+                        }
+                    });
 
                 ui.add(egui::Slider::new(&mut track.pan, -1.0..=1.0).show_value(false))
                     .on_hover_text(format!("Pan: {}", pan_label(track.pan)));
@@ -1253,11 +1423,105 @@ fn mixer_send_strip_ui(
         });
 }
 
+/// One submix bus's strip in the Mixer: an editable name, its own "FX" menu (same `fx_chain_ui`
+/// every other chain uses), Mute/Solo (see `Sequencer::process`'s `track_silent` — silences every
+/// member track at the synthesis stage, not just this bus's own summed output), a peak/RMS bar
+/// meter, and a `volume` fader — the "one fader" a Track Stack sums its member tracks into. Unlike
+/// `mixer_send_strip_ui`, a submix has all of these since it stands in for its member tracks'
+/// direct contribution to the mix rather than being a parallel tap (see `SubmixBus`'s doc comment).
+fn mixer_submix_strip_ui(
+    ui: &mut egui::Ui,
+    submix: &mut SubmixBus,
+    submix_index: usize,
+    fx: &mut TrackFxUi,
+    meter: MeterReadings,
+    remove_requested: &mut Option<usize>,
+) {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(46, 34, 46))
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::same(4))
+        .show(ui, |ui| {
+            ui.set_width(92.0);
+            ui.vertical_centered(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut submix.name)
+                        .desired_width(64.0)
+                        .font(egui::TextStyle::Small),
+                );
+                ui.menu_button("FX", |ui| {
+                    fx_chain_ui(ui, fx);
+                });
+
+                ui.horizontal(|ui| {
+                    let mute_color = if submix.muted {
+                        FL_ACCENT_ORANGE
+                    } else {
+                        egui::Color32::from_gray(150)
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("M").color(mute_color))
+                                .small()
+                                .min_size(egui::vec2(18.0, 20.0)),
+                        )
+                        .on_hover_text(if submix.muted { "Unmute" } else { "Mute" })
+                        .clicked()
+                    {
+                        submix.muted = !submix.muted;
+                    }
+
+                    let solo_color = if submix.solo {
+                        FL_ACCENT_YELLOW
+                    } else {
+                        egui::Color32::from_gray(150)
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("S").color(solo_color))
+                                .small()
+                                .min_size(egui::vec2(18.0, 20.0)),
+                        )
+                        .on_hover_text(if submix.solo { "Unsolo" } else { "Solo" })
+                        .clicked()
+                    {
+                        submix.solo = !submix.solo;
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    peak_rms_bar_meter_ui(ui, meter);
+                    ui.add_sized(
+                        [28.0, METER_BAR_SIZE.y],
+                        egui::Slider::new(&mut submix.volume, 0.0..=1.5)
+                            .vertical()
+                            .show_value(false),
+                    )
+                    .on_hover_text(format!("Volume: {:.2}", submix.volume));
+                });
+                ui.label(egui::RichText::new(format!("{:.2}", submix.volume)).small());
+
+                ui.add_space(4.0);
+                if ui.small_button("✕ Remove").clicked() {
+                    *remove_requested = Some(submix_index);
+                }
+            });
+        });
+}
+
 /// Bundles the Piano Roll's mutable app-state borrows for the same reason as `ChannelRackUi`.
 struct PianoRollPanelUi<'a> {
     selected_track: Option<usize>,
     piano_roll_drag: &'a mut Option<PianoRollDrag>,
     selected_notes: &'a mut HashSet<u64>,
+    /// See `SimpleDawApp::groove_quantize_grid_ticks` and its sibling `groove_*` fields — bundled
+    /// into one borrow the same way the other toolbar controls above are.
+    groove_quantize_grid_ticks: &'a mut usize,
+    groove_quantize_strength: &'a mut f32,
+    groove_humanize_timing_ticks: &'a mut usize,
+    groove_humanize_velocity: &'a mut u8,
+    groove_template_index: &'a mut usize,
     piano_roll_zoom: &'a mut f32,
     /// See `SimpleDawApp::piano_roll_scale_root`.
     scale_root: &'a mut u8,
@@ -1271,8 +1535,111 @@ struct PianoRollPanelUi<'a> {
     /// The open region's own track's live effect chain — read by `automation_lanes_ui`'s "+ Add
     /// Lane" menu to offer a currently-loaded CLAP plugin's real parameter names.
     track_effect_slots: &'a TrackEffectSlots,
+    /// Every send bus's and the master bus's live effect chains — same reason as
+    /// `track_effect_slots`, for `automation_lanes_ui`'s "Send FX"/"Master FX" cross-bus targets.
+    send_effect_slots: &'a SendEffectSlots,
+    master_effect_slots: &'a MasterEffectSlots,
     /// See `AutomationDrag`.
     automation_drag: &'a mut Option<AutomationDrag>,
+    /// See `SimpleDawApp::track_automation_drag`.
+    track_automation_drag: &'a mut Option<AutomationDrag>,
+}
+
+/// Grid choices for the Piano Roll's Quantize/Groove Template toolbar: (label, ticks-per-cell).
+/// `TICKS_PER_STEP` is one 16th note, so these are simple multiples/fractions of it.
+const QUANTIZE_GRID_CHOICES: &[(&str, usize)] = &[
+    ("1/4", TICKS_PER_STEP * 4),
+    ("1/8", TICKS_PER_STEP * 2),
+    ("1/16", TICKS_PER_STEP),
+    ("1/32", TICKS_PER_STEP / 2),
+    ("1/16 triplet", TICKS_PER_STEP * 2 / 3),
+];
+
+/// Quantize/Humanize/Groove Template controls for the open piano-roll region, shown just above
+/// the note grid. Each action targets `panel.selected_notes` if any are selected, else every note
+/// in `notes` — see `groove::quantize_notes`/`humanize_notes`/`apply_groove_template`.
+fn piano_roll_quantize_humanize_groove_ui(
+    ui: &mut egui::Ui,
+    notes: &mut Vec<Note>,
+    panel: &mut PianoRollPanelUi,
+) {
+    let selection = |panel: &PianoRollPanelUi| {
+        (!panel.selected_notes.is_empty()).then(|| panel.selected_notes.clone())
+    };
+    ui.horizontal(|ui| {
+        ui.label("Grid");
+        let grid_label = QUANTIZE_GRID_CHOICES
+            .iter()
+            .find(|(_, ticks)| *ticks == *panel.groove_quantize_grid_ticks)
+            .map(|(label, _)| *label)
+            .unwrap_or("custom");
+        egui::ComboBox::from_id_salt("quantize_grid").selected_text(grid_label).show_ui(ui, |ui| {
+            for (label, ticks) in QUANTIZE_GRID_CHOICES {
+                ui.selectable_value(panel.groove_quantize_grid_ticks, *ticks, *label);
+            }
+        });
+        ui.add(egui::Slider::new(panel.groove_quantize_strength, 0.0..=1.0).text("Strength"));
+        if ui
+            .button("Quantize")
+            .on_hover_text("Snap selected notes (or all, if none selected) to the grid")
+            .clicked()
+        {
+            let selection = selection(panel);
+            groove::quantize_notes(
+                notes,
+                selection.as_ref(),
+                *panel.groove_quantize_grid_ticks,
+                *panel.groove_quantize_strength,
+            );
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Humanize");
+        ui.add(egui::Slider::new(panel.groove_humanize_timing_ticks, 0..=24).text("Timing"));
+        ui.add(egui::Slider::new(panel.groove_humanize_velocity, 0..=40).text("Velocity"));
+        if ui
+            .button("Apply")
+            .on_hover_text("Randomly nudge selected notes' (or all, if none selected) timing/velocity")
+            .clicked()
+        {
+            let selection = selection(panel);
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            groove::humanize_notes(
+                notes,
+                selection.as_ref(),
+                *panel.groove_humanize_timing_ticks,
+                *panel.groove_humanize_velocity,
+                seed,
+            );
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Groove Template");
+        egui::ComboBox::from_id_salt("groove_template")
+            .selected_text(GROOVE_TEMPLATES[*panel.groove_template_index].name)
+            .show_ui(ui, |ui| {
+                for (index, template) in GROOVE_TEMPLATES.iter().enumerate() {
+                    ui.selectable_value(panel.groove_template_index, index, template.name);
+                }
+            });
+        if ui
+            .button("Apply")
+            .on_hover_text("Snap selected notes (or all, if none selected) to the grid, then apply this template's swing/accent")
+            .clicked()
+        {
+            let selection = selection(panel);
+            groove::apply_groove_template(
+                notes,
+                selection.as_ref(),
+                *panel.groove_quantize_grid_ticks,
+                &GROOVE_TEMPLATES[*panel.groove_template_index],
+            );
+        }
+    });
+    ui.separator();
 }
 
 /// The Piano Roll's header (selected track name/mute badge) and note grid, rendered inside the
@@ -1328,6 +1695,42 @@ fn piano_roll_contents_ui(
     });
     ui.separator();
 
+    if let Some(index) = selected {
+        // Same pre-borrow snapshot the region panel below takes for the same reason — see its
+        // own comment. Computed separately (a second clone per frame) rather than shared, so this
+        // panel doesn't depend on whether a region is also being edited below.
+        let track_effects_snapshot = song.tracks[index].effects.clone();
+        let other_tracks_snapshot: Vec<(String, Vec<TrackEffectConfig>)> = song
+            .tracks
+            .iter()
+            .map(|t| (t.name.clone(), t.effects.clone()))
+            .collect();
+        let arrangement_span_ticks = audio::arrangement_length_ticks(song);
+        ui.collapsing("Track Automation", |ui| {
+            egui::ScrollArea::vertical().id_salt("track_wide_automation").max_height(90.0).show(
+                ui,
+                |ui| {
+                    automation_lanes_ui(
+                        ui,
+                        &mut song.tracks[index].automation,
+                        arrangement_span_ticks,
+                        index,
+                        &track_effects_snapshot,
+                        panel.track_effect_slots,
+                        &other_tracks_snapshot,
+                        &song.sends,
+                        panel.send_effect_slots,
+                        &song.master_effects,
+                        panel.master_effect_slots,
+                        *panel.piano_roll_zoom,
+                        panel.track_automation_drag,
+                    );
+                },
+            );
+        });
+        ui.separator();
+    }
+
     match region {
         None => {
             ui.centered_and_justified(|ui| {
@@ -1344,12 +1747,22 @@ fn piano_roll_contents_ui(
                 (ui.available_height() - automation_reserved).max(PIANO_ROLL_HEIGHT_MIN);
             let steps_per_bar = song.steps_per_bar();
             let steps_per_beat = song.steps_per_beat();
+            // Snapshot every track's name/effects *before* borrowing `song.tracks[index]` below —
+            // `automation_lanes_ui`'s "Other Track" targets need to list every track, which would
+            // otherwise alias the same `song.tracks` field the open region's own mutable borrow
+            // comes from.
+            let other_tracks_snapshot: Vec<(String, Vec<TrackEffectConfig>)> = song
+                .tracks
+                .iter()
+                .map(|t| (t.name.clone(), t.effects.clone()))
+                .collect();
             let next_note_id = &mut song.next_note_id;
             let track = &mut song.tracks[index];
             let track_effects_snapshot = track.effects.clone();
             let default_note_length_ticks = &mut track.default_note_length_ticks;
             let region = &mut track.regions[region_index];
             if let RegionContent::PianoRoll(notes) = &mut region.content {
+                piano_roll_quantize_humanize_groove_ui(ui, notes, panel);
                 piano_roll_ui(
                     ui,
                     notes,
@@ -1370,16 +1783,22 @@ fn piano_roll_contents_ui(
                 );
             }
             ui.separator();
+            let region_span_ticks = region.loop_length_steps * TICKS_PER_STEP;
             egui::ScrollArea::vertical().max_height(automation_reserved.max(60.0)).show(
                 ui,
                 |ui| {
                     automation_lanes_ui(
                         ui,
-                        region,
+                        &mut region.automation,
+                        region_span_ticks,
                         index,
                         &track_effects_snapshot,
                         panel.track_effect_slots,
+                        &other_tracks_snapshot,
                         &song.sends,
+                        panel.send_effect_slots,
+                        &song.master_effects,
+                        panel.master_effect_slots,
                         *panel.piano_roll_zoom,
                         panel.automation_drag,
                     );
@@ -1483,7 +1902,13 @@ struct McpContext<'a> {
     send_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
     send_effect_paths: &'a mut Vec<Vec<String>>,
     send_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
+    submix_effect_slots: &'a SubmixEffectSlots,
+    submix_effect_instances: &'a mut Vec<Vec<Option<PluginInstance<DawHost>>>>,
+    submix_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
+    submix_effect_paths: &'a mut Vec<Vec<String>>,
+    submix_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
     track_meters: &'a MeterHandles,
+    submix_meters: &'a MeterHandles,
 }
 
 #[cfg(unix)]
@@ -1902,6 +2327,8 @@ fn apply_mcp_command(
                 ctx.track_effect_slots,
                 ctx.send_effect_paths,
                 ctx.send_effect_slots,
+                ctx.submix_effect_paths,
+                ctx.submix_effect_slots,
             );
             let path = p.path.trim().to_string();
             let (ok, message) = perform_save(song, &path);
@@ -1918,11 +2345,14 @@ fn apply_mcp_command(
             let loaded = perform_load(&path, ctx.sample_rate)?;
             let track_count = loaded.tracks.len();
             let send_count = loaded.sends.len();
+            let submix_count = loaded.submixes.len();
             let master_effect_specs = loaded.master_effects.clone();
             let track_effect_specs: Vec<Vec<TrackEffectConfig>> =
                 loaded.tracks.iter().map(|t| t.effects.clone()).collect();
             let send_effect_specs: Vec<Vec<TrackEffectConfig>> =
                 loaded.sends.iter().map(|s| s.effects.clone()).collect();
+            let submix_effect_specs: Vec<Vec<TrackEffectConfig>> =
+                loaded.submixes.iter().map(|s| s.effects.clone()).collect();
             *song = loaded;
             *ctx.song_path = path;
             resize_track_effects(
@@ -1942,6 +2372,15 @@ fn apply_mcp_command(
                 ctx.send_effect_messages,
                 send_count,
             );
+            resize_track_effects(
+                ctx.submix_effect_slots,
+                ctx.submix_effect_instances,
+                ctx.submix_effect_guis,
+                ctx.submix_effect_paths,
+                ctx.submix_effect_messages,
+                submix_count,
+            );
+            resize_track_meters(ctx.submix_meters, submix_count);
             apply_loaded_effects(
                 ctx.master_effect_paths,
                 ctx.master_effect_instances,
@@ -1961,6 +2400,12 @@ fn apply_mcp_command(
                 ctx.send_effect_messages,
                 ctx.send_effect_slots,
                 send_effect_specs,
+                ctx.submix_effect_paths,
+                ctx.submix_effect_instances,
+                ctx.submix_effect_guis,
+                ctx.submix_effect_messages,
+                ctx.submix_effect_slots,
+                submix_effect_specs,
                 ctx.engine_config,
             );
             Ok(json!({ "track_count": track_count }))
@@ -4337,8 +4782,8 @@ fn chain_to_config(chain: &[Option<EffectInstance>], paths: &[String]) -> Vec<Tr
 }
 
 /// Writes the app's live effect state (master bus + every track's effect chain + every send bus's
-/// effect chain) into `song`'s `master_effects`/`Track::effects`/`SendBus::effects` fields so
-/// `save_to_file` captures it.
+/// and submix bus's effect chain) into `song`'s `master_effects`/`Track::effects`/
+/// `SendBus::effects`/`SubmixBus::effects` fields so `save_to_file` captures it.
 #[allow(clippy::too_many_arguments)]
 fn sync_song_effects(
     song: &mut Song,
@@ -4348,6 +4793,8 @@ fn sync_song_effects(
     track_effect_slots: &TrackEffectSlots,
     send_effect_paths: &[Vec<String>],
     send_effect_slots: &SendEffectSlots,
+    submix_effect_paths: &[Vec<String>],
+    submix_effect_slots: &SubmixEffectSlots,
 ) {
     if let Ok(chains) = master_effect_slots.lock() {
         song.master_effects = chains
@@ -4370,6 +4817,16 @@ fn sync_song_effects(
         for (index, send) in song.sends.iter_mut().enumerate() {
             let paths = send_effect_paths.get(index).map(Vec::as_slice).unwrap_or(&[]);
             send.effects = chains
+                .get(index)
+                .map(|chain| chain_to_config(chain, paths))
+                .unwrap_or_default();
+        }
+    }
+
+    if let Ok(chains) = submix_effect_slots.lock() {
+        for (index, submix) in song.submixes.iter_mut().enumerate() {
+            let paths = submix_effect_paths.get(index).map(Vec::as_slice).unwrap_or(&[]);
+            submix.effects = chains
                 .get(index)
                 .map(|chain| chain_to_config(chain, paths))
                 .unwrap_or_default();
@@ -4523,6 +4980,12 @@ fn apply_loaded_effects(
     send_effect_messages: &mut [Vec<Option<(bool, String)>>],
     send_effect_slots: &SendEffectSlots,
     loaded_send_specs: Vec<Vec<TrackEffectConfig>>,
+    submix_effect_paths: &mut [Vec<String>],
+    submix_effect_instances: &mut [Vec<Option<PluginInstance<DawHost>>>],
+    submix_effect_guis: &mut [Vec<Option<PluginGuiHandle>>],
+    submix_effect_messages: &mut [Vec<Option<(bool, String)>>],
+    submix_effect_slots: &SubmixEffectSlots,
+    loaded_submix_specs: Vec<Vec<TrackEffectConfig>>,
     engine_config: Option<(f64, u32, u32)>,
 ) {
     let (paths, instances, guis, messages, chain) =
@@ -4560,6 +5023,19 @@ fn apply_loaded_effects(
             send_effect_instances,
             send_effect_guis,
             send_effect_messages,
+        );
+    }
+
+    for (index, submix_specs) in loaded_submix_specs.into_iter().enumerate() {
+        apply_chain_specs_at(
+            index,
+            submix_specs,
+            engine_config,
+            submix_effect_slots,
+            submix_effect_paths,
+            submix_effect_instances,
+            submix_effect_guis,
+            submix_effect_messages,
         );
     }
 }
@@ -4635,7 +5111,12 @@ const TIME_SIGNATURE_DENOMINATORS: [u8; 5] = [1, 2, 4, 8, 16];
 /// Logic Pro–style transport LCD: Bar/Beat/Div/Tick derived from the absolute tick counter and
 /// the song's own time signature, plus editable Tempo/Signature fields, in one dark rounded
 /// panel.
-fn transport_lcd_ui(ui: &mut egui::Ui, tick: usize, song: &mut Song) {
+fn transport_lcd_ui(
+    ui: &mut egui::Ui,
+    tick: usize,
+    song: &mut Song,
+    tap_tempo: &mut tempo::TapTempo,
+) {
     let steps_per_beat = song.steps_per_beat();
     let ticks_per_beat = steps_per_beat * TICKS_PER_STEP;
     let ticks_per_bar = song.steps_per_bar() * TICKS_PER_STEP;
@@ -4687,6 +5168,22 @@ fn transport_lcd_ui(ui: &mut egui::Ui, tick: usize, song: &mut Song) {
                                 });
                                 ui.label(
                                     egui::RichText::new("TEMPO")
+                                        .size(8.0)
+                                        .color(egui::Color32::from_gray(140)),
+                                );
+                            });
+                            lcd_divider(ui);
+                            ui.vertical(|ui| {
+                                if ui
+                                    .add(egui::Button::new("TAP").small())
+                                    .on_hover_text("Click on the beat a few times to set tempo")
+                                    .clicked()
+                                    && let Some(bpm) = tap_tempo.tap(std::time::Instant::now())
+                                {
+                                    song.bpm = bpm.clamp(20.0, 300.0);
+                                }
+                                ui.label(
+                                    egui::RichText::new("TAP")
                                         .size(8.0)
                                         .color(egui::Color32::from_gray(140)),
                                 );
@@ -4793,7 +5290,13 @@ impl eframe::App for SimpleDawApp {
                     send_effect_guis: &mut self.send_effect_guis,
                     send_effect_paths: &mut self.send_effect_paths,
                     send_effect_messages: &mut self.send_effect_messages,
+                    submix_effect_slots: &self.submix_effect_slots,
+                    submix_effect_instances: &mut self.submix_effect_instances,
+                    submix_effect_guis: &mut self.submix_effect_guis,
+                    submix_effect_paths: &mut self.submix_effect_paths,
+                    submix_effect_messages: &mut self.submix_effect_messages,
                     track_meters: &self.track_meters,
+                    submix_meters: &self.submix_meters,
                 };
                 let result = apply_mcp_command(&req.cmd, req.params, song, &mut mcp_ctx);
                 let _ = req.reply.send(result);
@@ -4829,6 +5332,7 @@ impl eframe::App for SimpleDawApp {
                                     Ok(loaded) => {
                                         let track_count = loaded.tracks.len();
                                         let send_count = loaded.sends.len();
+                                        let submix_count = loaded.submixes.len();
                                         let master_effect_specs = loaded.master_effects.clone();
                                         let track_effect_specs: Vec<Vec<TrackEffectConfig>> =
                                             loaded
@@ -4839,6 +5343,12 @@ impl eframe::App for SimpleDawApp {
                                         let send_effect_specs: Vec<Vec<TrackEffectConfig>> =
                                             loaded
                                                 .sends
+                                                .iter()
+                                                .map(|s| s.effects.clone())
+                                                .collect();
+                                        let submix_effect_specs: Vec<Vec<TrackEffectConfig>> =
+                                            loaded
+                                                .submixes
                                                 .iter()
                                                 .map(|s| s.effects.clone())
                                                 .collect();
@@ -4871,6 +5381,15 @@ impl eframe::App for SimpleDawApp {
                                             &mut self.send_effect_messages,
                                             send_count,
                                         );
+                                        resize_track_effects(
+                                            &self.submix_effect_slots,
+                                            &mut self.submix_effect_instances,
+                                            &mut self.submix_effect_guis,
+                                            &mut self.submix_effect_paths,
+                                            &mut self.submix_effect_messages,
+                                            submix_count,
+                                        );
+                                        resize_track_meters(&self.submix_meters, submix_count);
                                         let engine_config = self.engine.as_ref().ok().map(|e| {
                                             (
                                                 e.status.sample_rate as f64,
@@ -4897,6 +5416,12 @@ impl eframe::App for SimpleDawApp {
                                             &mut self.send_effect_messages,
                                             &self.send_effect_slots,
                                             send_effect_specs,
+                                            &mut self.submix_effect_paths,
+                                            &mut self.submix_effect_instances,
+                                            &mut self.submix_effect_guis,
+                                            &mut self.submix_effect_messages,
+                                            &self.submix_effect_slots,
+                                            submix_effect_specs,
                                             engine_config,
                                         );
                                         self.song_message = Some((
@@ -4920,6 +5445,8 @@ impl eframe::App for SimpleDawApp {
                                 &self.track_effect_slots,
                                 &self.send_effect_paths,
                                 &self.send_effect_slots,
+                                &self.submix_effect_paths,
+                                &self.submix_effect_slots,
                             );
                             self.song_message = Some(perform_save(song, &self.song_path));
                             ui.close();
@@ -4934,6 +5461,10 @@ impl eframe::App for SimpleDawApp {
 
                         if ui.button("Import MIDI…").clicked() {
                             self.show_import_midi = true;
+                            ui.close();
+                        }
+                        if ui.button("Detect Tempo…").clicked() {
+                            self.show_detect_tempo = true;
                             ui.close();
                         }
 
@@ -5101,7 +5632,12 @@ impl eframe::App for SimpleDawApp {
                     });
 
                     columns[1].with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                        transport_lcd_ui(ui, self.transport.current_tick(), song);
+                        transport_lcd_ui(
+                            ui,
+                            self.transport.current_tick(),
+                            song,
+                            &mut self.tap_tempo,
+                        );
                     });
 
                     columns[2].horizontal(|ui| {
@@ -5185,6 +5721,8 @@ impl eframe::App for SimpleDawApp {
                                     &self.track_effect_slots,
                                     &self.send_effect_paths,
                                     &self.send_effect_slots,
+                                    &self.submix_effect_paths,
+                                    &self.submix_effect_slots,
                                 );
                                 // The old engine (if any) is kept alive until the new one succeeds, so a
                                 // bad device/rate doesn't leave the app silent.
@@ -5194,8 +5732,10 @@ impl eframe::App for SimpleDawApp {
                                     self.master_effect_slots.clone(),
                                     self.track_effect_slots.clone(),
                                     self.send_effect_slots.clone(),
+                                    self.submix_effect_slots.clone(),
                                     self.track_meters.clone(),
                                     self.master_meter.clone(),
+                                    self.submix_meters.clone(),
                                     self.selected_output_device.as_deref(),
                                     self.selected_output_sample_rate,
                                 ) {
@@ -5228,6 +5768,12 @@ impl eframe::App for SimpleDawApp {
                                             &mut self.send_effect_messages,
                                             &self.send_effect_slots,
                                             song.sends.iter().map(|s| s.effects.clone()).collect(),
+                                            &mut self.submix_effect_paths,
+                                            &mut self.submix_effect_instances,
+                                            &mut self.submix_effect_guis,
+                                            &mut self.submix_effect_messages,
+                                            &self.submix_effect_slots,
+                                            song.submixes.iter().map(|s| s.effects.clone()).collect(),
                                             engine_config,
                                         );
                                         self.output_device_message = None;
@@ -5318,6 +5864,8 @@ impl eframe::App for SimpleDawApp {
                                 &self.track_effect_slots,
                                 &self.send_effect_paths,
                                 &self.send_effect_slots,
+                                &self.submix_effect_paths,
+                                &self.submix_effect_slots,
                             );
                             self.song_message = Some(perform_save(song, &self.song_path));
                             self.show_save_as = false;
@@ -5438,6 +5986,90 @@ impl eframe::App for SimpleDawApp {
                 });
             if !open {
                 self.show_import_midi = false;
+            }
+        }
+
+        if self.show_detect_tempo {
+            let mut open = true;
+            egui::Window::new("Detect Tempo")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("File:");
+                        ui.add_sized(
+                            [240.0, 22.0],
+                            egui::TextEdit::singleline(&mut self.detect_tempo_path)
+                                .hint_text("loop.wav"),
+                        );
+                        if ui.button("Browse…").clicked()
+                            && let Some(path) = browse_for_file(
+                                &self.detect_tempo_path,
+                                "WAV audio",
+                                &["wav"],
+                                None,
+                            )
+                        {
+                            self.detect_tempo_path = path;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let can_detect = !self.detect_tempo_path.trim().is_empty();
+                        if ui
+                            .add_enabled(can_detect, egui::Button::new("Detect"))
+                            .clicked()
+                        {
+                            let path = std::path::Path::new(self.detect_tempo_path.trim());
+                            match SampleBuffer::load_wav(path) {
+                                Ok(buffer) => {
+                                    match tempo_detection::detect_bpm(
+                                        &buffer.mono,
+                                        buffer.sample_rate,
+                                    ) {
+                                        Some(bpm) => {
+                                            self.detect_tempo_bpm = Some(bpm);
+                                            self.detect_tempo_message =
+                                                Some((true, format!("Detected {bpm:.1} BPM")));
+                                        }
+                                        None => {
+                                            self.detect_tempo_bpm = None;
+                                            self.detect_tempo_message = Some((
+                                                false,
+                                                "Couldn't find a steady tempo in this file"
+                                                    .to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    self.detect_tempo_bpm = None;
+                                    self.detect_tempo_message = Some((false, format!("{err:#}")));
+                                }
+                            }
+                        }
+                        if let Some(bpm) = self.detect_tempo_bpm
+                            && ui
+                                .button(format!("Apply to Song Tempo ({bpm:.1} BPM)"))
+                                .clicked()
+                        {
+                            song.bpm = bpm;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_detect_tempo = false;
+                        }
+                    });
+                    if let Some((ok, message)) = &self.detect_tempo_message {
+                        let color = if *ok {
+                            egui::Color32::from_rgb(120, 220, 140)
+                        } else {
+                            egui::Color32::RED
+                        };
+                        ui.colored_label(color, message);
+                    }
+                });
+            if !open {
+                self.show_detect_tempo = false;
             }
         }
 
@@ -5583,6 +6215,9 @@ impl eframe::App for SimpleDawApp {
                 EffectEditorTarget::Send(send_index, slot_index) => {
                     format!("Send {} FX {} Params", send_index + 1, slot_index + 1)
                 }
+                EffectEditorTarget::Submix(submix_index, slot_index) => {
+                    format!("Submix {} FX {} Params", submix_index + 1, slot_index + 1)
+                }
             };
             let gui_title = title.clone();
             let mut open = true;
@@ -5670,6 +6305,35 @@ impl eframe::App for SimpleDawApp {
                                 .and_then(|instance| instance.as_mut()),
                             self.send_effect_guis
                                 .get_mut(send_index)
+                                .and_then(|slots| slots.get_mut(slot_index))
+                                .and_then(|gui| gui.as_mut()),
+                        ) {
+                            plugin_gui_button_ui(ui, instance, gui, &gui_title);
+                        }
+                    }
+                    EffectEditorTarget::Submix(submix_index, slot_index) => {
+                        if let Ok(mut guard) = self.submix_effect_slots.lock() {
+                            let slot = guard
+                                .get_mut(submix_index)
+                                .and_then(|chain| chain.get_mut(slot_index))
+                                .and_then(|slot| slot.as_mut());
+                            match slot {
+                                Some(EffectInstance::Clap(effect)) => {
+                                    effect_params_ui(ui, Some(effect))
+                                }
+                                Some(EffectInstance::BuiltIn(effect)) => {
+                                    built_in_effect_params_ui(ui, effect)
+                                }
+                                None => effect_params_ui(ui, None),
+                            }
+                        }
+                        if let (Some(instance), Some(gui)) = (
+                            self.submix_effect_instances
+                                .get_mut(submix_index)
+                                .and_then(|slots| slots.get_mut(slot_index))
+                                .and_then(|instance| instance.as_mut()),
+                            self.submix_effect_guis
+                                .get_mut(submix_index)
                                 .and_then(|slots| slots.get_mut(slot_index))
                                 .and_then(|gui| gui.as_mut()),
                         ) {
@@ -6009,6 +6673,12 @@ impl eframe::App for SimpleDawApp {
                 send_effect_guis: &mut self.send_effect_guis,
                 send_effect_paths: &mut self.send_effect_paths,
                 send_effect_messages: &mut self.send_effect_messages,
+                submix_effect_slots: &self.submix_effect_slots,
+                submix_effect_instances: &mut self.submix_effect_instances,
+                submix_effect_guis: &mut self.submix_effect_guis,
+                submix_effect_paths: &mut self.submix_effect_paths,
+                submix_effect_messages: &mut self.submix_effect_messages,
+                submix_meters: &self.submix_meters,
             };
 
             if mixer_already_detached {
@@ -6058,13 +6728,21 @@ impl eframe::App for SimpleDawApp {
                 selected_track: self.selected_track,
                 piano_roll_drag: &mut self.piano_roll_drag,
                 selected_notes: &mut self.selected_notes,
+                groove_quantize_grid_ticks: &mut self.groove_quantize_grid_ticks,
+                groove_quantize_strength: &mut self.groove_quantize_strength,
+                groove_humanize_timing_ticks: &mut self.groove_humanize_timing_ticks,
+                groove_humanize_velocity: &mut self.groove_humanize_velocity,
+                groove_template_index: &mut self.groove_template_index,
                 piano_roll_zoom: &mut self.piano_roll_zoom,
                 scale_root: &mut self.piano_roll_scale_root,
                 scale: &mut self.piano_roll_scale,
                 editing_region_index: &mut self.piano_roll_region,
                 scroll_to: &mut self.piano_roll_scroll_to,
                 track_effect_slots: &self.track_effect_slots,
+                send_effect_slots: &self.send_effect_slots,
+                master_effect_slots: &self.master_effect_slots,
                 automation_drag: &mut self.automation_drag,
+                track_automation_drag: &mut self.track_automation_drag,
             };
             let ctx = ui.ctx().clone();
             let mut still_open = true;
@@ -6107,7 +6785,15 @@ impl eframe::App for SimpleDawApp {
             let beats_region = &mut self.beats_region;
             let lane_synth_editor = &mut self.lane_synth_editor;
             let track_effect_slots = &self.track_effect_slots;
+            let send_effect_slots = &self.send_effect_slots;
+            let master_effect_slots = &self.master_effect_slots;
             let automation_drag = &mut self.automation_drag;
+            let track_automation_drag = &mut self.track_automation_drag;
+            let mut groove = StepGrooveUi {
+                humanize_timing_ticks: &mut self.groove_humanize_timing_ticks,
+                humanize_velocity: &mut self.groove_humanize_velocity,
+                template_index: &mut self.groove_template_index,
+            };
             let ctx = ui.ctx().clone();
             let mut still_open = true;
             ctx.show_viewport_immediate(
@@ -6128,7 +6814,11 @@ impl eframe::App for SimpleDawApp {
                                 beats_region,
                                 lane_synth_editor,
                                 track_effect_slots,
+                                send_effect_slots,
+                                master_effect_slots,
                                 automation_drag,
+                                track_automation_drag,
+                                &mut groove,
                             );
                         });
                     if ui.ctx().input(|i| i.viewport().close_requested()) {
@@ -6214,6 +6904,7 @@ fn fx_editor_target(fx: &TrackFxUi, slot_index: usize) -> EffectEditorTarget {
         FxChainKind::Master => EffectEditorTarget::Master(slot_index),
         FxChainKind::Track => EffectEditorTarget::Track(fx.track_index, slot_index),
         FxChainKind::Send => EffectEditorTarget::Send(fx.track_index, slot_index),
+        FxChainKind::Submix => EffectEditorTarget::Submix(fx.track_index, slot_index),
     }
 }
 
@@ -6411,6 +7102,71 @@ fn channel_rack_row_ui(
     });
 }
 
+/// Bundles the Beats window's shared groove/humanize controls — the same underlying
+/// `SimpleDawApp` fields the Piano Roll toolbar uses (see `PianoRollPanelUi`'s `groove_*`
+/// fields), reused here since "how much to humanize by" is a general preference, not a
+/// per-lane setting.
+struct StepGrooveUi<'a> {
+    humanize_timing_ticks: &'a mut usize,
+    humanize_velocity: &'a mut u8,
+    template_index: &'a mut usize,
+}
+
+/// One lane's groove menu ("🎲"): humanize timing/velocity sliders and a groove-template picker,
+/// each with its own Apply button — the step-grid counterpart of the Piano Roll's Quantize/
+/// Humanize/Groove Template toolbar (`piano_roll_quantize_humanize_groove_ui`). Applies to every
+/// active step in this lane — the Beats window has no per-step selection to narrow it to.
+fn step_grid_lane_groove_menu_ui(
+    ui: &mut egui::Ui,
+    lane_index: usize,
+    lane: &mut Lane,
+    groove: &mut StepGrooveUi,
+) {
+    ui.menu_button("🎲", |ui| {
+        ui.label("Humanize");
+        ui.add(
+            egui::Slider::new(groove.humanize_timing_ticks, 0..=MAX_STEP_TIMING_OFFSET_TICKS as usize)
+                .text("Timing"),
+        );
+        ui.add(egui::Slider::new(groove.humanize_velocity, 0..=40).text("Velocity"));
+        if ui
+            .button("Apply")
+            .on_hover_text("Randomly nudge every active step's timing/velocity in this lane")
+            .clicked()
+        {
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            groove::humanize_steps(
+                &mut lane.steps,
+                *groove.humanize_timing_ticks as u8,
+                *groove.humanize_velocity,
+                seed,
+            );
+        }
+        ui.separator();
+        ui.label("Groove Template");
+        egui::ComboBox::from_id_salt(("step_groove_template", lane_index))
+            .selected_text(GROOVE_TEMPLATES[*groove.template_index].name)
+            .show_ui(ui, |ui| {
+                for (index, template) in GROOVE_TEMPLATES.iter().enumerate() {
+                    ui.selectable_value(groove.template_index, index, template.name);
+                }
+            });
+        if ui
+            .button("Apply")
+            .on_hover_text("Apply this template's swing/accent to every active step in this lane")
+            .clicked()
+        {
+            groove::apply_groove_template_to_steps(
+                &mut lane.steps,
+                &GROOVE_TEMPLATES[*groove.template_index],
+            );
+        }
+    });
+}
+
 /// A step-grid pattern's lanes: each lane's name, sample-load controls, and step buttons — the
 /// Beats window's contents (see `beats_contents_ui`), extracted so the row layout is defined in
 /// one place.
@@ -6425,6 +7181,7 @@ fn step_grid_lanes_ui(
     track_index: usize,
     region_index: usize,
     lane_synth_editor: &mut Option<(usize, usize, usize)>,
+    groove: &mut StepGrooveUi,
 ) -> Option<usize> {
     let mut remove_lane = None;
     let current_step = current_tick.map(|t| t / TICKS_PER_STEP);
@@ -6451,6 +7208,7 @@ fn step_grid_lanes_ui(
             {
                 *lane_synth_editor = Some((track_index, region_index, lane_index));
             }
+            step_grid_lane_groove_menu_ui(ui, lane_index, lane, groove);
             lane_sample_controls(ui, lane, sample_rate);
             for (i, step) in lane.steps.iter_mut().enumerate() {
                 if i > 0 && i % 4 == 0 {
@@ -6471,7 +7229,11 @@ fn step_grid_lanes_ui(
                     button = button.stroke(egui::Stroke::new(2.0, egui::Color32::WHITE));
                 }
                 if ui.add(button).clicked() {
-                    *step = if active { None } else { Some(100) };
+                    *step = if active {
+                        None
+                    } else {
+                        Some(StepData { velocity: 100, timing_offset_ticks: 0 })
+                    };
                 }
             }
         });
@@ -6483,6 +7245,7 @@ fn step_grid_lanes_ui(
 /// always-detached Beats window (see `ui` in `impl eframe::App for SimpleDawApp`) — the step-grid
 /// counterpart of `piano_roll_contents_ui`, including the "no in-window picker, double-click a
 /// region in the Playlist instead" behavior.
+#[allow(clippy::too_many_arguments)]
 fn beats_contents_ui(
     ui: &mut egui::Ui,
     song: &mut Song,
@@ -6492,7 +7255,11 @@ fn beats_contents_ui(
     editing_region_index: &mut Option<usize>,
     lane_synth_editor: &mut Option<(usize, usize, usize)>,
     track_effect_slots: &TrackEffectSlots,
+    send_effect_slots: &SendEffectSlots,
+    master_effect_slots: &MasterEffectSlots,
     automation_drag: &mut Option<AutomationDrag>,
+    track_automation_drag: &mut Option<AutomationDrag>,
+    groove: &mut StepGrooveUi,
 ) {
     let selected = selected_beats_track
         .filter(|&i| i < song.tracks.len())
@@ -6523,6 +7290,45 @@ fn beats_contents_ui(
     });
     ui.separator();
 
+    if let Some(index) = selected {
+        // Same pre-borrow snapshot the region panel below takes for the same reason — see its
+        // own comment. Computed separately (a second clone per frame) rather than shared, so this
+        // panel doesn't depend on whether a region is also being edited below.
+        let track_effects_snapshot = song.tracks[index].effects.clone();
+        let other_tracks_snapshot: Vec<(String, Vec<TrackEffectConfig>)> = song
+            .tracks
+            .iter()
+            .map(|t| (t.name.clone(), t.effects.clone()))
+            .collect();
+        let arrangement_span_ticks = audio::arrangement_length_ticks(song);
+        // Beats has no continuous zoom of its own (its step grid is fixed-width cells) — a fixed
+        // default keeps this graph at a reasonable density regardless, same as the region panel.
+        let zoom = 1.0;
+        ui.collapsing("Track Automation", |ui| {
+            egui::ScrollArea::vertical().id_salt("track_wide_automation").max_height(90.0).show(
+                ui,
+                |ui| {
+                    automation_lanes_ui(
+                        ui,
+                        &mut song.tracks[index].automation,
+                        arrangement_span_ticks,
+                        index,
+                        &track_effects_snapshot,
+                        track_effect_slots,
+                        &other_tracks_snapshot,
+                        &song.sends,
+                        send_effect_slots,
+                        &song.master_effects,
+                        master_effect_slots,
+                        zoom,
+                        track_automation_drag,
+                    );
+                },
+            );
+        });
+        ui.separator();
+    }
+
     match region {
         None => {
             ui.centered_and_justified(|ui| {
@@ -6539,6 +7345,12 @@ fn beats_contents_ui(
                 song.tracks[index].add_lane(format!("Lane {}", lane_count + 1), 60);
             }
             let track_effects_snapshot = song.tracks[index].effects.clone();
+            // Same pre-borrow snapshot as `piano_roll_contents_ui` — see its comment.
+            let other_tracks_snapshot: Vec<(String, Vec<TrackEffectConfig>)> = song
+                .tracks
+                .iter()
+                .map(|t| (t.name.clone(), t.effects.clone()))
+                .collect();
             let mut lane_to_remove = None;
             let region = &mut song.tracks[index].regions[region_index];
             if let RegionContent::StepGrid(lanes) = &mut region.content {
@@ -6551,20 +7363,27 @@ fn beats_contents_ui(
                     index,
                     region_index,
                     lane_synth_editor,
+                    groove,
                 );
             }
             ui.separator();
             // Beats has no continuous zoom of its own (its step grid is fixed-width cells) —
             // a fixed default keeps the automation graph at a reasonable density regardless.
             let zoom = 1.0;
+            let region_span_ticks = region.loop_length_steps * TICKS_PER_STEP;
             egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
                 automation_lanes_ui(
                     ui,
-                    region,
+                    &mut region.automation,
+                    region_span_ticks,
                     index,
                     &track_effects_snapshot,
                     track_effect_slots,
+                    &other_tracks_snapshot,
                     &song.sends,
+                    send_effect_slots,
+                    &song.master_effects,
+                    master_effect_slots,
                     zoom,
                     automation_drag,
                 );
@@ -7671,6 +8490,49 @@ fn draw_audio_clip_waveform(painter: &egui::Painter, rect: egui::Rect, buffer: &
     }
 }
 
+/// A list editor for `Song::tempo_map`: each row is an existing tempo-change point's tick
+/// (read-only — moving a point means removing and re-inserting it, not dragging it) and its BPM
+/// (editable in place), plus a remove button. "+ Insert Tempo Change at Playhead" adds a new
+/// point at the transport's current tick, defaulting its BPM to whatever's already in effect
+/// there (`Song::bpm_at`) so inserting one is a no-op until the value's actually changed.
+/// Simpler than the Piano Roll's draggable automation graph (`automation_lane_graph_ui`) since a
+/// tempo map is a handful of precise step-function points, not a continuously-dragged curve.
+fn tempo_track_ui(ui: &mut egui::Ui, song: &mut Song, current_tick: Option<usize>) {
+    ui.horizontal(|ui| {
+        ui.label("Starting tempo:");
+        ui.add(
+            egui::DragValue::new(&mut song.bpm)
+                .range(20.0..=300.0)
+                .suffix(" BPM"),
+        );
+        ui.weak("(same field as the transport LCD's TEMPO)");
+    });
+    if ui
+        .button("+ Insert Tempo Change at Playhead")
+        .on_hover_text("Adds a tempo-change point at the transport's current position")
+        .clicked()
+    {
+        let tick = current_tick.unwrap_or(0);
+        song.set_tempo_at(tick, song.bpm_at(tick));
+    }
+    let mut remove_index = None;
+    for (index, point) in song.tempo_map.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(format!("Tick {}", point.tick));
+            ui.add(egui::DragValue::new(&mut point.bpm).range(20.0..=300.0).suffix(" BPM"));
+            if ui.small_button("✕").on_hover_text("Remove this tempo change").clicked() {
+                remove_index = Some(index);
+            }
+        });
+    }
+    if let Some(index) = remove_index {
+        song.remove_tempo_point(index);
+    }
+    if song.tempo_map.is_empty() {
+        ui.weak("No tempo changes yet — the song plays at the starting tempo throughout.");
+    }
+}
+
 fn playlist_contents_ui(
     ui: &mut egui::Ui,
     song: &mut Song,
@@ -7695,6 +8557,10 @@ fn playlist_contents_ui(
          resize (shorter truncates it, longer loops it); drag its body to move it in time. \
          Double-click a region to edit it in the Piano Roll/Beats; right-click removes it.",
     );
+    ui.separator();
+    ui.collapsing("Tempo Track", |ui| {
+        tempo_track_ui(ui, song, current_tick);
+    });
     ui.separator();
     let zoom = *zoom;
 
@@ -7724,17 +8590,19 @@ fn playlist_contents_ui(
 
     let steps_per_bar = song.steps_per_bar();
     let steps_per_beat = song.steps_per_beat();
-    let ticks_per_second = audio::ticks_per_second(song.bpm);
     let max_region_step = lane_track_indices
         .iter()
         .flat_map(|&i| song.tracks[i].regions.iter())
         .map(|r| (r.start_tick + r.loop_length_steps * TICKS_PER_STEP) / TICKS_PER_STEP)
         .max()
         .unwrap_or(0);
+    // Each clip's own starting tempo (`Song::bpm_at`), not one flat rate for all of them — same
+    // approximation `audio::arrangement_length_ticks` uses for the same reason.
     let max_audio_step = audio_track_indices
         .iter()
         .flat_map(|&i| song.tracks[i].audio_clips.iter())
         .map(|clip| {
+            let ticks_per_second = audio::ticks_per_second(song.bpm_at(clip.start_tick));
             (clip.start_tick + audio_clip_length_ticks(clip, ticks_per_second)) / TICKS_PER_STEP
         })
         .max()
@@ -7911,8 +8779,9 @@ fn playlist_contents_ui(
                 let color = track_color(track_index);
                 for clip in &track.audio_clips {
                     let x = rect.left() + tick_to_x(clip.start_tick, zoom);
-                    let w =
-                        tick_to_x(audio_clip_length_ticks(clip, ticks_per_second), zoom).max(3.0);
+                    let clip_ticks_per_second = audio::ticks_per_second(song.bpm_at(clip.start_tick));
+                    let w = tick_to_x(audio_clip_length_ticks(clip, clip_ticks_per_second), zoom)
+                        .max(3.0);
                     let clip_rect = egui::Rect::from_min_size(
                         egui::pos2(x, y + 1.0),
                         egui::vec2(w, PLAYLIST_LANE_HEIGHT - 2.0),
@@ -7968,7 +8837,6 @@ fn playlist_contents_ui(
                 song,
                 &audio_track_indices,
                 audio_rows_top,
-                ticks_per_second,
                 audio_clip_drag,
                 zoom,
             );
@@ -8324,7 +9192,6 @@ fn handle_audio_clip_interaction(
     song: &mut Song,
     audio_track_indices: &[usize],
     audio_rows_top: f32,
-    ticks_per_second: f64,
     drag: &mut Option<AudioClipDrag>,
     zoom: f32,
 ) {
@@ -8339,9 +9206,19 @@ fn handle_audio_clip_interaction(
             .max(0.0) as usize;
         (row < row_count).then(|| audio_track_indices[row])
     };
+    // Snapshot before any `&mut song.tracks[...]` borrow below, mirroring the same pre-borrow
+    // pattern used elsewhere (e.g. `piano_roll_contents_ui`'s `other_tracks_snapshot`) — a plain
+    // closure calling `song.bpm_at(...)` here would hold `song` captured for this whole
+    // function's remaining borrows, conflicting with those later mutable ones.
+    let (base_bpm, tempo_map) = (song.bpm, song.tempo_map.clone());
     let clip_at = |clips: &[AudioClip], tick: usize| {
         clips.iter().position(|c| {
-            let len = audio_clip_length_ticks(c, ticks_per_second);
+            let bpm = tempo_map
+                .iter()
+                .rev()
+                .find(|point| point.tick <= c.start_tick)
+                .map_or(base_bpm, |point| point.bpm);
+            let len = audio_clip_length_ticks(c, audio::ticks_per_second(bpm));
             tick >= c.start_tick && tick < c.start_tick + len
         })
     };
@@ -8551,71 +9428,133 @@ fn effect_slot_automatable_params(
     }
 }
 
-/// Human label for an already-existing lane's target, for its row header — `Volume`/`Pan` as-is,
-/// `Send: <name>` (falling back to the index if the send was since removed), and
-/// `FX <slot+1> (<kind>): <param>` for an effect param (again falling back to a generic label if
-/// the slot's contents changed since the lane was created).
+/// Human label for one effect-chain automation target: `FX <slot+1> (<kind>): <param>`, falling
+/// back to a generic label if the slot's contents changed since the lane was created. Shared body
+/// behind `automation_target_label`'s `EffectParam`/`OtherTrackEffectParam`/`SendEffectParam`/
+/// `MasterEffectParam` arms, which differ only in which chain (`effects`) they read from.
+fn effect_param_label(slot_index: usize, key: &EffectParamKey, effects: &[TrackEffectConfig]) -> String {
+    let param_name = match key {
+        EffectParamKey::Clap { param_id } => format!("param {param_id}"),
+        EffectParamKey::BuiltIn { param_name } => param_name.clone(),
+    };
+    match effects.get(slot_index) {
+        Some(config) => {
+            format!("FX {} ({}): {param_name}", slot_index + 1, track_effect_config_label(config))
+        }
+        None => format!("FX {}: {param_name}", slot_index + 1),
+    }
+}
+
+/// Human label for an already-existing lane's target, for its row header — `Volume`/`Pan` as-is
+/// for this lane's own track, `<track>: Volume`/`<track>: Pan`/`<track>: Send <send>` for a
+/// redirected `OtherTrack*` target, `Send: <name>` for this track's own `SendLevel`, and an
+/// `effect_param_label` for any `*EffectParam` target — all falling back to a generic label (index
+/// instead of name) if the referenced track/send/slot no longer matches what the lane was created
+/// for.
+#[allow(clippy::too_many_arguments)]
 fn automation_target_label(
     target: &AutomationTarget,
     track_effects: &[TrackEffectConfig],
+    other_tracks: &[(String, Vec<TrackEffectConfig>)],
     sends: &[SendBus],
+    master_effects: &[TrackEffectConfig],
 ) -> String {
+    let track_name = |track_index: usize| {
+        other_tracks
+            .get(track_index)
+            .map_or_else(|| format!("Track {}", track_index + 1), |(name, _)| name.clone())
+    };
+    let send_name = |send_index: usize| {
+        sends.get(send_index).map_or_else(|| format!("Send {}", send_index + 1), |s| s.name.clone())
+    };
     match target {
         AutomationTarget::Volume => "Volume".to_string(),
         AutomationTarget::Pan => "Pan".to_string(),
-        AutomationTarget::SendLevel { send_index } => match sends.get(*send_index) {
-            Some(send) => format!("Send: {}", send.name),
-            None => format!("Send {}", send_index + 1),
-        },
+        AutomationTarget::SendLevel { send_index } => format!("Send: {}", send_name(*send_index)),
         AutomationTarget::EffectParam { slot_index, key } => {
-            let param_name = match key {
-                EffectParamKey::Clap { param_id } => format!("param {param_id}"),
-                EffectParamKey::BuiltIn { param_name } => param_name.clone(),
-            };
-            match track_effects.get(*slot_index) {
-                Some(config) => format!(
-                    "FX {} ({}): {param_name}",
-                    slot_index + 1,
-                    track_effect_config_label(config)
-                ),
-                None => format!("FX {}: {param_name}", slot_index + 1),
-            }
+            effect_param_label(*slot_index, key, track_effects)
+        }
+        AutomationTarget::OtherTrackVolume { track_index } => {
+            format!("{}: Volume", track_name(*track_index))
+        }
+        AutomationTarget::OtherTrackPan { track_index } => {
+            format!("{}: Pan", track_name(*track_index))
+        }
+        AutomationTarget::OtherTrackSendLevel { track_index, send_index } => {
+            format!("{}: Send {}", track_name(*track_index), send_name(*send_index))
+        }
+        AutomationTarget::OtherTrackEffectParam { track_index, slot_index, key } => {
+            let effects = other_tracks.get(*track_index).map_or(&[][..], |(_, e)| e.as_slice());
+            format!("{}: {}", track_name(*track_index), effect_param_label(*slot_index, key, effects))
+        }
+        AutomationTarget::SendEffectParam { send_index, slot_index, key } => {
+            let effects = sends.get(*send_index).map_or(&[][..], |s| s.effects.as_slice());
+            format!("{}: {}", send_name(*send_index), effect_param_label(*slot_index, key, effects))
+        }
+        AutomationTarget::MasterEffectParam { slot_index, key } => {
+            format!("Master: {}", effect_param_label(*slot_index, key, master_effects))
         }
     }
 }
 
 /// This target's value range, for the lane graph's y-axis and new-point clamping — static ranges
-/// for `Volume`/`Pan`/`SendLevel` (matching their sliders elsewhere in the Mixer), or whatever
-/// `effect_slot_automatable_params` reports for an `EffectParam` target (falling back to 0.0..1.0
-/// if the slot's contents no longer match the key the lane was created for, e.g. a different
-/// effect was loaded into that slot since).
+/// for `Volume`/`Pan`/`SendLevel` (matching their sliders elsewhere in the Mixer, whether this
+/// lane's own track or a redirected `OtherTrack*` target), or whatever
+/// `effect_slot_automatable_params` reports for any `*EffectParam` target (falling back to
+/// 0.0..1.0 if the slot's contents no longer match the key the lane was created for, e.g. a
+/// different effect was loaded into that slot since).
+#[allow(clippy::too_many_arguments)]
 fn automation_target_range(
     target: &AutomationTarget,
     track_effects: &[TrackEffectConfig],
     track_effect_slots: &TrackEffectSlots,
     track_index: usize,
+    other_tracks: &[(String, Vec<TrackEffectConfig>)],
+    sends: &[SendBus],
+    send_effect_slots: &SendEffectSlots,
+    master_effects: &[TrackEffectConfig],
+    master_effect_slots: &MasterEffectSlots,
 ) -> (f32, f32) {
+    let range_for = |effects: &[TrackEffectConfig],
+                      slots: &TrackEffectSlots,
+                      owner_index: usize,
+                      slot_index: usize,
+                      key: &EffectParamKey| {
+        let Some(config) = effects.get(slot_index) else {
+            return (0.0, 1.0);
+        };
+        let params = effect_slot_automatable_params(config, slots, owner_index, slot_index);
+        params
+            .iter()
+            .find(|(_, _, _, k)| k == key)
+            .map(|&(_, min, max, _)| (min, max))
+            .unwrap_or((0.0, 1.0))
+    };
     match target {
-        AutomationTarget::Volume => (0.0, 1.5),
-        AutomationTarget::Pan => (-1.0, 1.0),
-        AutomationTarget::SendLevel { .. } => (0.0, 1.5),
+        AutomationTarget::Volume | AutomationTarget::OtherTrackVolume { .. } => (0.0, 1.5),
+        AutomationTarget::Pan | AutomationTarget::OtherTrackPan { .. } => (-1.0, 1.0),
+        AutomationTarget::SendLevel { .. } | AutomationTarget::OtherTrackSendLevel { .. } => {
+            (0.0, 1.5)
+        }
         AutomationTarget::EffectParam { slot_index, key } => {
-            let Some(config) = track_effects.get(*slot_index) else {
-                return (0.0, 1.0);
-            };
-            let params =
-                effect_slot_automatable_params(config, track_effect_slots, track_index, *slot_index);
-            params
-                .iter()
-                .find(|(_, _, _, k)| k == key)
-                .map(|&(_, min, max, _)| (min, max))
-                .unwrap_or((0.0, 1.0))
+            range_for(track_effects, track_effect_slots, track_index, *slot_index, key)
+        }
+        AutomationTarget::OtherTrackEffectParam { track_index: other_index, slot_index, key } => {
+            let effects = other_tracks.get(*other_index).map_or(&[][..], |(_, e)| e.as_slice());
+            range_for(effects, track_effect_slots, *other_index, *slot_index, key)
+        }
+        AutomationTarget::SendEffectParam { send_index, slot_index, key } => {
+            let effects = sends.get(*send_index).map_or(&[][..], |s| s.effects.as_slice());
+            range_for(effects, send_effect_slots, *send_index, *slot_index, key)
+        }
+        AutomationTarget::MasterEffectParam { slot_index, key } => {
+            range_for(master_effects, master_effect_slots, 0, *slot_index, key)
         }
     }
 }
 
 /// One automation lane's point graph: a connecting line through every point (sorted by tick for
-/// display only — see `AutomationLane::value_at`'s doc comment on why storage order doesn't
+/// display only — see `AutomationLane::value_at_fractional`'s doc comment on why storage order doesn't
 /// matter), a dot per point, click-empty-space to add a point, drag a point to move it (both tick
 /// and value), right-click a point to delete it. The `Region` fade triangles' visual counterpart
 /// for a full multi-point "ride" rather than a single ramp.
@@ -8711,39 +9650,80 @@ fn automation_lane_graph_ui(
     }
 }
 
-/// The automation panel shown under a region's own content editor (Piano Roll or Beats) — an
-/// "+ Add Lane" menu (Volume/Pan/every send/every automatable param on this track's own effect
-/// chain) plus one `automation_lane_graph_ui` row per existing lane, each with a remove button.
-/// `track_effects`/`track_effect_slots` are this region's own track's — automation only ever
-/// targets its own track, never another track, a send's own chain, or the master bus (see
-/// `AutomationTarget`'s doc comment).
+/// One "FX <slot+1> (<kind>)" submenu per slot in `effects` that has at least one automatable
+/// param, each listing its params as buttons — `on_pick(slot_index, key)` is called when one's
+/// clicked (the caller closes the popup and pushes the new lane; this only builds the menu tree).
+/// Shared body behind `automation_lanes_ui`'s four near-identical effect-chain submenus (this
+/// track's own chain, a redirected other-track's chain, a send's chain, the master chain), which
+/// differ only in which `effects`/`slots`/`owner_index` they read from.
+fn effect_chain_automation_menu(
+    ui: &mut egui::Ui,
+    effects: &[TrackEffectConfig],
+    slots: &TrackEffectSlots,
+    owner_index: usize,
+    mut on_pick: impl FnMut(usize, EffectParamKey),
+) {
+    for (slot_index, config) in effects.iter().enumerate() {
+        let params = effect_slot_automatable_params(config, slots, owner_index, slot_index);
+        if params.is_empty() {
+            continue;
+        }
+        let label = format!("FX {} ({})", slot_index + 1, track_effect_config_label(config));
+        ui.menu_button(label, |ui| {
+            for (name, _min, _max, key) in &params {
+                if ui.button(name).clicked() {
+                    on_pick(slot_index, key.clone());
+                    ui.close();
+                }
+            }
+        });
+    }
+}
+
+/// The automation panel shown under a region's own content editor (Piano Roll or Beats) *or* under
+/// a selected track's header as its track-wide panel — an "+ Add Lane" menu (Volume/Pan/every
+/// send/every automatable param on this track's own effect chain, plus "Other Track"/"Send FX"/
+/// "Master FX" submenus for redirected targets — see `AutomationTarget`'s doc comment) plus one
+/// `automation_lane_graph_ui` row per existing lane, each with a remove button. Generic over which
+/// `Vec<AutomationLane>`/`span_ticks` it edits — a `Region`'s own `automation` capped at that
+/// region's on-timeline length, or a `Track`'s own track-wide `automation` capped at the whole
+/// arrangement's length (`audio::arrangement_length_ticks`) — since the panel itself doesn't care
+/// which; only the ticks' meaning (region-local vs. absolute) differs, and that's resolved entirely
+/// by `collect_automation` at playback time, not here. `track_effects`/`track_effect_slots` are
+/// this track's own; `other_tracks` is every track's (name, effects) snapshot, index-aligned with
+/// `Song::tracks`, for the "Other Track" submenu.
+#[allow(clippy::too_many_arguments)]
 fn automation_lanes_ui(
     ui: &mut egui::Ui,
-    region: &mut Region,
+    automation: &mut Vec<AutomationLane>,
+    span_ticks: usize,
     track_index: usize,
     track_effects: &[TrackEffectConfig],
     track_effect_slots: &TrackEffectSlots,
+    other_tracks: &[(String, Vec<TrackEffectConfig>)],
     sends: &[SendBus],
+    send_effect_slots: &SendEffectSlots,
+    master_effects: &[TrackEffectConfig],
+    master_effect_slots: &MasterEffectSlots,
     zoom: f32,
     drag: &mut Option<AutomationDrag>,
 ) {
-    let span_ticks = region.loop_length_steps * TICKS_PER_STEP;
     ui.horizontal(|ui| {
         ui.strong("Automation");
         ui.menu_button("+ Add Lane", |ui| {
             if ui.button("Volume").clicked() {
-                region.automation.push(AutomationLane { target: AutomationTarget::Volume, points: Vec::new() });
+                automation.push(AutomationLane { target: AutomationTarget::Volume, points: Vec::new() });
                 ui.close();
             }
             if ui.button("Pan").clicked() {
-                region.automation.push(AutomationLane { target: AutomationTarget::Pan, points: Vec::new() });
+                automation.push(AutomationLane { target: AutomationTarget::Pan, points: Vec::new() });
                 ui.close();
             }
             if !sends.is_empty() {
                 ui.menu_button("Send Level", |ui| {
                     for (send_index, send) in sends.iter().enumerate() {
                         if ui.button(&send.name).clicked() {
-                            region.automation.push(AutomationLane {
+                            automation.push(AutomationLane {
                                 target: AutomationTarget::SendLevel { send_index },
                                 points: Vec::new(),
                             });
@@ -8752,44 +9732,120 @@ fn automation_lanes_ui(
                     }
                 });
             }
-            for (slot_index, config) in track_effects.iter().enumerate() {
-                let params =
-                    effect_slot_automatable_params(config, track_effect_slots, track_index, slot_index);
-                if params.is_empty() {
-                    continue;
-                }
-                let label = format!("FX {} ({})", slot_index + 1, track_effect_config_label(config));
-                ui.menu_button(label, |ui| {
-                    for (name, _min, _max, key) in &params {
-                        if ui.button(name).clicked() {
-                            region.automation.push(AutomationLane {
-                                target: AutomationTarget::EffectParam {
-                                    slot_index,
-                                    key: key.clone(),
-                                },
-                                points: Vec::new(),
-                            });
-                            ui.close();
+            effect_chain_automation_menu(ui, track_effects, track_effect_slots, track_index, |slot_index, key| {
+                automation.push(AutomationLane {
+                    target: AutomationTarget::EffectParam { slot_index, key },
+                    points: Vec::new(),
+                });
+            });
+            if other_tracks.len() > 1 {
+                ui.menu_button("Other Track", |ui| {
+                    for (other_index, (name, effects)) in other_tracks.iter().enumerate() {
+                        if other_index == track_index {
+                            continue;
                         }
+                        ui.menu_button(name, |ui| {
+                            if ui.button("Volume").clicked() {
+                                automation.push(AutomationLane {
+                                    target: AutomationTarget::OtherTrackVolume { track_index: other_index },
+                                    points: Vec::new(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Pan").clicked() {
+                                automation.push(AutomationLane {
+                                    target: AutomationTarget::OtherTrackPan { track_index: other_index },
+                                    points: Vec::new(),
+                                });
+                                ui.close();
+                            }
+                            if !sends.is_empty() {
+                                ui.menu_button("Send Level", |ui| {
+                                    for (send_index, send) in sends.iter().enumerate() {
+                                        if ui.button(&send.name).clicked() {
+                                            automation.push(AutomationLane {
+                                                target: AutomationTarget::OtherTrackSendLevel {
+                                                    track_index: other_index,
+                                                    send_index,
+                                                },
+                                                points: Vec::new(),
+                                            });
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            }
+                            effect_chain_automation_menu(ui, effects, track_effect_slots, other_index, |slot_index, key| {
+                                automation.push(AutomationLane {
+                                    target: AutomationTarget::OtherTrackEffectParam {
+                                        track_index: other_index,
+                                        slot_index,
+                                        key,
+                                    },
+                                    points: Vec::new(),
+                                });
+                            });
+                        });
                     }
+                });
+            }
+            if !sends.is_empty() {
+                ui.menu_button("Send FX", |ui| {
+                    for (send_index, send) in sends.iter().enumerate() {
+                        ui.menu_button(&send.name, |ui| {
+                            effect_chain_automation_menu(
+                                ui,
+                                &send.effects,
+                                send_effect_slots,
+                                send_index,
+                                |slot_index, key| {
+                                    automation.push(AutomationLane {
+                                        target: AutomationTarget::SendEffectParam { send_index, slot_index, key },
+                                        points: Vec::new(),
+                                    });
+                                },
+                            );
+                        });
+                    }
+                });
+            }
+            if !master_effects.is_empty() {
+                ui.menu_button("Master FX", |ui| {
+                    effect_chain_automation_menu(ui, master_effects, master_effect_slots, 0, |slot_index, key| {
+                        automation.push(AutomationLane {
+                            target: AutomationTarget::MasterEffectParam { slot_index, key },
+                            points: Vec::new(),
+                        });
+                    });
                 });
             }
         });
     });
 
-    if region.automation.is_empty() {
+    if automation.is_empty() {
         ui.weak("No automation lanes yet.");
         return;
     }
 
     let mut lane_to_remove = None;
-    for lane_index in 0..region.automation.len() {
-        let label = automation_target_label(&region.automation[lane_index].target, track_effects, sends);
+    for lane_index in 0..automation.len() {
+        let label = automation_target_label(
+            &automation[lane_index].target,
+            track_effects,
+            other_tracks,
+            sends,
+            master_effects,
+        );
         let value_range = automation_target_range(
-            &region.automation[lane_index].target,
+            &automation[lane_index].target,
             track_effects,
             track_effect_slots,
             track_index,
+            other_tracks,
+            sends,
+            send_effect_slots,
+            master_effects,
+            master_effect_slots,
         );
         ui.horizontal(|ui| {
             ui.label(&label);
@@ -8799,7 +9855,7 @@ fn automation_lanes_ui(
         });
         automation_lane_graph_ui(
             ui,
-            &mut region.automation[lane_index],
+            &mut automation[lane_index],
             lane_index,
             span_ticks,
             value_range,
@@ -8808,7 +9864,7 @@ fn automation_lanes_ui(
         );
     }
     if let Some(index) = lane_to_remove {
-        region.automation.remove(index);
+        automation.remove(index);
         if drag.as_ref().is_some_and(|d| d.lane_index == index) {
             *drag = None;
         }

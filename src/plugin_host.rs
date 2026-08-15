@@ -14,6 +14,7 @@ use clack_host::prelude::*;
 use clack_host::utils::Cookie;
 
 use crate::builtin_fx::BuiltInEffect;
+use crate::model::TrackEffectConfig;
 
 /// A CLAP parameter's static metadata, as declared by the plugin at load time (id, display name,
 /// and its plain-value range). Doesn't change over the plugin's lifetime in this MVP — there's no
@@ -163,6 +164,10 @@ pub fn new_master_effect_slots() -> MasterEffectSlots {
 /// `TrackEffectSlots` resizes with `Song::tracks`), and built with the same `new_track_effect_slots`
 /// constructor.
 pub type SendEffectSlots = TrackEffectSlots;
+
+/// One effect chain per submix bus, indexed the same as `Song::submixes` — structurally identical
+/// to `TrackEffectSlots`/`SendEffectSlots`, same reasoning.
+pub type SubmixEffectSlots = TrackEffectSlots;
 
 /// A `TrackEffectSlots` with `track_count` empty per-track chains.
 pub fn new_track_effect_slots(track_count: usize) -> TrackEffectSlots {
@@ -372,6 +377,63 @@ pub fn load_and_activate(
             is_open: false,
         },
     ))
+}
+
+/// A temporary effect chain loaded fresh for one-shot offline rendering (`audio::render_song_to_wav`)
+/// — distinct from `TrackEffectSlots` and friends, the *live* chains loaded once via the UI's
+/// "Load" button and reused every real-time callback for as long as a plugin stays loaded. Every
+/// loaded CLAP plugin's `PluginInstance` must be kept alive exactly as long as its `LoadedEffect`
+/// (see `LoadedEffect`'s doc comment) — `_instances` exists purely to hold that alive via RAII,
+/// dropped together with `chain` when this whole value drops at the end of the bounce. Never read
+/// directly; a bounce has no GUI to open and no need to touch a `PluginInstance` beyond keeping it
+/// alive.
+pub struct OfflineEffectChain {
+    pub chain: Vec<Option<EffectInstance>>,
+    _instances: Vec<Option<PluginInstance<DawHost>>>,
+}
+
+/// Loads `specs` into a fresh `OfflineEffectChain` at `sample_rate`/`block_size` — which may differ
+/// from any live session's, since a bounce picks its own sample rate. Activates each CLAP plugin
+/// with `min_frames_count = 1` regardless of `block_size` (unlike a live chain, which activates at
+/// the audio device's own reported minimum) — the offline mixdown's automation sub-chunking
+/// (`process_chain_with_automation`) can hand a plugin fewer frames than `block_size` at an
+/// automation breakpoint, and this keeps every call within the plugin's declared range. A CLAP
+/// plugin that fails to load (missing file, incompatible bundle, ...) leaves that slot `None`,
+/// silently skipped, the same tolerance a live chain already has for a not-yet-loaded slot — one
+/// broken effect shouldn't fail the whole bounce.
+pub fn load_offline_chain(specs: &[TrackEffectConfig], sample_rate: f64, block_size: u32) -> OfflineEffectChain {
+    let mut chain = Vec::with_capacity(specs.len());
+    let mut instances = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match spec {
+            TrackEffectConfig::Clap { path, params } => {
+                if path.trim().is_empty() {
+                    chain.push(None);
+                    instances.push(None);
+                    continue;
+                }
+                match load_and_activate(Path::new(path.trim()), sample_rate, 1, block_size) {
+                    Ok((instance, mut effect, _gui)) => {
+                        for (id, value) in params {
+                            effect.set_param_by_id(*id, *value);
+                        }
+                        chain.push(Some(EffectInstance::Clap(effect)));
+                        instances.push(Some(instance));
+                    }
+                    Err(_) => {
+                        chain.push(None);
+                        instances.push(None);
+                    }
+                }
+            }
+            builtin_spec => {
+                let effect = BuiltInEffect::from_config(builtin_spec, sample_rate as f32);
+                chain.push(effect.map(EffectInstance::BuiltIn));
+                instances.push(None);
+            }
+        }
+    }
+    OfflineEffectChain { chain, _instances: instances }
 }
 
 /// Negotiates and opens `instance`'s floating GUI window (see the `gui` extension's negotiation

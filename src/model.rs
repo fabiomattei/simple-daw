@@ -7,11 +7,53 @@ use serde::{Deserialize, Serialize};
 use crate::sample::SampleBuffer;
 use crate::wavetable::{WaveWarpMode, WavetableId};
 
+/// One active step-grid trigger: a velocity plus a small timing nudge off the step's own grid
+/// position, for groove templates/humanize (see `crate::groove`). `timing_offset_ticks` is
+/// expected to stay within `-(TICKS_PER_STEP / 2 - 1)..=(TICKS_PER_STEP / 2 - 1)` (kept in range
+/// by every setter — `Lane::set_step`, `Lane::set_step_timing_offset`, and `groove`'s step
+/// functions — rather than enforced here) so a nudged step's trigger tick can never cross into a
+/// neighboring step's own territory; `Sequencer::process`'s trigger scan (`audio::step_triggering_at`)
+/// only looks at the two step boundaries nearest a given tick, relying on that invariant.
+///
+/// Deserializes from either this struct's own shape or a bare `u8` (`#[serde(from = "StepDataRepr")]`
+/// below) so song files saved before timing offsets existed — where a step was just a velocity
+/// byte — still load, with `timing_offset_ticks` defaulting to 0.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "StepDataRepr")]
+pub struct StepData {
+    pub velocity: u8,
+    pub timing_offset_ticks: i8,
+}
+
+/// Deserialization-only shape `StepData` converts from — see `StepData`'s doc comment.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StepDataRepr {
+    /// A song file saved before timing offsets existed: a step was just a velocity byte.
+    LegacyVelocity(u8),
+    Full {
+        velocity: u8,
+        #[serde(default)]
+        timing_offset_ticks: i8,
+    },
+}
+
+impl From<StepDataRepr> for StepData {
+    fn from(repr: StepDataRepr) -> Self {
+        match repr {
+            StepDataRepr::LegacyVelocity(velocity) => StepData { velocity, timing_offset_ticks: 0 },
+            StepDataRepr::Full { velocity, timing_offset_ticks } => {
+                StepData { velocity, timing_offset_ticks }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lane {
     pub name: String,
     pub pitch: u8,
-    pub steps: Vec<Option<u8>>,
+    pub steps: Vec<Option<StepData>>,
     /// When set, triggering this lane plays the sample instead of the built-in synth.
     /// Not serialized — it's decoded audio, not song data; reloaded from `sample_path`
     /// after deserializing (see `Song::load_from_file`).
@@ -64,10 +106,13 @@ impl Lane {
         }
     }
 
-    /// Sets step `index` to trigger at `velocity`.
+    /// Sets step `index` to trigger at `velocity`, preserving that step's existing timing offset
+    /// (if it was already active) rather than resetting it to straight.
     pub fn set_step(&mut self, index: usize, velocity: u8) {
-        self.steps[index] = Some(velocity);
+        let timing_offset_ticks = self.steps[index].map_or(0, |step| step.timing_offset_ticks);
+        self.steps[index] = Some(StepData { velocity, timing_offset_ticks });
     }
+
 
     /// Loads `sample_path`, resampled to `target_sample_rate`. On failure, falls back
     /// to the synth (clears `sample`) and records the error for the UI to display.
@@ -103,6 +148,11 @@ impl Lane {
 /// a common MIDI PPQ-style resolution: fine enough that placement feels
 /// free-form while staying exact integer arithmetic for the sequencer.
 pub const TICKS_PER_STEP: usize = 24;
+
+/// Largest magnitude a `StepData::timing_offset_ticks` may hold — half a step, minus one tick, so
+/// a maximally-nudged step's trigger tick can never land exactly on (or past) a neighboring step's
+/// own grid position. See `StepData`'s doc comment.
+pub const MAX_STEP_TIMING_OFFSET_TICKS: i8 = (TICKS_PER_STEP / 2 - 1) as i8;
 
 /// A melodic note in a piano-roll pattern: unlike a step-grid `Lane`, pitch
 /// varies per note rather than being fixed per row, and position/length are
@@ -718,22 +768,57 @@ pub struct Region {
     pub automation: Vec<AutomationLane>,
 }
 
-/// Which of a track's continuously-varying parameters an `AutomationLane` rides. Always scoped to
-/// the region's own track — there's no cross-track automation target (a lane on one track can't
-/// ride another track's fader, its sends, or the master bus).
+/// Which of a track's (or another track's, or a send/master bus's) continuously-varying
+/// parameters an `AutomationLane` rides. A lane still always *lives on* one `Region`, owned by one
+/// track — that doesn't change — but its target no longer has to be that same track: the
+/// `OtherTrack*`/`SendEffectParam`/`MasterEffectParam` variants let a lane on one track's region
+/// ride a different track's fader, another track's send level, a send bus's own effect chain, or
+/// the master bus's effect chain. `audio::collect_automation` resolves every region's lanes into
+/// per-owner buckets each buffer, regardless of which track's region a lane happened to live on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum AutomationTarget {
-    /// Rides `Track::volume`.
+    /// Rides this lane's own track's `Track::volume`.
     Volume,
-    /// Rides `Track::pan`.
+    /// Rides this lane's own track's `Track::pan`.
     Pan,
-    /// Rides `Track::send_levels[send_index]` (index into `Song::sends`).
+    /// Rides this lane's own track's `Track::send_levels[send_index]` (index into `Song::sends`).
     SendLevel { send_index: usize },
-    /// Rides one parameter of the effect loaded in this track's own `Track::effects[slot_index]`
-    /// — which parameter is identified by `key`, since a CLAP plugin's parameters and a built-in
-    /// effect's parameters are addressed differently (see `EffectParamKey`).
+    /// Rides one parameter of the effect loaded in this lane's own track's own
+    /// `Track::effects[slot_index]` — which parameter is identified by `key`, since a CLAP
+    /// plugin's parameters and a built-in effect's parameters are addressed differently (see
+    /// `EffectParamKey`).
     EffectParam {
+        slot_index: usize,
+        key: EffectParamKey,
+    },
+    /// Rides `Song::tracks[track_index].volume` — a *different* track than the one this lane's
+    /// region lives on.
+    OtherTrackVolume { track_index: usize },
+    /// Rides `Song::tracks[track_index].pan` — a *different* track than the one this lane's
+    /// region lives on.
+    OtherTrackPan { track_index: usize },
+    /// Rides `Song::tracks[track_index].send_levels[send_index]` — a *different* track than the
+    /// one this lane's region lives on.
+    OtherTrackSendLevel { track_index: usize, send_index: usize },
+    /// Rides one parameter of the effect loaded in a *different* track's
+    /// `Track::effects[slot_index]` than the one this lane's region lives on.
+    OtherTrackEffectParam {
+        track_index: usize,
+        slot_index: usize,
+        key: EffectParamKey,
+    },
+    /// Rides one parameter of the effect loaded in `Song::sends[send_index]`'s own
+    /// `SendBus::effects[slot_index]` — the send bus's own chain, distinct from
+    /// `SendLevel`/`OtherTrackSendLevel`, which ride how much of a track feeds that bus.
+    SendEffectParam {
+        send_index: usize,
+        slot_index: usize,
+        key: EffectParamKey,
+    },
+    /// Rides one parameter of the effect loaded in `Song::master_effects[slot_index]` — the master
+    /// bus's own chain.
+    MasterEffectParam {
         slot_index: usize,
         key: EffectParamKey,
     },
@@ -764,9 +849,9 @@ pub struct AutomationPoint {
 
 /// A single automated parameter's "ride" over a `Region`'s on-timeline span: a target plus an
 /// ordered-by-nothing-in-particular list of (tick, value) points, linearly interpolated between —
-/// see `value_at`. A `fade_in_ticks`/`fade_out_ticks` ramp is conceptually just a 2-point `Volume`
-/// lane; this is the general form ("rides" — riding a fader up/down over multiple points, not
-/// just a straight ramp).
+/// see `value_at_fractional`. A `fade_in_ticks`/`fade_out_ticks` ramp is conceptually just a
+/// 2-point `Volume` lane; this is the general form ("rides" — riding a fader up/down over multiple
+/// points, not just a straight ramp).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationLane {
     pub target: AutomationTarget,
@@ -781,26 +866,31 @@ impl AutomationLane {
     /// (`Track::volume`, etc.) in that case, the same way an empty `points` list reads as "no
     /// override" rather than "override to 0".
     ///
+    /// Takes a fractional tick rather than a whole sequencer tick so a caller evaluating per audio
+    /// sample (rather than per sequencer tick) gets a smoothly interpolated value instead of one
+    /// quantized to tick boundaries — see `audio::TrackAutomationOverride`, which evaluates this
+    /// once per output sample.
+    ///
     /// Scans `points` rather than requiring them pre-sorted by tick, so a dragged point can be
     /// written in place (by index) during a UI drag without needing to keep the whole list sorted
     /// mid-gesture — an O(n) scan per lookup is the same not-fully-incremental trade-off
     /// `metering.rs`'s integrated-LUFS rescan already makes, and lanes are short (a handful of
     /// points, not thousands).
-    pub fn value_at(&self, tick: usize) -> Option<f32> {
+    pub fn value_at_fractional(&self, tick: f64) -> Option<f32> {
         if self.points.is_empty() {
             return None;
         }
-        let before = self.points.iter().filter(|p| p.tick <= tick).max_by_key(|p| p.tick);
-        let after = self.points.iter().filter(|p| p.tick > tick).min_by_key(|p| p.tick);
+        let before = self.points.iter().filter(|p| (p.tick as f64) <= tick).max_by_key(|p| p.tick);
+        let after = self.points.iter().filter(|p| (p.tick as f64) > tick).min_by_key(|p| p.tick);
         Some(match (before, after) {
             (Some(before), Some(after)) => {
-                let span = (after.tick - before.tick) as f32;
+                let span = (after.tick - before.tick) as f64;
                 let frac = if span > 0.0 {
-                    (tick - before.tick) as f32 / span
+                    (tick - before.tick as f64) / span
                 } else {
                     0.0
                 };
-                before.value + (after.value - before.value) * frac
+                before.value + (after.value - before.value) * frac as f32
             }
             (Some(before), None) => before.value,
             (None, Some(after)) => after.value,
@@ -1565,6 +1655,33 @@ pub struct Track {
     /// load with none.
     #[serde(default)]
     pub send_levels: Vec<f32>,
+    /// Where this track's post-fader/pan signal sums into — straight to the master bus (the
+    /// original, still-default behavior) or into one of `Song.submixes` instead, exclusively (not
+    /// in addition to master; the submix's own summed output is what reaches master). Distinct
+    /// from `send_levels`: a send is a parallel tap, this replaces the track's direct contribution.
+    /// `#[serde(default)]` so song files saved before submixes existed still load routed to master.
+    #[serde(default)]
+    pub output: TrackOutput,
+    /// Track-wide automation "rides" — same `AutomationLane`/`AutomationTarget` shape as a
+    /// `Region`'s own `automation`, but not tied to any one region's on-timeline span: a point's
+    /// `tick` here is an *absolute* song tick (this track's placement in the overall arrangement),
+    /// not region-local. Lets a lane ride a parameter across the whole song (or wherever this
+    /// track has no active region at all) rather than only within one region's span. Where both a
+    /// track-wide lane and an active region's own lane target the same parameter at the same tick,
+    /// the region's lane wins — see `audio::collect_automation`. `#[serde(default)]` so song files
+    /// saved before this field existed still load with none.
+    #[serde(default)]
+    pub automation: Vec<AutomationLane>,
+}
+
+/// See `Track::output`. `Submix(index)` indexes into `Song.submixes`; kept valid by
+/// `Song::remove_submix`, which resets any track pointing at the removed submix back to `Master`
+/// and shifts indices of tracks pointing past it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum TrackOutput {
+    #[default]
+    Master,
+    Submix(usize),
 }
 
 impl Track {
@@ -1588,6 +1705,8 @@ impl Track {
             audio_clips: Vec::new(),
             regions: Vec::new(),
             send_levels: Vec::new(),
+            output: TrackOutput::Master,
+            automation: Vec::new(),
         }
     }
 
@@ -1611,6 +1730,8 @@ impl Track {
             audio_clips: Vec::new(),
             regions: Vec::new(),
             send_levels: Vec::new(),
+            output: TrackOutput::Master,
+            automation: Vec::new(),
         }
     }
 
@@ -1634,6 +1755,8 @@ impl Track {
             audio_clips: Vec::new(),
             regions: Vec::new(),
             send_levels: Vec::new(),
+            output: TrackOutput::Master,
+            automation: Vec::new(),
         }
     }
 
@@ -1709,7 +1832,21 @@ impl Track {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Song {
     pub name: String,
+    /// The tempo from the start of the song up to `tempo_map`'s first point (if any) — the
+    /// song's original single global tempo, still the only tempo field every one-shot
+    /// read/write (the transport LCD's field, MCP `set_bpm`/`get_playback_state`, tap tempo,
+    /// detect tempo, MIDI import's "apply tempo" checkbox) needs to know about. `tempo_map`
+    /// only ever represents *changes* after this starting point — see `bpm_at`.
     pub bpm: f32,
+    /// Tempo-change points after the start (see `bpm`), each holding constant until the next
+    /// one — a step function, not a smooth ramp, edited via the Playlist's Tempo Track
+    /// (`tempo_track_ui` in `main.rs`). Kept sorted by `tick` ascending by every editing method
+    /// here (`set_tempo_at`/`remove_tempo_point`) rather than by the UI, the same convention
+    /// `Song::sends`/`submixes` use for their own index-stability guarantees.
+    /// `#[serde(default)]` so song files saved before tempo maps existed still load with a flat
+    /// `bpm` and no changes.
+    #[serde(default)]
+    pub tempo_map: Vec<TempoPoint>,
     pub tracks: Vec<Track>,
     /// Monotonically increasing counter for `Note::id` allocation, shared
     /// across every track's piano roll so ids never collide.
@@ -1747,6 +1884,12 @@ pub struct Song {
     /// `#[serde(default)]` so song files saved before sends existed still load with none.
     #[serde(default)]
     pub sends: Vec<SendBus>,
+    /// Submix buses (see `SubmixBus`) a track can route its output into instead of straight to
+    /// master via `Track::output` — the "Track Stack"/alternate-output-routing mechanism.
+    /// `#[serde(default)]` so song files saved before submixes existed still load with none (every
+    /// track's `Track::output` also defaults to `Master`, so nothing changes for them).
+    #[serde(default)]
+    pub submixes: Vec<SubmixBus>,
 }
 
 fn default_time_signature_numerator() -> u8 {
@@ -1755,6 +1898,15 @@ fn default_time_signature_numerator() -> u8 {
 
 fn default_time_signature_denominator() -> u8 {
     4
+}
+
+/// One tempo-change point on `Song::tempo_map` — an absolute song tick (not region-local, unlike
+/// `AutomationPoint::tick`, since a tempo map isn't scoped to one region/track) and the BPM to
+/// hold from that tick until the next point.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TempoPoint {
+    pub tick: usize,
+    pub bpm: f32,
 }
 
 /// One imported CLAP plugin in the project library (`Song::plugins`) — a mnemonic name paired
@@ -1775,6 +1927,25 @@ pub struct SendBus {
     pub name: String,
     #[serde(default)]
     pub effects: Vec<TrackEffectConfig>,
+}
+
+/// A summing bus a track can route its output into via `Track::output` (instead of straight to
+/// master) — Logic's "Track Stack" made of one shared fader plus one shared insert chain, so N
+/// tracks that used to each carry their own reverb/compressor can share one instance instead.
+/// Unlike `SendBus`, this has its own `volume`/`muted`/`solo` since it stands in for its member
+/// tracks' direct contribution to the mix rather than being a parallel tap; it has no `pan` — kept
+/// minimal, matching this app's per-track (not per-group) stereo-field model.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubmixBus {
+    pub name: String,
+    #[serde(default)]
+    pub effects: Vec<TrackEffectConfig>,
+    #[serde(default = "default_track_volume")]
+    pub volume: f32,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub solo: bool,
 }
 
 /// A step is fixed at a sixteenth note regardless of time signature (see `TICKS_PER_STEP`) — this
@@ -1832,6 +2003,37 @@ impl Song {
     /// `steps_per_beat` each — the unit bar lines are drawn on and new regions/imports default to.
     pub fn steps_per_bar(&self) -> usize {
         self.time_signature_numerator as usize * self.steps_per_beat()
+    }
+
+    /// The tempo in effect at `tick` — `bpm` until `tempo_map`'s first point at or before `tick`,
+    /// then that point's `bpm`, held constant until the next point (a step function; see
+    /// `tempo_map`'s doc comment). `tempo_map` is assumed sorted by `tick` ascending, an invariant
+    /// `set_tempo_at`/`remove_tempo_point` maintain.
+    pub fn bpm_at(&self, tick: usize) -> f32 {
+        self.tempo_map
+            .iter()
+            .rev()
+            .find(|point| point.tick <= tick)
+            .map_or(self.bpm, |point| point.bpm)
+    }
+
+    /// Inserts a new tempo-change point at `tick`, or updates its `bpm` if one already exists
+    /// there, keeping `tempo_map` sorted by `tick`.
+    pub fn set_tempo_at(&mut self, tick: usize, bpm: f32) {
+        match self.tempo_map.iter_mut().find(|point| point.tick == tick) {
+            Some(point) => point.bpm = bpm,
+            None => {
+                self.tempo_map.push(TempoPoint { tick, bpm });
+                self.tempo_map.sort_by_key(|point| point.tick);
+            }
+        }
+    }
+
+    /// Removes the tempo-change point at index `index` into `tempo_map`, if any.
+    pub fn remove_tempo_point(&mut self, index: usize) {
+        if index < self.tempo_map.len() {
+            self.tempo_map.remove(index);
+        }
     }
 
     /// A starter song so the sequencer UI has something to show and edit.
@@ -1914,6 +2116,7 @@ impl Song {
         Self {
             name: "New Song".to_string(),
             bpm: 120.0,
+            tempo_map: Vec::new(),
             tracks: vec![drums, bass],
             next_note_id,
             // A default master-bus limiter, matching how e.g. Logic ships an Adaptive Limiter on
@@ -1925,6 +2128,7 @@ impl Song {
             time_signature_numerator: 4,
             time_signature_denominator: 4,
             sends: Vec::new(),
+            submixes: Vec::new(),
         }
     }
 
@@ -1971,6 +2175,32 @@ impl Song {
             if index < track.send_levels.len() {
                 track.send_levels.remove(index);
             }
+        }
+    }
+
+    /// Appends a new, empty-chain, unity-volume submix bus. Returns the new submix's index.
+    pub fn add_submix(&mut self, name: impl Into<String>) -> usize {
+        self.submixes.push(SubmixBus {
+            name: name.into(),
+            effects: Vec::new(),
+            volume: 1.0,
+            muted: false,
+            solo: false,
+        });
+        self.submixes.len() - 1
+    }
+
+    /// Removes a submix bus, routing any track that fed it back to `Master` (rather than leaving
+    /// a dangling index) and shifting every other track's `TrackOutput::Submix` index down to
+    /// stay valid against the now-shorter `Song.submixes`.
+    pub fn remove_submix(&mut self, index: usize) {
+        self.submixes.remove(index);
+        for track in &mut self.tracks {
+            track.output = match track.output {
+                TrackOutput::Submix(i) if i == index => TrackOutput::Master,
+                TrackOutput::Submix(i) if i > index => TrackOutput::Submix(i - 1),
+                other => other,
+            };
         }
     }
 
@@ -2204,6 +2434,8 @@ fn legacy_to_patterns_era(legacy: LegacySong) -> PatternsEraSong {
             audio_clips: Vec::new(),
             regions: Vec::new(),
             send_levels: Vec::new(),
+            output: TrackOutput::Master,
+            automation: Vec::new(),
         });
     }
 
@@ -2281,6 +2513,7 @@ fn migrate_patterns_song(mid: PatternsEraSong) -> Song {
     Song {
         name: mid.name,
         bpm: mid.bpm,
+        tempo_map: Vec::new(),
         tracks,
         next_note_id: mid.next_note_id,
         // Populated uniformly by `load_from_file` from the raw JSON's old
@@ -2292,6 +2525,7 @@ fn migrate_patterns_song(mid: PatternsEraSong) -> Song {
         time_signature_numerator: 4,
         time_signature_denominator: 4,
         sends: Vec::new(),
+        submixes: Vec::new(),
     }
 }
 
@@ -2319,8 +2553,8 @@ mod tests {
     #[test]
     fn value_at_is_none_for_an_empty_lane() {
         let lane = AutomationLane { target: AutomationTarget::Volume, points: Vec::new() };
-        assert_eq!(lane.value_at(0), None);
-        assert_eq!(lane.value_at(100), None);
+        assert_eq!(lane.value_at_fractional(0.0), None);
+        assert_eq!(lane.value_at_fractional(100.0), None);
     }
 
     #[test]
@@ -2329,9 +2563,9 @@ mod tests {
             target: AutomationTarget::Volume,
             points: vec![AutomationPoint { tick: 50, value: 0.75 }],
         };
-        assert_eq!(lane.value_at(0), Some(0.75));
-        assert_eq!(lane.value_at(50), Some(0.75));
-        assert_eq!(lane.value_at(1000), Some(0.75));
+        assert_eq!(lane.value_at_fractional(0.0), Some(0.75));
+        assert_eq!(lane.value_at_fractional(50.0), Some(0.75));
+        assert_eq!(lane.value_at_fractional(1000.0), Some(0.75));
     }
 
     #[test]
@@ -2343,9 +2577,21 @@ mod tests {
                 AutomationPoint { tick: 100, value: 1.0 },
             ],
         };
-        assert_eq!(lane.value_at(0), Some(-1.0));
-        assert!((lane.value_at(50).unwrap() - 0.0).abs() < 1e-6);
-        assert_eq!(lane.value_at(100), Some(1.0));
+        assert_eq!(lane.value_at_fractional(0.0), Some(-1.0));
+        assert!((lane.value_at_fractional(50.0).unwrap() - 0.0).abs() < 1e-6);
+        assert_eq!(lane.value_at_fractional(100.0), Some(1.0));
+    }
+
+    #[test]
+    fn value_at_fractional_interpolates_between_whole_ticks() {
+        let lane = AutomationLane {
+            target: AutomationTarget::Pan,
+            points: vec![
+                AutomationPoint { tick: 0, value: -1.0 },
+                AutomationPoint { tick: 100, value: 1.0 },
+            ],
+        };
+        assert!((lane.value_at_fractional(25.5).unwrap() - -0.49).abs() < 1e-6);
     }
 
     #[test]
@@ -2357,8 +2603,8 @@ mod tests {
                 AutomationPoint { tick: 80, value: 0.8 },
             ],
         };
-        assert_eq!(lane.value_at(0), Some(0.2));
-        assert_eq!(lane.value_at(1000), Some(0.8));
+        assert_eq!(lane.value_at_fractional(0.0), Some(0.2));
+        assert_eq!(lane.value_at_fractional(1000.0), Some(0.8));
     }
 
     #[test]
@@ -2370,7 +2616,7 @@ mod tests {
                 AutomationPoint { tick: 0, value: 0.0 },
             ],
         };
-        assert!((lane.value_at(50).unwrap() - 0.5).abs() < 1e-6);
+        assert!((lane.value_at_fractional(50.0).unwrap() - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -2466,6 +2712,45 @@ mod tests {
             }
             _ => panic!("expected PianoRoll content for the Bass track's region"),
         }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_the_tempo_map() {
+        let mut song = Song::demo();
+        song.set_tempo_at(1000, 140.0);
+        song.set_tempo_at(2000, 80.0);
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-tempo-map-{}.json",
+            std::process::id()
+        ));
+
+        song.save_to_file(&path).unwrap();
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.tempo_map, song.tempo_map);
+    }
+
+    #[test]
+    fn load_from_file_defaults_to_an_empty_tempo_map_for_pre_existing_song_files() {
+        // A song file saved before tempo maps existed has no "tempo_map" key at all.
+        let json = r#"{
+            "name": "Old Song",
+            "bpm": 120.0,
+            "next_note_id": 0,
+            "tracks": []
+        }"#;
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-legacy-tempo-map-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.bpm, 120.0);
+        assert!(loaded.tempo_map.is_empty());
     }
 
     #[test]
@@ -2834,6 +3119,35 @@ mod tests {
     }
 
     #[test]
+    fn save_then_load_round_trips_track_wide_automation() {
+        let mut song = Song::demo();
+        song.tracks[0].automation = vec![AutomationLane {
+            target: AutomationTarget::OtherTrackVolume { track_index: 1 },
+            points: vec![
+                AutomationPoint { tick: 0, value: 1.0 },
+                AutomationPoint { tick: 480, value: 0.25 },
+            ],
+        }];
+
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-track-automation-{}.json",
+            std::process::id()
+        ));
+        song.save_to_file(&path).unwrap();
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.tracks[0].automation.len(), 1);
+        let lane = &loaded.tracks[0].automation[0];
+        assert_eq!(lane.target, AutomationTarget::OtherTrackVolume { track_index: 1 });
+        assert_eq!(lane.points.len(), 2);
+        assert_eq!(lane.points[1].tick, 480);
+        assert_eq!(lane.points[1].value, 0.25);
+        // Untouched track: no automation set, none should appear after the round trip.
+        assert!(loaded.tracks[1].automation.is_empty());
+    }
+
+    #[test]
     fn save_then_load_round_trips_limiter() {
         let mut song = Song::demo();
         song.tracks[0].effects = vec![TrackEffectConfig::Limiter {
@@ -2895,6 +3209,51 @@ mod tests {
         assert!(loaded.master_effects.is_empty());
         assert!(loaded.tracks[0].effects.is_empty());
         assert_eq!(loaded.tracks[0].volume, 1.0);
+        assert!(loaded.tracks[0].automation.is_empty());
+    }
+
+    #[test]
+    fn load_from_file_migrates_legacy_bare_velocity_steps_into_step_data() {
+        // A song file saved before per-step timing offsets existed: each active step in a
+        // lane's `steps` array is a bare velocity byte, not a `{velocity, timing_offset_ticks}`
+        // object.
+        let json = r#"{
+            "name": "Old Song",
+            "bpm": 120.0,
+            "next_note_id": 0,
+            "tracks": [
+                {
+                    "name": "Drums",
+                    "midi_channel": 10,
+                    "muted": false,
+                    "default_note_length_ticks": 96,
+                    "pattern": {
+                        "name": "Drums 1",
+                        "length_steps": 4,
+                        "content": {
+                            "StepGrid": [
+                                { "name": "Kick", "pitch": 36, "steps": [100, null, null, 64], "sample_path": "" }
+                            ]
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-legacy-steps-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let RegionContent::StepGrid(lanes) = &loaded.tracks[0].regions[0].content else {
+            panic!("expected step-grid content");
+        };
+        assert_eq!(lanes[0].steps[0], Some(StepData { velocity: 100, timing_offset_ticks: 0 }));
+        assert_eq!(lanes[0].steps[1], None);
+        assert_eq!(lanes[0].steps[3], Some(StepData { velocity: 64, timing_offset_ticks: 0 }));
     }
 
     #[test]
@@ -3410,6 +3769,56 @@ mod tests {
     }
 
     #[test]
+    fn bpm_at_falls_back_to_base_bpm_with_no_tempo_map() {
+        let song = Song::demo();
+        assert_eq!(song.bpm_at(0), song.bpm);
+        assert_eq!(song.bpm_at(100_000), song.bpm);
+    }
+
+    #[test]
+    fn bpm_at_holds_each_points_bpm_until_the_next_one() {
+        let mut song = Song::demo();
+        song.bpm = 100.0;
+        song.set_tempo_at(1000, 140.0);
+        song.set_tempo_at(2000, 80.0);
+
+        assert_eq!(song.bpm_at(0), 100.0);
+        assert_eq!(song.bpm_at(999), 100.0);
+        assert_eq!(song.bpm_at(1000), 140.0);
+        assert_eq!(song.bpm_at(1500), 140.0);
+        assert_eq!(song.bpm_at(2000), 80.0);
+        assert_eq!(song.bpm_at(50_000), 80.0);
+    }
+
+    #[test]
+    fn set_tempo_at_keeps_the_map_sorted_regardless_of_insertion_order() {
+        let mut song = Song::demo();
+        song.set_tempo_at(2000, 80.0);
+        song.set_tempo_at(1000, 140.0);
+        let ticks: Vec<usize> = song.tempo_map.iter().map(|p| p.tick).collect();
+        assert_eq!(ticks, vec![1000, 2000]);
+    }
+
+    #[test]
+    fn set_tempo_at_updates_an_existing_point_instead_of_duplicating_it() {
+        let mut song = Song::demo();
+        song.set_tempo_at(1000, 140.0);
+        song.set_tempo_at(1000, 150.0);
+        assert_eq!(song.tempo_map.len(), 1);
+        assert_eq!(song.tempo_map[0].bpm, 150.0);
+    }
+
+    #[test]
+    fn remove_tempo_point_drops_only_the_given_index() {
+        let mut song = Song::demo();
+        song.set_tempo_at(1000, 140.0);
+        song.set_tempo_at(2000, 80.0);
+        song.remove_tempo_point(0);
+        assert_eq!(song.tempo_map.len(), 1);
+        assert_eq!(song.tempo_map[0].tick, 2000);
+    }
+
+    #[test]
     fn add_track_returns_its_index_and_starts_with_no_regions() {
         let mut song = Song::demo();
         assert_eq!(song.tracks.len(), 2);
@@ -3437,6 +3846,36 @@ mod tests {
             song.tracks[0].regions[0].content,
             RegionContent::PianoRoll(_)
         ));
+    }
+
+    #[test]
+    fn remove_submix_routes_its_member_tracks_back_to_master() {
+        let mut song = Song::demo();
+        let submix_index = song.add_submix("Drum Bus");
+        song.tracks[0].output = TrackOutput::Submix(submix_index);
+
+        song.remove_submix(submix_index);
+
+        assert!(song.submixes.is_empty());
+        assert_eq!(song.tracks[0].output, TrackOutput::Master);
+    }
+
+    #[test]
+    fn remove_submix_shifts_down_indices_of_tracks_routed_past_it() {
+        let mut song = Song::demo();
+        let first = song.add_submix("Drum Bus");
+        let second = song.add_submix("Vocal Bus");
+        song.tracks[0].output = TrackOutput::Submix(first);
+        song.tracks[1].output = TrackOutput::Submix(second);
+
+        song.remove_submix(first);
+
+        assert_eq!(song.submixes.len(), 1);
+        assert_eq!(song.submixes[0].name, "Vocal Bus");
+        // Track 0 pointed at the removed submix, so it falls back to Master.
+        assert_eq!(song.tracks[0].output, TrackOutput::Master);
+        // Track 1 pointed past the removed submix, so its index shifts down to stay valid.
+        assert_eq!(song.tracks[1].output, TrackOutput::Submix(0));
     }
 
     #[test]
