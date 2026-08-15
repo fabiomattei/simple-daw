@@ -63,6 +63,10 @@
       <li><strong>Double-click a Region</strong> — open it in the Piano Roll or Beats window for
         editing.</li>
       <li><strong>Right-click a Region</strong> — remove it.</li>
+      <li><strong>Drag the small handle at a Region's top-left or top-right corner</strong> — set
+        a fade-in or fade-out, shown as a shaded triangle over the faded portion. A fade ramps that
+        Region's own output linearly to/from silence over the dragged span; it doesn't affect
+        anything before/after the Region's own on-timeline extent.</li>
     </ul>
     <p>Audio tracks get their own row for their recorded/imported clips instead of Regions — the
       two kinds never share a row. The <strong>Zoom</strong> slider at the top of the Playlist
@@ -102,6 +106,11 @@
       down. The roll grows automatically as notes reach its right edge. The <strong>Zoom</strong>
       and <strong>Roll height</strong> controls in the top toolbar resize every track's piano roll
       at once.</p>
+
+    <h2>Automation</h2>
+    <p>Both the Piano Roll and Beats windows show an <strong>Automation</strong> panel below the
+      grid for whichever Region is open — volume/pan/send-level/effect-param "rides" scoped to
+      that one Region. See <a href="effects.html">Effects</a> for how lanes work.</p>
 
     <footer>simple-daw documentation</footer>
   </main>
