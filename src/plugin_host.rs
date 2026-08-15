@@ -471,24 +471,32 @@ impl EffectScratch {
     }
 }
 
-/// Runs `effect` over a mono `input` buffer for one audio block, writing stereo results into
-/// `out_l`/`out_r` (mono output is duplicated to both channels, matching how a mono-out plugin's
-/// single channel is treated as center-panned). Also delivers any pending `set_param` changes as
-/// part of this block's `process()` call. Returns `false` (leaving `out_l`/`out_r` untouched) if
-/// the plugin isn't ready to process, so callers can fall back to the dry signal.
+/// Runs `effect` over one stereo audio block (`input_l`/`input_r`) for one audio block, writing
+/// stereo results into `out_l`/`out_r`. A plugin that only declares one input channel gets a mono
+/// downmix (`(l+r)/2`) as its single input — that's the plugin's own declared I/O shape, not a
+/// choice this function makes about the chain; a mono-output plugin's single channel is likewise
+/// duplicated to both output channels, treated as center-panned. Also delivers any pending
+/// `set_param` changes as part of this block's `process()` call. Returns `false` (leaving
+/// `out_l`/`out_r` untouched) if the plugin isn't ready to process, so callers can fall back to
+/// the dry signal.
 pub fn process_effect(
     effect: &mut LoadedEffect,
-    input: &[f32],
+    input_l: &[f32],
+    input_r: &[f32],
     out_l: &mut [f32],
     out_r: &mut [f32],
     scratch: &mut EffectScratch,
 ) -> bool {
-    let frames = input.len();
+    let frames = input_l.len();
     scratch.in_l.resize(frames, 0.0);
     scratch.in_r.resize(frames, 0.0);
-    scratch.in_l.copy_from_slice(input);
     if effect.input_channels > 1 {
-        scratch.in_r.copy_from_slice(input);
+        scratch.in_l.copy_from_slice(input_l);
+        scratch.in_r.copy_from_slice(input_r);
+    } else {
+        for i in 0..frames {
+            scratch.in_l[i] = 0.5 * (input_l[i] + input_r[i]);
+        }
     }
     scratch.out_l.resize(frames, 0.0);
     scratch.out_r.resize(frames, 0.0);
@@ -549,47 +557,52 @@ pub fn process_effect(
     ok
 }
 
-/// Runs `input` through each effect in `chain` in order (element 0 first, mixing CLAP plugins and
-/// built-in DSP effects freely), downmixing one stage's stereo output to mono before feeding it
-/// to the next stage — the same L/R-average downmix callers already use to sum a track's
-/// post-effect signal into the master bus. A `None` slot (no CLAP plugin loaded there yet, or one
-/// not ready to process — built-in effects never end up `None` once added, since creating one
-/// can't fail or need an async load step) passes its input through unchanged, matching
-/// `process_effect`'s own not-ready fallback.
+/// Runs `input_l`/`input_r` through each effect in `chain` in order (element 0 first, mixing CLAP
+/// plugins and built-in DSP effects freely), carrying the real stereo signal from one stage to the
+/// next — a stage only loses width if it itself declares mono I/O (see `process_effect`'s own
+/// downmix-on-mono-input behavior), never because the chain machinery flattens it between stages.
+/// A `None` slot (no CLAP plugin loaded there yet, or one not ready to process — built-in effects
+/// never end up `None` once added, since creating one can't fail or need an async load step)
+/// passes its input through unchanged, matching `process_effect`'s own not-ready fallback.
 ///
-/// `out_l`/`out_r` always end up holding the full chain's result (starting from `input`
-/// duplicated to both channels if nothing in the chain processes). Returns whether at least one
-/// stage actually processed, so callers can cheaply skip the mixed-down output and add the dry
-/// signal straight in when a track's chain is empty or every CLAP plugin in it is unloaded.
+/// `out_l`/`out_r` always end up holding the full chain's result (starting from `input_l`/
+/// `input_r` unchanged if nothing in the chain processes). `run_l`/`run_r` are reusable scratch
+/// for the signal in flight between stages — needed because a CLAP stage's `process_effect` call
+/// can't read and write the same buffer. Returns whether at least one stage actually processed, so
+/// callers can cheaply skip the processed output and add the dry signal straight in when a
+/// track's chain is empty or every CLAP plugin in it is unloaded.
 pub fn process_effect_chain(
     chain: &mut [Option<EffectInstance>],
-    input: &[f32],
+    input_l: &[f32],
+    input_r: &[f32],
     out_l: &mut [f32],
     out_r: &mut [f32],
     scratch: &mut [EffectScratch],
-    mono_buf: &mut Vec<f32>,
+    run_l: &mut Vec<f32>,
+    run_r: &mut Vec<f32>,
 ) -> bool {
-    let frames = input.len();
-    mono_buf.resize(frames, 0.0);
-    mono_buf.copy_from_slice(input);
-    out_l.copy_from_slice(input);
-    out_r.copy_from_slice(input);
+    let frames = input_l.len();
+    run_l.resize(frames, 0.0);
+    run_r.resize(frames, 0.0);
+    run_l.copy_from_slice(input_l);
+    run_r.copy_from_slice(input_r);
+    out_l.copy_from_slice(input_l);
+    out_r.copy_from_slice(input_r);
 
     let mut any_used = false;
     for (slot, effect_scratch) in chain.iter_mut().zip(scratch.iter_mut()) {
         match slot {
             Some(EffectInstance::Clap(effect)) => {
-                if process_effect(effect, mono_buf, out_l, out_r, effect_scratch) {
+                if process_effect(effect, run_l, run_r, out_l, out_r, effect_scratch) {
                     any_used = true;
-                    for i in 0..frames {
-                        mono_buf[i] = 0.5 * (out_l[i] + out_r[i]);
-                    }
+                    run_l.copy_from_slice(out_l);
+                    run_r.copy_from_slice(out_r);
                 }
             }
             Some(EffectInstance::BuiltIn(effect)) => {
-                effect.process(mono_buf);
-                out_l.copy_from_slice(mono_buf);
-                out_r.copy_from_slice(mono_buf);
+                effect.process(run_l, run_r);
+                out_l.copy_from_slice(run_l);
+                out_r.copy_from_slice(run_r);
                 any_used = true;
             }
             None => {}

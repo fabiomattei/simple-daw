@@ -2122,6 +2122,14 @@ impl Sequencer {
     }
 }
 
+/// Equal-power left/right gains for a `Track::pan` value (-1.0 hard left, 0.0 center, 1.0 hard
+/// right) — the standard constant-power law (`cos`/`sin` of a quarter-turn sweep) so a centered
+/// track doesn't get louder or quieter than a hard-panned one when summed to mono.
+fn equal_power_pan_gains(pan: f32) -> (f32, f32) {
+    let theta = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    (theta.cos(), theta.sin())
+}
+
 fn build_playback_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -2138,17 +2146,19 @@ where
     let channels = (config.channels as usize).max(1);
 
     let mut sequencer = Sequencer::new(sample_rate);
-    let mut scratch: Vec<f32> = Vec::with_capacity(max_frames);
+    let mut scratch_l: Vec<f32> = Vec::with_capacity(max_frames);
+    let mut scratch_r: Vec<f32> = Vec::with_capacity(max_frames);
     let mut track_dry: Vec<Vec<f32>> = Vec::new();
     let mut metronome_dry: Vec<f32> = Vec::with_capacity(max_frames);
 
     // Per-track CLAP insert-effect-chain scratch (one `Vec<EffectScratch>` per track index, grown
-    // lazily to match that track's chain length) and a pair of reusable stereo buffers plus a mono
-    // downmix buffer for whichever track is currently being processed.
+    // lazily to match that track's chain length) and a pair of reusable stereo buffers plus the
+    // chain's own in-flight stereo scratch for whichever track is currently being processed.
     let mut track_scratch: Vec<Vec<plugin_host::EffectScratch>> = Vec::new();
     let mut track_effect_out_l: Vec<f32> = Vec::with_capacity(max_frames);
     let mut track_effect_out_r: Vec<f32> = Vec::with_capacity(max_frames);
-    let mut track_chain_mono: Vec<f32> = Vec::with_capacity(max_frames);
+    let mut track_chain_run_l: Vec<f32> = Vec::with_capacity(max_frames);
+    let mut track_chain_run_r: Vec<f32> = Vec::with_capacity(max_frames);
 
     // Scratch for the master-bus CLAP effect. Allocated once and reused every callback.
     let mut master_scratch = plugin_host::EffectScratch::new();
@@ -2189,8 +2199,10 @@ where
         *config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             let frames = data.len() / channels;
-            scratch.resize(frames, 0.0);
-            scratch.iter_mut().for_each(|s| *s = 0.0);
+            scratch_l.resize(frames, 0.0);
+            scratch_r.resize(frames, 0.0);
+            scratch_l.iter_mut().for_each(|s| *s = 0.0);
+            scratch_r.iter_mut().for_each(|s| *s = 0.0);
 
             // Note: even when stopped, silence still runs through the master
             // effect below rather than short-circuiting straight to the
@@ -2224,9 +2236,11 @@ where
                     .current_tick
                     .store(sequencer.current_tick(), Ordering::Relaxed);
 
-                // Run each track's dry mix through its own CLAP insert effect chain (if any
-                // plugins are loaded there), apply that track's volume, then sum every track
-                // (post-effect, post-volume) into the master bus.
+                // Run each track's dry mix through its own CLAP/built-in insert effect chain (if
+                // any are loaded there — the chain now carries real stereo between stages, see
+                // `plugin_host::process_effect_chain`), apply that track's volume and pan (as an
+                // equal-power gain split, the same point a channel strip's pan pot sits after its
+                // inserts), then sum every track into the master bus.
                 track_effect_out_l.resize(frames, 0.0);
                 track_effect_out_r.resize(frames, 0.0);
                 if let Ok(mut chains) = track_effects.lock() {
@@ -2234,7 +2248,9 @@ where
                         track_scratch.push(Vec::new());
                     }
                     for (track_index, dry) in track_dry.iter().enumerate() {
-                        let volume = snapshot.tracks.get(track_index).map_or(1.0, |t| t.volume);
+                        let track = snapshot.tracks.get(track_index);
+                        let volume = track.map_or(1.0, |t| t.volume);
+                        let (pan_l, pan_r) = equal_power_pan_gains(track.map_or(0.0, |t| t.pan));
                         let chain = chains
                             .get_mut(track_index)
                             .map_or(&mut [][..], Vec::as_mut_slice);
@@ -2245,36 +2261,46 @@ where
                         let used = plugin_host::process_effect_chain(
                             chain,
                             dry,
+                            dry,
                             &mut track_effect_out_l,
                             &mut track_effect_out_r,
                             stage_scratch,
-                            &mut track_chain_mono,
+                            &mut track_chain_run_l,
+                            &mut track_chain_run_r,
                         );
                         if used {
                             for i in 0..frames {
-                                scratch[i] +=
-                                    volume * 0.5 * (track_effect_out_l[i] + track_effect_out_r[i]);
+                                scratch_l[i] += volume * pan_l * track_effect_out_l[i];
+                                scratch_r[i] += volume * pan_r * track_effect_out_r[i];
                             }
                         } else {
-                            for (out, s) in scratch.iter_mut().zip(dry) {
-                                *out += volume * *s;
+                            for i in 0..frames {
+                                scratch_l[i] += volume * pan_l * dry[i];
+                                scratch_r[i] += volume * pan_r * dry[i];
                             }
                         }
                     }
                 } else {
                     for (track_index, dry) in track_dry.iter().enumerate() {
-                        let volume = snapshot.tracks.get(track_index).map_or(1.0, |t| t.volume);
-                        for (out, s) in scratch.iter_mut().zip(dry) {
-                            *out += volume * *s;
+                        let track = snapshot.tracks.get(track_index);
+                        let volume = track.map_or(1.0, |t| t.volume);
+                        let (pan_l, pan_r) = equal_power_pan_gains(track.map_or(0.0, |t| t.pan));
+                        for i in 0..frames {
+                            scratch_l[i] += volume * pan_l * dry[i];
+                            scratch_r[i] += volume * pan_r * dry[i];
                         }
                     }
                 }
 
-                for (out, click) in scratch.iter_mut().zip(&metronome_dry) {
-                    *out += *click;
+                for i in 0..frames {
+                    scratch_l[i] += metronome_dry[i];
+                    scratch_r[i] += metronome_dry[i];
                 }
 
-                for s in scratch.iter_mut() {
+                for s in scratch_l.iter_mut() {
+                    *s = (*s * MASTER_GAIN).tanh();
+                }
+                for s in scratch_r.iter_mut() {
                     *s = (*s * MASTER_GAIN).tanh();
                 }
             } else {
@@ -2283,11 +2309,11 @@ where
             }
 
             // Run the mix through the master-bus CLAP effect, if one is loaded.
-            // Falls back to the dry mono mix (duplicated to L/R) on any failure.
-            // Channel counts come from what the plugin actually declared via
-            // the `audio-ports` extension (see `plugin_host::load_and_activate`)
-            // — assuming every effect is 2-in/2-out caused real plugins (e.g.
-            // ZamDelay, which is mono-in) to read past their declared buffers.
+            // Falls back to the dry stereo mix on any failure. Channel counts come
+            // from what the plugin actually declared via the `audio-ports`
+            // extension (see `plugin_host::load_and_activate`) — assuming every
+            // effect is 2-in/2-out caused real plugins (e.g. ZamDelay, which is
+            // mono-in) to read past their declared buffers.
             let mut used_plugin = false;
             if let Ok(mut guard) = master_effect.lock() {
                 if let Some(effect) = guard.as_mut() {
@@ -2295,7 +2321,8 @@ where
                     plugin_out_r.resize(frames, 0.0);
                     used_plugin = plugin_host::process_effect(
                         effect,
-                        &scratch,
+                        &scratch_l,
+                        &scratch_r,
                         &mut plugin_out_l,
                         &mut plugin_out_r,
                         &mut master_scratch,
@@ -2306,7 +2333,7 @@ where
             let (left, right): (&[f32], &[f32]) = if used_plugin {
                 (&plugin_out_l, &plugin_out_r)
             } else {
-                (&scratch, &scratch)
+                (&scratch_l, &scratch_r)
             };
 
             for (i, frame) in data.chunks_mut(channels).enumerate() {
@@ -2325,7 +2352,7 @@ where
     Ok(stream)
 }
 
-/// Renders `loops` repetitions of the song's pattern content to a mono
+/// Renders `loops` repetitions of the song's pattern content to a stereo
 /// 16-bit WAV file, using the exact same synthesis path as real-time
 /// playback (via `Sequencer`), so the bounce sounds like what you hear.
 pub fn render_song_to_wav(
@@ -2343,8 +2370,8 @@ pub fn render_song_to_wav(
     let total_samples =
         (arrangement_len_ticks as f64 * samples_per_tick * (loops.max(1) as f64)).round() as usize;
 
-    // Dry-only, matching live playback's scope cut: CLAP effects (master or per-track) don't
-    // route into the bounce.
+    // Dry-only, matching live playback's scope cut: CLAP/built-in effects (master or per-track)
+    // don't route into the bounce — only each track's volume and pan do.
     let mut sequencer = Sequencer::new(sample_rate as f32);
     let mut track_dry: Vec<Vec<f32>> = Vec::new();
     let mut metronome_dry: Vec<f32> = Vec::new();
@@ -2357,28 +2384,35 @@ pub fn render_song_to_wav(
         &mut metronome_dry,
     );
 
-    let mut buffer = vec![0.0f32; total_samples];
+    let mut buffer_l = vec![0.0f32; total_samples];
+    let mut buffer_r = vec![0.0f32; total_samples];
     for (track_buf, track) in track_dry.iter().zip(&song.tracks) {
-        for (out, s) in buffer.iter_mut().zip(track_buf) {
-            *out += track.volume * *s;
+        let (pan_l, pan_r) = equal_power_pan_gains(track.pan);
+        for i in 0..total_samples {
+            buffer_l[i] += track.volume * pan_l * track_buf[i];
+            buffer_r[i] += track.volume * pan_r * track_buf[i];
         }
     }
-    for s in buffer.iter_mut() {
+    for s in buffer_l.iter_mut().chain(buffer_r.iter_mut()) {
         *s = (*s * MASTER_GAIN).tanh();
     }
 
     let spec = hound::WavSpec {
-        channels: 1,
+        channels: 2,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(path, spec)
         .with_context(|| format!("failed to create wav file: {}", path.display()))?;
-    for sample in buffer {
-        let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+    for (l, r) in buffer_l.into_iter().zip(buffer_r) {
+        let l = (l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        let r = (r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
         writer
-            .write_sample(value)
+            .write_sample(l)
+            .context("failed to write wav sample")?;
+        writer
+            .write_sample(r)
             .context("failed to write wav sample")?;
     }
     writer.finalize().context("failed to finalize wav file")?;
@@ -2957,6 +2991,13 @@ mod tests {
         );
     }
 
+    /// De-interleaves a stereo `i16` sample stream (as `render_song_to_wav` now writes) back down
+    /// to just its left channel, so tests written against the format's old mono sample-index math
+    /// don't all need their index literals doubled.
+    fn left_channel(samples: &[i16]) -> Vec<i16> {
+        samples.iter().step_by(2).copied().collect()
+    }
+
     #[test]
     fn render_song_to_wav_produces_expected_length_and_nonsilent_audio() {
         let song = crate::model::Song::demo();
@@ -2967,13 +3008,15 @@ mod tests {
 
         let mut reader = hound::WavReader::open(&path).expect("exported wav should be readable");
         let spec = reader.spec();
-        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.channels, 2);
         assert_eq!(spec.sample_rate, sample_rate);
 
-        let samples: Vec<i16> = reader
-            .samples::<i16>()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
+        let samples: Vec<i16> = left_channel(
+            &reader
+                .samples::<i16>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap(),
+        );
         let samples_per_step = (sample_rate as f64 * 60.0 / 120.0 / STEPS_PER_BEAT).max(1.0);
         let expected_len = (16.0 * samples_per_step).round() as i64;
         assert!(
@@ -3049,10 +3092,12 @@ mod tests {
             std::env::temp_dir().join(format!("simple_daw_test_gap_{}.wav", std::process::id()));
         render_song_to_wav(&song, sample_rate, 1, &path).expect("export should succeed");
         let mut reader = hound::WavReader::open(&path).unwrap();
-        let samples: Vec<i16> = reader
-            .samples::<i16>()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
+        let samples: Vec<i16> = left_channel(
+            &reader
+                .samples::<i16>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap(),
+        );
         std::fs::remove_file(&path).ok();
 
         // samples_per_tick = 250 at 120bpm/48kHz (see the formula in render_song_to_wav), so one
@@ -3088,10 +3133,12 @@ mod tests {
             std::env::temp_dir().join(format!("simple_daw_test_loop_{}.wav", std::process::id()));
         render_song_to_wav(&song, sample_rate, 1, &path).expect("export should succeed");
         let mut reader = hound::WavReader::open(&path).unwrap();
-        let samples: Vec<i16> = reader
-            .samples::<i16>()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
+        let samples: Vec<i16> = left_channel(
+            &reader
+                .samples::<i16>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap(),
+        );
         std::fs::remove_file(&path).ok();
 
         // One step = 6000 samples; the region's own content is 2 steps = 12000 samples, so it
@@ -3197,10 +3244,12 @@ mod tests {
         ));
         render_song_to_wav(&song, sample_rate, 1, &path).expect("export should succeed");
         let mut reader = hound::WavReader::open(&path).unwrap();
-        let samples: Vec<i16> = reader
-            .samples::<i16>()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
+        let samples: Vec<i16> = left_channel(
+            &reader
+                .samples::<i16>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap(),
+        );
         std::fs::remove_file(&path).ok();
 
         assert!(

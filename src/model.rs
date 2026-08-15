@@ -1221,6 +1221,12 @@ pub struct Track {
     /// field existed still load at full volume rather than silent.
     #[serde(default = "default_track_volume")]
     pub volume: f32,
+    /// Stereo position of this track's mix contribution, applied (as an equal-power gain split)
+    /// after its effects chain, the same point `volume` is applied — -1.0 is hard left, 0.0 is
+    /// center, 1.0 is hard right. `#[serde(default)]` so song files saved before this field
+    /// existed still load centered.
+    #[serde(default)]
+    pub pan: f32,
     /// This track's built-in synth voice settings (waveform + attack/decay). `#[serde(default)]`
     /// so song files saved before this field existed still load, defaulting to the original
     /// sine-with-instant-attack sound.
@@ -1263,6 +1269,7 @@ impl Track {
             default_note_length_ticks: 4 * TICKS_PER_STEP,
             effects: Vec::new(),
             volume: 1.0,
+            pan: 0.0,
             synth: SynthParams::default(),
             synth_engine: SynthEngine::default(),
             trine: TrineParams::default(),
@@ -1283,6 +1290,7 @@ impl Track {
             default_note_length_ticks: 4 * TICKS_PER_STEP,
             effects: Vec::new(),
             volume: 1.0,
+            pan: 0.0,
             synth: SynthParams::default(),
             synth_engine: SynthEngine::default(),
             trine: TrineParams::default(),
@@ -1303,6 +1311,7 @@ impl Track {
             default_note_length_ticks: 4 * TICKS_PER_STEP,
             effects: Vec::new(),
             volume: 1.0,
+            pan: 0.0,
             synth: SynthParams::default(),
             synth_engine: SynthEngine::default(),
             trine: TrineParams::default(),
@@ -1811,6 +1820,7 @@ fn legacy_to_patterns_era(legacy: LegacySong) -> PatternsEraSong {
             default_note_length_ticks: legacy_track.default_note_length_ticks,
             effects: legacy_track.effects,
             volume: legacy_track.volume,
+            pan: 0.0,
             synth: legacy_track.synth,
             synth_engine: legacy_track.synth_engine,
             trine: legacy_track.trine,

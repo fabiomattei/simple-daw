@@ -5300,6 +5300,18 @@ struct TrackFxUi<'a> {
     remove_requested: &'a mut Option<usize>,
 }
 
+/// Hover-text label for a `Track::pan` value: "C" at dead center, otherwise a percentage toward
+/// hard left/right (e.g. "35% L").
+fn pan_label(pan: f32) -> String {
+    if pan.abs() < 0.01 {
+        "C".to_string()
+    } else if pan < 0.0 {
+        format!("{:.0}% L", -pan * 100.0)
+    } else {
+        format!("{:.0}% R", pan * 100.0)
+    }
+}
+
 /// One compact row in the Channel Rack (left panel): a colored swatch, mute LED, name field,
 /// volume slider, and Synth/FX/Remove buttons. Neither piano-roll nor step-grid tracks show their
 /// notes/regions inline, and there's no button here to open either editor — a track's Piano
@@ -5387,6 +5399,9 @@ fn channel_rack_row_ui(
                         .trailing_fill(true),
                 )
                 .on_hover_text(format!("Volume: {:.2}", track.volume));
+
+                ui.add(egui::Slider::new(&mut track.pan, -1.0..=1.0).show_value(false))
+                    .on_hover_text(format!("Pan: {}", pan_label(track.pan)));
 
                 if !is_audio {
                     if ui.small_button("🎹").on_hover_text("Synth").clicked() {
