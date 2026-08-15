@@ -571,6 +571,7 @@ pub fn process_effect(
 /// can't read and write the same buffer. Returns whether at least one stage actually processed, so
 /// callers can cheaply skip the processed output and add the dry signal straight in when a
 /// track's chain is empty or every CLAP plugin in it is unloaded.
+#[allow(clippy::too_many_arguments)]
 pub fn process_effect_chain(
     chain: &mut [Option<EffectInstance>],
     input_l: &[f32],

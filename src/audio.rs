@@ -328,6 +328,8 @@ struct Voice {
     /// gives that partial's instantaneous frequency.
     unison_ratios: [f32; MAX_UNISON_VOICES],
     unison_count: usize,
+    /// How far unison voices spread across L/R (0.0..1.0) — see `SynthParams::unison_width`.
+    unison_width: f32,
     waveform: SynthWaveform,
     pulse_width: f32,
 
@@ -392,9 +394,16 @@ struct Voice {
     /// TPT state-variable filter integrator state (Zavalishin) — chosen over the more common
     /// Chamberlin SVF because it stays numerically stable even as cutoff approaches Nyquist,
     /// which matters here since the default cutoff (20kHz) is deliberately near-inaudible/near-
-    /// bypass and must not blow up at typical device sample rates.
-    filter_ic1eq: f32,
-    filter_ic2eq: f32,
+    /// bypass and must not blow up at typical device sample rates. Duplicated per channel (`_l`/
+    /// `_r`) rather than shared: once `unison_width` spreads osc1's unison voices apart, left and
+    /// right feed the filter a genuinely different pre-filter signal, so each channel needs its
+    /// own integrator state — sharing one would silently collapse the spread back to mono right
+    /// at the filter. At `unison_width == 0.0` both channels' input is identical, so both filter
+    /// instances stay identical too (see `next_sample`'s doc comment).
+    filter_ic1eq_l: f32,
+    filter_ic2eq_l: f32,
+    filter_ic1eq_r: f32,
+    filter_ic2eq_r: f32,
 
     sample_rate: f32,
 }
@@ -407,6 +416,7 @@ impl Default for Voice {
             phase_incs: [0.0; MAX_UNISON_VOICES],
             unison_ratios: [1.0; MAX_UNISON_VOICES],
             unison_count: 1,
+            unison_width: 0.0,
             waveform: SynthWaveform::default(),
             pulse_width: 0.5,
             current_freq: 0.0,
@@ -441,8 +451,10 @@ impl Default for Voice {
             filter_resonance: 0.707,
             filter_env_amount_hz: 0.0,
             filter_type: FilterType::default(),
-            filter_ic1eq: 0.0,
-            filter_ic2eq: 0.0,
+            filter_ic1eq_l: 0.0,
+            filter_ic2eq_l: 0.0,
+            filter_ic1eq_r: 0.0,
+            filter_ic2eq_r: 0.0,
             sample_rate: 48_000.0,
         }
     }
@@ -471,6 +483,7 @@ impl Voice {
 
         let unison = (synth.unison_voices as usize).clamp(1, MAX_UNISON_VOICES);
         self.unison_count = unison;
+        self.unison_width = synth.unison_width.clamp(0.0, 1.0);
         let detune_ratio = 2f32.powf(synth.unison_detune_cents.max(0.0) / 1200.0);
         self.phases = [0.0; MAX_UNISON_VOICES];
         self.unison_ratios = [1.0; MAX_UNISON_VOICES];
@@ -550,13 +563,22 @@ impl Voice {
         self.filter_resonance = synth.filter_resonance.max(0.05);
         self.filter_env_amount_hz = synth.filter_env_amount_hz;
         self.filter_type = synth.filter_type;
-        self.filter_ic1eq = 0.0;
-        self.filter_ic2eq = 0.0;
+        self.filter_ic1eq_l = 0.0;
+        self.filter_ic2eq_l = 0.0;
+        self.filter_ic1eq_r = 0.0;
+        self.filter_ic2eq_r = 0.0;
     }
 
-    fn next_sample(&mut self) -> f32 {
+    /// Returns `(left, right)`. Osc1's unison voices (if `unison_count > 1`) spread across the
+    /// stereo field by `unison_width`; osc2 and the sub oscillator stay centered (no unison
+    /// stacking of their own, so nothing to spread). At `unison_width == 0.0` (the default) every
+    /// unison voice's pan gain is `(1.0, 1.0)` — both channels get the exact same pre-filter
+    /// signal, and since the filter below has no random/audio-independent state, both channels'
+    /// filtered output ends up numerically identical too: byte-for-byte the same as this engine's
+    /// pre-stereo mono output.
+    fn next_sample(&mut self) -> (f32, f32) {
         if !self.active {
-            return 0.0;
+            return (0.0, 0.0);
         }
 
         // LFO: one free-running sine/etc cycle per voice, computed once and reused by whichever
@@ -586,11 +608,24 @@ impl Voice {
         }
         let base_freq = self.current_freq * pitch_lfo_ratio;
 
-        let mut osc1 = 0.0;
+        let mut osc1_l = 0.0;
+        let mut osc1_r = 0.0;
         let mut osc1_master_wrapped = false;
         for i in 0..self.unison_count {
             self.phase_incs[i] = base_freq * self.unison_ratios[i] / self.sample_rate;
-            osc1 += waveform_sample(self.waveform, self.phases[i], self.pulse_width);
+            let sample_i = waveform_sample(self.waveform, self.phases[i], self.pulse_width);
+            // Voice 0 sits hard left, the last voice hard right, any middle voice (3-voice
+            // unison) stays centered — same layout as `unison_ratios`' detune-down/center/
+            // detune-up spread. Scaled by `unison_width` so 0.0 collapses every voice's position
+            // to dead center, matching `unison_pan_gains`'s "both channels get gain 1.0" case.
+            let position = if self.unison_count <= 1 {
+                0.0
+            } else {
+                (i as f32 / (self.unison_count - 1) as f32) * 2.0 - 1.0
+            };
+            let (gain_l, gain_r) = unison_pan_gains(position * self.unison_width);
+            osc1_l += sample_i * gain_l;
+            osc1_r += sample_i * gain_r;
             self.phases[i] += self.phase_incs[i];
             if self.phases[i] >= 1.0 {
                 self.phases[i] -= 1.0;
@@ -599,7 +634,8 @@ impl Voice {
                 }
             }
         }
-        osc1 /= self.unison_count as f32;
+        osc1_l /= self.unison_count as f32;
+        osc1_r /= self.unison_count as f32;
 
         let osc2_inc = base_freq * self.osc2_ratio / self.sample_rate;
         let osc2 = waveform_sample(self.osc2_waveform, self.osc2_phase, self.pulse_width);
@@ -621,7 +657,11 @@ impl Voice {
             self.sub_phase -= 1.0;
         }
 
-        let osc = osc1 * (1.0 - self.osc2_mix) + osc2 * self.osc2_mix + sub * self.sub_mix;
+        // osc2/sub have no unison stacking of their own (see their struct docs), so they stay
+        // centered — identical contribution to both channels.
+        let osc2_and_sub = osc2 * self.osc2_mix + sub * self.sub_mix;
+        let osc_l = osc1_l * (1.0 - self.osc2_mix) + osc2_and_sub;
+        let osc_r = osc1_r * (1.0 - self.osc2_mix) + osc2_and_sub;
 
         match self.stage {
             EnvelopeStage::Attack => {
@@ -670,7 +710,8 @@ impl Voice {
         } else {
             1.0
         };
-        let enveloped = osc * self.amp * amp_lfo;
+        let enveloped_l = osc_l * self.amp * amp_lfo;
+        let enveloped_r = osc_r * self.amp * amp_lfo;
 
         // TPT state-variable filter (Zavalishin's "Art of VA Filter Design"), cutoff modulated by
         // the independent filter envelope computed above and, if selected, the LFO.
@@ -683,23 +724,30 @@ impl Voice {
         let cutoff =
             (self.filter_cutoff_hz + self.filter_env_amount_hz * self.filter_env + filter_lfo_hz)
                 .clamp(20.0, self.sample_rate * 0.49);
-        let g = (std::f32::consts::PI * cutoff / self.sample_rate).tan();
-        let k = 1.0 / self.filter_resonance;
-        let a1 = 1.0 / (1.0 + g * (g + k));
-        let a2 = g * a1;
-        let a3 = g * a2;
-        let v3 = enveloped - self.filter_ic2eq;
-        let v1 = a1 * self.filter_ic1eq + a2 * v3;
-        let v2 = self.filter_ic2eq + a2 * self.filter_ic1eq + a3 * v3;
-        self.filter_ic1eq = 2.0 * v1 - self.filter_ic1eq;
-        self.filter_ic2eq = 2.0 * v2 - self.filter_ic2eq;
-
-        match self.filter_type {
-            FilterType::Lowpass => v2,
-            FilterType::Bandpass => v1,
-            FilterType::Highpass => enveloped - k * v1 - v2,
-            FilterType::Notch => enveloped - k * v1,
-        }
+        // Two independent filter instances (own integrator state each, see `filter_ic1eq_l`'s doc
+        // comment), sharing the `svf_stage` helper `TrineVoice`/`WaveVoice` already use for their
+        // own cascaded filters — reusing it here (rather than hand-duplicating this engine's
+        // previously-inlined filter math a second time) is exactly the "duplication introduces
+        // higher risk than explicit shared logic" case the project's duplication rule carves out.
+        let out_l = svf_stage(
+            enveloped_l,
+            cutoff,
+            self.filter_resonance,
+            self.filter_type,
+            self.sample_rate,
+            &mut self.filter_ic1eq_l,
+            &mut self.filter_ic2eq_l,
+        );
+        let out_r = svf_stage(
+            enveloped_r,
+            cutoff,
+            self.filter_resonance,
+            self.filter_type,
+            self.sample_rate,
+            &mut self.filter_ic1eq_r,
+            &mut self.filter_ic2eq_r,
+        );
+        (out_l, out_r)
     }
 }
 
@@ -707,10 +755,26 @@ fn pitch_to_freq(pitch: u8) -> f32 {
     440.0 * 2f32.powf((pitch as f32 - 69.0) / 12.0)
 }
 
-/// One TPT state-variable filter stage (Zavalishin's "Art of VA Filter Design") — factored out of
-/// `Voice::next_sample`'s inlined version (left untouched) so `TrineVoice` can cascade it once
-/// (12dB/octave) or twice (24dB/octave) per `FilterSlope`, and run it twice per sample (filter1 +
-/// filter2).
+/// Per-channel gain for one unison voice at stereo `position` (already scaled by
+/// `SynthParams::unison_width`/`WaveParams::unison_width`, so callers pass `position * width`, in
+/// -1.0..1.0 — negative pans the voice toward left, positive toward right, 0.0 is dead center).
+/// Deliberately not the equal-power law `Track::pan`/`equal_power_pan_gains` uses: that law
+/// assumes a single mono source being positioned somewhere in an already-stereo field, and
+/// attenuates it (~-3dB) even when centered, to compensate for both ears hearing it. Here, a
+/// centered unison voice isn't "positioned in the middle of a stereo signal" — it's simply present
+/// in both channels at full strength, the way it always has been before this feature (`spread ==
+/// 0.0` must return exactly `(1.0, 1.0)`, not a duller `(0.707, 0.707)`, or every existing preset's
+/// loudness would silently change the moment this shipped). As `spread` moves toward +/-1.0, the
+/// voice simply fades out of the opposite channel instead of both attenuating symmetrically.
+fn unison_pan_gains(spread: f32) -> (f32, f32) {
+    let gain_l = (1.0 - spread).clamp(0.0, 1.0);
+    let gain_r = (1.0 + spread).clamp(0.0, 1.0);
+    (gain_l, gain_r)
+}
+
+/// One TPT state-variable filter stage (Zavalishin's "Art of VA Filter Design") — shared by
+/// `Voice` (one instance per channel once unison spread diverges L/R), and by `TrineVoice`/
+/// `WaveVoice`, which each cascade it once (12dB/octave) or twice (24dB/octave) per `FilterSlope`.
 fn svf_stage(
     input: f32,
     cutoff_hz: f32,
@@ -771,6 +835,67 @@ fn run_filter_stage(
             &mut ic1eq[1],
             &mut ic2eq[1],
         ),
+    }
+}
+
+/// Runs `WaveVoice`/`TrineVoice`'s shared dual-filter shape — filter1 alone, or filter1 feeding
+/// filter2 in series, or filter1/filter2 summed in parallel, per `routing` — for one channel's own
+/// integrator state. Factored out as a free function (not a method) so callers can pass `&mut`
+/// borrows of individual struct fields (e.g. `filter1_ic1eq_l`) alongside plain copies of the
+/// filter parameters, without the whole-`self` borrow a `&self` method receiver would require.
+#[allow(clippy::too_many_arguments)]
+fn run_dual_filter_stage(
+    input: f32,
+    routing: FilterRouting,
+    filter1_cutoff: f32,
+    filter1_resonance: f32,
+    filter1_type: FilterType,
+    filter1_slope: FilterSlope,
+    filter1_ic1eq: &mut [f32; 2],
+    filter1_ic2eq: &mut [f32; 2],
+    filter2_cutoff: f32,
+    filter2_resonance: f32,
+    filter2_type: FilterType,
+    filter2_slope: FilterSlope,
+    filter2_ic1eq: &mut [f32; 2],
+    filter2_ic2eq: &mut [f32; 2],
+    sample_rate: f32,
+) -> f32 {
+    let filter1_out = run_filter_stage(
+        input,
+        filter1_cutoff,
+        filter1_resonance,
+        filter1_type,
+        filter1_slope,
+        sample_rate,
+        filter1_ic1eq,
+        filter1_ic2eq,
+    );
+    match routing {
+        FilterRouting::Off => filter1_out,
+        FilterRouting::Series => run_filter_stage(
+            filter1_out,
+            filter2_cutoff,
+            filter2_resonance,
+            filter2_type,
+            filter2_slope,
+            sample_rate,
+            filter2_ic1eq,
+            filter2_ic2eq,
+        ),
+        FilterRouting::Parallel => {
+            let filter2_out = run_filter_stage(
+                input,
+                filter2_cutoff,
+                filter2_resonance,
+                filter2_type,
+                filter2_slope,
+                sample_rate,
+                filter2_ic1eq,
+                filter2_ic2eq,
+            );
+            filter1_out + filter2_out
+        }
     }
 }
 
@@ -854,6 +979,26 @@ impl EnvGen {
     }
 }
 
+/// Per-channel state for `TrineVoice`'s drift-decorrelated stereo: everything that either carries
+/// audio (filter integrators) or depends on this channel's own drift-modulated frequency (the
+/// three oscillator phases — once `drift_seed` diverges, `freq` diverges, so each channel's phases
+/// accumulate differently over time and can no longer be shared). `drift_seed` starts different
+/// per channel (see `TrineVoice::trigger`); everything else starts identical, so at
+/// `analog_drift == 0.0` (the default) `drift_lp` never contributes to `freq` and both channels
+/// stay numerically identical forever, same as this engine's pre-stereo mono output.
+#[derive(Clone, Copy, Default)]
+struct TrineVoiceChannel {
+    osc1_phase: f32,
+    osc2_phase: f32,
+    osc3_phase: f32,
+    drift_lp: f32,
+    drift_seed: u32,
+    filter1_ic1eq: [f32; 2],
+    filter1_ic2eq: [f32; 2],
+    filter2_ic1eq: [f32; 2],
+    filter2_ic2eq: [f32; 2],
+}
+
 /// One Trine-engine voice — see `TrineParams`. Three oscillators (with FM, ring mod, and per-voice
 /// analog drift) run into a dual filter (series/parallel/off routing, switchable slope, drive,
 /// and audio-rate filter FM from osc2's raw sample), while up to five modulation sources (2 LFOs,
@@ -870,41 +1015,31 @@ struct TrineVoice {
     base_freq: f32,
 
     osc1_waveform: SynthWaveform,
-    osc1_phase: f32,
     osc1_level: f32,
     pulse_width: f32,
 
     osc2_waveform: SynthWaveform,
     osc2_ratio: f32,
-    osc2_phase: f32,
     osc2_level: f32,
     osc2_sync: bool,
 
     osc3_waveform: SynthWaveform,
     osc3_ratio: f32,
-    osc3_phase: f32,
     osc3_level: f32,
     osc3_sync: bool,
 
     fm_amount: f32,
     ring_mod_mix: f32,
     analog_drift: f32,
-    /// Slowly-smoothed noise driving the per-voice pitch drift — see `TRINE_ANALOG_DRIFT_SMOOTHING`.
-    drift_lp: f32,
-    drift_seed: u32,
 
     filter1_cutoff_hz: f32,
     filter1_resonance: f32,
     filter1_type: FilterType,
     filter1_slope: FilterSlope,
-    filter1_ic1eq: [f32; 2],
-    filter1_ic2eq: [f32; 2],
     filter2_cutoff_hz: f32,
     filter2_resonance: f32,
     filter2_type: FilterType,
     filter2_slope: FilterSlope,
-    filter2_ic1eq: [f32; 2],
-    filter2_ic2eq: [f32; 2],
     filter_routing: FilterRouting,
     filter_drive: f32,
     filter_fm_amount: f32,
@@ -920,6 +1055,9 @@ struct TrineVoice {
     env2: EnvGen,
     env3: EnvGen,
     velocity: f32,
+
+    left: TrineVoiceChannel,
+    right: TrineVoiceChannel,
 }
 
 impl Default for TrineVoice {
@@ -929,36 +1067,27 @@ impl Default for TrineVoice {
             sample_rate: 48_000.0,
             base_freq: 0.0,
             osc1_waveform: SynthWaveform::default(),
-            osc1_phase: 0.0,
             osc1_level: 1.0,
             pulse_width: 0.5,
             osc2_waveform: SynthWaveform::default(),
             osc2_ratio: 1.0,
-            osc2_phase: 0.0,
             osc2_level: 0.0,
             osc2_sync: false,
             osc3_waveform: SynthWaveform::default(),
             osc3_ratio: 1.0,
-            osc3_phase: 0.0,
             osc3_level: 0.0,
             osc3_sync: false,
             fm_amount: 0.0,
             ring_mod_mix: 0.0,
             analog_drift: 0.0,
-            drift_lp: 0.0,
-            drift_seed: 1,
             filter1_cutoff_hz: 20_000.0,
             filter1_resonance: 0.707,
             filter1_type: FilterType::default(),
             filter1_slope: FilterSlope::default(),
-            filter1_ic1eq: [0.0; 2],
-            filter1_ic2eq: [0.0; 2],
             filter2_cutoff_hz: 20_000.0,
             filter2_resonance: 0.707,
             filter2_type: FilterType::default(),
             filter2_slope: FilterSlope::default(),
-            filter2_ic1eq: [0.0; 2],
-            filter2_ic2eq: [0.0; 2],
             filter_routing: FilterRouting::default(),
             filter_drive: 0.0,
             filter_fm_amount: 0.0,
@@ -972,6 +1101,8 @@ impl Default for TrineVoice {
             env2: EnvGen::default(),
             env3: EnvGen::default(),
             velocity: 0.0,
+            left: TrineVoiceChannel::default(),
+            right: TrineVoiceChannel::default(),
         }
     }
 }
@@ -990,42 +1121,44 @@ impl TrineVoice {
         self.base_freq = freq;
 
         self.osc1_waveform = trine.osc1_waveform;
-        self.osc1_phase = 0.0;
         self.osc1_level = trine.osc1_level.clamp(0.0, 1.0);
         self.pulse_width = trine.pulse_width.clamp(0.02, 0.98);
 
         self.osc2_waveform = trine.osc2_waveform;
         self.osc2_ratio = 2f32.powf(trine.osc2_semitones as f32 / 12.0)
             * 2f32.powf(trine.osc2_detune_cents / 1200.0);
-        self.osc2_phase = 0.0;
         self.osc2_level = trine.osc2_level.clamp(0.0, 1.0);
         self.osc2_sync = trine.osc2_sync;
 
         self.osc3_waveform = trine.osc3_waveform;
         self.osc3_ratio = 2f32.powf(trine.osc3_semitones as f32 / 12.0)
             * 2f32.powf(trine.osc3_detune_cents / 1200.0);
-        self.osc3_phase = 0.0;
         self.osc3_level = trine.osc3_level.clamp(0.0, 1.0);
         self.osc3_sync = trine.osc3_sync;
 
         self.fm_amount = trine.fm_amount.max(0.0);
         self.ring_mod_mix = trine.ring_mod_mix.clamp(0.0, 1.0);
         self.analog_drift = trine.analog_drift.max(0.0);
-        self.drift_lp = 0.0;
-        self.drift_seed = freq.to_bits() ^ 0xA5A5_5A5A;
+        // Both channels start from the same phases/filter state, diverging only in their drift
+        // seed — the two XOR constants are arbitrary but distinct, so left and right decorrelate
+        // once `analog_drift > 0.0` (see `TrineVoiceChannel`'s doc comment).
+        self.left = TrineVoiceChannel {
+            drift_seed: freq.to_bits() ^ 0xA5A5_5A5A,
+            ..TrineVoiceChannel::default()
+        };
+        self.right = TrineVoiceChannel {
+            drift_seed: freq.to_bits() ^ 0x5A5A_A5A5,
+            ..TrineVoiceChannel::default()
+        };
 
         self.filter1_cutoff_hz = trine.filter1_cutoff_hz.max(20.0);
         self.filter1_resonance = trine.filter1_resonance.max(0.05);
         self.filter1_type = trine.filter1_type;
         self.filter1_slope = trine.filter1_slope;
-        self.filter1_ic1eq = [0.0; 2];
-        self.filter1_ic2eq = [0.0; 2];
         self.filter2_cutoff_hz = trine.filter2_cutoff_hz.max(20.0);
         self.filter2_resonance = trine.filter2_resonance.max(0.05);
         self.filter2_type = trine.filter2_type;
         self.filter2_slope = trine.filter2_slope;
-        self.filter2_ic1eq = [0.0; 2];
-        self.filter2_ic2eq = [0.0; 2];
         self.filter_routing = trine.filter_routing;
         self.filter_drive = trine.filter_drive.max(0.0);
         self.filter_fm_amount = trine.filter_fm_amount;
@@ -1070,15 +1203,15 @@ impl TrineVoice {
     }
 
     /// `mod_slots` is the owning track's live `TrineParams::mod_slots` — see the struct doc comment
-    /// for why it's a parameter here instead of a field copied in at `trigger` time.
-    fn next_sample(&mut self, mod_slots: &[ModSlot]) -> f32 {
+    /// for why it's a parameter here instead of a field copied in at `trigger` time. Returns
+    /// `(left, right)` — identical at `analog_drift == 0.0` (see `TrineVoiceChannel`'s doc
+    /// comment), otherwise the two channels' drift decorrelates their frequency (hence their
+    /// oscillator phases and everything downstream) over time, run independently via
+    /// `trine_channel_sample`.
+    fn next_sample(&mut self, mod_slots: &[ModSlot]) -> (f32, f32) {
         if !self.active {
-            return 0.0;
+            return (0.0, 0.0);
         }
-
-        self.drift_seed = self.drift_seed.wrapping_add(0x9E37_79B9);
-        let drift_noise = hash_to_bipolar(self.drift_seed);
-        self.drift_lp += (drift_noise - self.drift_lp) * TRINE_ANALOG_DRIFT_SMOOTHING;
 
         let lfo1_value = waveform_sample(self.lfo1_waveform, self.lfo1_phase, 0.5);
         self.lfo1_phase += self.lfo1_phase_inc;
@@ -1139,111 +1272,45 @@ impl TrineVoice {
             }
         }
 
-        let drift_ratio =
-            2f32.powf(self.analog_drift * self.drift_lp * TRINE_ANALOG_DRIFT_MAX_CENTS / 1200.0);
         let pitch_ratio = 2f32.powf(pitch_semitones / 12.0);
-        let freq = self.base_freq * drift_ratio * pitch_ratio;
-
-        let osc1_level = (self.osc1_level + osc1_level_delta).clamp(0.0, 1.0);
-        let osc2_level = (self.osc2_level + osc2_level_delta).clamp(0.0, 1.0);
-        let osc3_level = (self.osc3_level + osc3_level_delta).clamp(0.0, 1.0);
-        let pulse_width = (self.pulse_width + pulse_width_delta).clamp(0.02, 0.98);
-        let fm_amount = (self.fm_amount + fm_amount_delta).max(0.0);
-        let ring_mod_mix = (self.ring_mod_mix + ring_mod_delta).clamp(0.0, 1.0);
-
-        let osc1_inc = freq / self.sample_rate;
-        let osc2_inc = freq * self.osc2_ratio / self.sample_rate;
-        let osc3_inc = freq * self.osc3_ratio / self.sample_rate;
-
-        let osc2_raw = waveform_sample(self.osc2_waveform, self.osc2_phase, pulse_width);
-        let osc1_raw = waveform_sample(self.osc1_waveform, self.osc1_phase, pulse_width);
-
-        // FM: osc2's raw sample perturbs osc1's phase increment for this sample only.
-        self.osc1_phase += osc1_inc * (1.0 + fm_amount * osc2_raw);
-        let osc1_wrapped = !(0.0..1.0).contains(&self.osc1_phase);
-        if self.osc1_phase >= 1.0 {
-            self.osc1_phase -= 1.0;
-        } else if self.osc1_phase < 0.0 {
-            self.osc1_phase += 1.0;
-        }
-
-        if self.osc2_sync && osc1_wrapped {
-            self.osc2_phase = 0.0;
-        } else {
-            self.osc2_phase += osc2_inc;
-            if self.osc2_phase >= 1.0 {
-                self.osc2_phase -= 1.0;
-            }
-        }
-
-        let osc3_raw = waveform_sample(self.osc3_waveform, self.osc3_phase, pulse_width);
-        if self.osc3_sync && osc1_wrapped {
-            self.osc3_phase = 0.0;
-        } else {
-            self.osc3_phase += osc3_inc;
-            if self.osc3_phase >= 1.0 {
-                self.osc3_phase -= 1.0;
-            }
-        }
-
-        let ring = osc1_raw * osc2_raw * ring_mod_mix;
-        let osc_sum = osc1_raw * osc1_level + osc2_raw * osc2_level + osc3_raw * osc3_level + ring;
-
-        let driven = if self.filter_drive > 0.0 {
-            (osc_sum * (1.0 + self.filter_drive * 4.0)).tanh()
-        } else {
-            osc_sum
-        };
-
         let env3_value = self.env3.advance();
-        let enveloped = driven * env3_value;
 
-        let filter1_cutoff = (self.filter1_cutoff_hz
-            + filter1_cutoff_delta
-            + self.filter_fm_amount * TRINE_FILTER_FM_RANGE_HZ * osc2_raw)
-            .clamp(20.0, self.sample_rate * 0.49);
-        let filter1_resonance =
-            (self.filter1_resonance + filter1_resonance_delta).clamp(0.05, 20.0);
-        let filter2_cutoff =
-            (self.filter2_cutoff_hz + filter2_cutoff_delta).clamp(20.0, self.sample_rate * 0.49);
-
-        let filter1_out = run_filter_stage(
-            enveloped,
-            filter1_cutoff,
-            filter1_resonance,
-            self.filter1_type,
-            self.filter1_slope,
-            self.sample_rate,
-            &mut self.filter1_ic1eq,
-            &mut self.filter1_ic2eq,
-        );
-
-        let output = match self.filter_routing {
-            FilterRouting::Off => filter1_out,
-            FilterRouting::Series => run_filter_stage(
-                filter1_out,
-                filter2_cutoff,
-                self.filter2_resonance,
-                self.filter2_type,
-                self.filter2_slope,
-                self.sample_rate,
-                &mut self.filter2_ic1eq,
-                &mut self.filter2_ic2eq,
-            ),
-            FilterRouting::Parallel => {
-                let filter2_out = run_filter_stage(
-                    enveloped,
-                    filter2_cutoff,
-                    self.filter2_resonance,
-                    self.filter2_type,
-                    self.filter2_slope,
-                    self.sample_rate,
-                    &mut self.filter2_ic1eq,
-                    &mut self.filter2_ic2eq,
-                );
-                filter1_out + filter2_out
-            }
+        let shared = TrineSharedInputs {
+            base_freq: self.base_freq,
+            pitch_ratio,
+            analog_drift: self.analog_drift,
+            sample_rate: self.sample_rate,
+            osc1_waveform: self.osc1_waveform,
+            osc2_waveform: self.osc2_waveform,
+            osc3_waveform: self.osc3_waveform,
+            osc2_ratio: self.osc2_ratio,
+            osc3_ratio: self.osc3_ratio,
+            osc2_sync: self.osc2_sync,
+            osc3_sync: self.osc3_sync,
+            pulse_width: (self.pulse_width + pulse_width_delta).clamp(0.02, 0.98),
+            osc1_level: (self.osc1_level + osc1_level_delta).clamp(0.0, 1.0),
+            osc2_level: (self.osc2_level + osc2_level_delta).clamp(0.0, 1.0),
+            osc3_level: (self.osc3_level + osc3_level_delta).clamp(0.0, 1.0),
+            fm_amount: (self.fm_amount + fm_amount_delta).max(0.0),
+            ring_mod_mix: (self.ring_mod_mix + ring_mod_delta).clamp(0.0, 1.0),
+            filter_drive: self.filter_drive,
+            env3_value,
+            filter1_cutoff_hz: self.filter1_cutoff_hz,
+            filter1_cutoff_delta,
+            filter_fm_amount: self.filter_fm_amount,
+            filter1_resonance: (self.filter1_resonance + filter1_resonance_delta).clamp(0.05, 20.0),
+            filter1_type: self.filter1_type,
+            filter1_slope: self.filter1_slope,
+            filter2_cutoff: (self.filter2_cutoff_hz + filter2_cutoff_delta)
+                .clamp(20.0, self.sample_rate * 0.49),
+            filter2_resonance: self.filter2_resonance,
+            filter2_type: self.filter2_type,
+            filter2_slope: self.filter2_slope,
+            filter_routing: self.filter_routing,
         };
+
+        let out_l = trine_channel_sample(&mut self.left, &shared);
+        let out_r = trine_channel_sample(&mut self.right, &shared);
 
         // Lifecycle mirrors `Voice`'s: once env3 (the amp envelope) has entered Release and decayed
         // below the floor, this voice is done.
@@ -1251,8 +1318,130 @@ impl TrineVoice {
             self.active = false;
         }
 
-        output
+        (out_l, out_r)
     }
+}
+
+/// Read-only, per-sample inputs shared by both of `TrineVoice::next_sample`'s channel runs —
+/// everything already resolved (mod-slot deltas applied, clamped) before either channel's own
+/// drift/phase/filter state comes into play. Bundled into one struct instead of a long parameter
+/// list purely for readability at the two `trine_channel_sample` call sites.
+struct TrineSharedInputs {
+    base_freq: f32,
+    pitch_ratio: f32,
+    analog_drift: f32,
+    sample_rate: f32,
+    osc1_waveform: SynthWaveform,
+    osc2_waveform: SynthWaveform,
+    osc3_waveform: SynthWaveform,
+    osc2_ratio: f32,
+    osc3_ratio: f32,
+    osc2_sync: bool,
+    osc3_sync: bool,
+    pulse_width: f32,
+    osc1_level: f32,
+    osc2_level: f32,
+    osc3_level: f32,
+    fm_amount: f32,
+    ring_mod_mix: f32,
+    filter_drive: f32,
+    env3_value: f32,
+    filter1_cutoff_hz: f32,
+    filter1_cutoff_delta: f32,
+    filter_fm_amount: f32,
+    filter1_resonance: f32,
+    filter1_type: FilterType,
+    filter1_slope: FilterSlope,
+    filter2_cutoff: f32,
+    filter2_resonance: f32,
+    filter2_type: FilterType,
+    filter2_slope: FilterSlope,
+    filter_routing: FilterRouting,
+}
+
+/// Runs one channel's worth of `TrineVoice::next_sample` — drift, the three oscillators (with FM/
+/// ring mod/hard sync), and the dual filter — entirely against `channel`'s own state, using
+/// `shared`'s already-resolved parameters. A free function (not a `TrineVoice` method) for the
+/// same reason `run_dual_filter_stage` is: it needs `&mut` access to one field (`channel`) of a
+/// struct it's called twice on, which a `&self`/`&mut self` method receiver can't express.
+fn trine_channel_sample(channel: &mut TrineVoiceChannel, shared: &TrineSharedInputs) -> f32 {
+    channel.drift_seed = channel.drift_seed.wrapping_add(0x9E37_79B9);
+    let drift_noise = hash_to_bipolar(channel.drift_seed);
+    channel.drift_lp += (drift_noise - channel.drift_lp) * TRINE_ANALOG_DRIFT_SMOOTHING;
+    let drift_ratio = 2f32.powf(
+        shared.analog_drift * channel.drift_lp * TRINE_ANALOG_DRIFT_MAX_CENTS / 1200.0,
+    );
+    let freq = shared.base_freq * drift_ratio * shared.pitch_ratio;
+
+    let osc1_inc = freq / shared.sample_rate;
+    let osc2_inc = freq * shared.osc2_ratio / shared.sample_rate;
+    let osc3_inc = freq * shared.osc3_ratio / shared.sample_rate;
+
+    let osc2_raw = waveform_sample(shared.osc2_waveform, channel.osc2_phase, shared.pulse_width);
+    let osc1_raw = waveform_sample(shared.osc1_waveform, channel.osc1_phase, shared.pulse_width);
+
+    // FM: osc2's raw sample perturbs osc1's phase increment for this sample only.
+    channel.osc1_phase += osc1_inc * (1.0 + shared.fm_amount * osc2_raw);
+    let osc1_wrapped = !(0.0..1.0).contains(&channel.osc1_phase);
+    if channel.osc1_phase >= 1.0 {
+        channel.osc1_phase -= 1.0;
+    } else if channel.osc1_phase < 0.0 {
+        channel.osc1_phase += 1.0;
+    }
+
+    if shared.osc2_sync && osc1_wrapped {
+        channel.osc2_phase = 0.0;
+    } else {
+        channel.osc2_phase += osc2_inc;
+        if channel.osc2_phase >= 1.0 {
+            channel.osc2_phase -= 1.0;
+        }
+    }
+
+    let osc3_raw = waveform_sample(shared.osc3_waveform, channel.osc3_phase, shared.pulse_width);
+    if shared.osc3_sync && osc1_wrapped {
+        channel.osc3_phase = 0.0;
+    } else {
+        channel.osc3_phase += osc3_inc;
+        if channel.osc3_phase >= 1.0 {
+            channel.osc3_phase -= 1.0;
+        }
+    }
+
+    let ring = osc1_raw * osc2_raw * shared.ring_mod_mix;
+    let osc_sum =
+        osc1_raw * shared.osc1_level + osc2_raw * shared.osc2_level + osc3_raw * shared.osc3_level + ring;
+
+    let driven = if shared.filter_drive > 0.0 {
+        (osc_sum * (1.0 + shared.filter_drive * 4.0)).tanh()
+    } else {
+        osc_sum
+    };
+
+    let enveloped = driven * shared.env3_value;
+
+    let filter1_cutoff = (shared.filter1_cutoff_hz
+        + shared.filter1_cutoff_delta
+        + shared.filter_fm_amount * TRINE_FILTER_FM_RANGE_HZ * osc2_raw)
+        .clamp(20.0, shared.sample_rate * 0.49);
+
+    run_dual_filter_stage(
+        enveloped,
+        shared.filter_routing,
+        filter1_cutoff,
+        shared.filter1_resonance,
+        shared.filter1_type,
+        shared.filter1_slope,
+        &mut channel.filter1_ic1eq,
+        &mut channel.filter1_ic2eq,
+        shared.filter2_cutoff,
+        shared.filter2_resonance,
+        shared.filter2_type,
+        shared.filter2_slope,
+        &mut channel.filter2_ic1eq,
+        &mut channel.filter2_ic2eq,
+        shared.sample_rate,
+    )
 }
 
 /// One Wave-engine voice — see `WaveParams`. Two wavetable oscillators (each scanning its table's
@@ -1278,6 +1467,8 @@ struct WaveVoice {
     unison: usize,
     unison_phases: [f32; MAX_UNISON_VOICES],
     unison_ratios: [f32; MAX_UNISON_VOICES],
+    /// How far unison voices spread across L/R (0.0..1.0) — see `WaveParams::unison_width`.
+    unison_width: f32,
 
     osc2_table: WavetableId,
     osc2_position: f32,
@@ -1298,14 +1489,19 @@ struct WaveVoice {
     filter1_resonance: f32,
     filter1_type: FilterType,
     filter1_slope: FilterSlope,
-    filter1_ic1eq: [f32; 2],
-    filter1_ic2eq: [f32; 2],
+    /// Duplicated per channel (`_l`/`_r`) — see `Voice::filter_ic1eq_l`'s doc comment for why.
+    filter1_ic1eq_l: [f32; 2],
+    filter1_ic2eq_l: [f32; 2],
+    filter1_ic1eq_r: [f32; 2],
+    filter1_ic2eq_r: [f32; 2],
     filter2_cutoff_hz: f32,
     filter2_resonance: f32,
     filter2_type: FilterType,
     filter2_slope: FilterSlope,
-    filter2_ic1eq: [f32; 2],
-    filter2_ic2eq: [f32; 2],
+    filter2_ic1eq_l: [f32; 2],
+    filter2_ic2eq_l: [f32; 2],
+    filter2_ic1eq_r: [f32; 2],
+    filter2_ic2eq_r: [f32; 2],
     filter_routing: FilterRouting,
     filter_drive: f32,
 
@@ -1337,6 +1533,7 @@ impl Default for WaveVoice {
             unison: 1,
             unison_phases: [0.0; MAX_UNISON_VOICES],
             unison_ratios: [1.0; MAX_UNISON_VOICES],
+            unison_width: 0.0,
             osc2_table: WavetableId::default(),
             osc2_position: 0.0,
             osc2_warp_mode: WaveWarpMode::default(),
@@ -1354,14 +1551,18 @@ impl Default for WaveVoice {
             filter1_resonance: 0.707,
             filter1_type: FilterType::default(),
             filter1_slope: FilterSlope::default(),
-            filter1_ic1eq: [0.0; 2],
-            filter1_ic2eq: [0.0; 2],
+            filter1_ic1eq_l: [0.0; 2],
+            filter1_ic2eq_l: [0.0; 2],
+            filter1_ic1eq_r: [0.0; 2],
+            filter1_ic2eq_r: [0.0; 2],
             filter2_cutoff_hz: 20_000.0,
             filter2_resonance: 0.707,
             filter2_type: FilterType::default(),
             filter2_slope: FilterSlope::default(),
-            filter2_ic1eq: [0.0; 2],
-            filter2_ic2eq: [0.0; 2],
+            filter2_ic1eq_l: [0.0; 2],
+            filter2_ic2eq_l: [0.0; 2],
+            filter2_ic1eq_r: [0.0; 2],
+            filter2_ic2eq_r: [0.0; 2],
             filter_routing: FilterRouting::default(),
             filter_drive: 0.0,
             lfo1_waveform: SynthWaveform::default(),
@@ -1400,6 +1601,7 @@ impl WaveVoice {
 
         let unison = (wave.unison_voices as usize).clamp(1, MAX_UNISON_VOICES);
         self.unison = unison;
+        self.unison_width = wave.unison_width.clamp(0.0, 1.0);
         let detune_ratio = 2f32.powf(wave.unison_detune_cents.max(0.0) / 1200.0);
         self.unison_phases = [0.0; MAX_UNISON_VOICES];
         self.unison_ratios = [1.0; MAX_UNISON_VOICES];
@@ -1435,14 +1637,18 @@ impl WaveVoice {
         self.filter1_resonance = wave.filter1_resonance.max(0.05);
         self.filter1_type = wave.filter1_type;
         self.filter1_slope = wave.filter1_slope;
-        self.filter1_ic1eq = [0.0; 2];
-        self.filter1_ic2eq = [0.0; 2];
+        self.filter1_ic1eq_l = [0.0; 2];
+        self.filter1_ic2eq_l = [0.0; 2];
+        self.filter1_ic1eq_r = [0.0; 2];
+        self.filter1_ic2eq_r = [0.0; 2];
         self.filter2_cutoff_hz = wave.filter2_cutoff_hz.max(20.0);
         self.filter2_resonance = wave.filter2_resonance.max(0.05);
         self.filter2_type = wave.filter2_type;
         self.filter2_slope = wave.filter2_slope;
-        self.filter2_ic1eq = [0.0; 2];
-        self.filter2_ic2eq = [0.0; 2];
+        self.filter2_ic1eq_l = [0.0; 2];
+        self.filter2_ic2eq_l = [0.0; 2];
+        self.filter2_ic1eq_r = [0.0; 2];
+        self.filter2_ic2eq_r = [0.0; 2];
         self.filter_routing = wave.filter_routing;
         self.filter_drive = wave.filter_drive.max(0.0);
 
@@ -1487,9 +1693,12 @@ impl WaveVoice {
 
     /// `mod_slots` is the owning track's live `WaveParams::mod_slots` — see `TrineVoice::next_sample`'s
     /// doc comment for why it's a parameter here instead of a field copied in at `trigger` time.
-    fn next_sample(&mut self, mod_slots: &[WaveModSlot]) -> f32 {
+    /// Returns `(left, right)`, currently identical on both channels — this engine's own stereo
+    /// width (unison spread) lands in a follow-up change; for now this signature change is purely
+    /// plumbing so the mixing loop and every downstream buffer can already carry real stereo.
+    fn next_sample(&mut self, mod_slots: &[WaveModSlot]) -> (f32, f32) {
         if !self.active {
-            return 0.0;
+            return (0.0, 0.0);
         }
 
         let lfo1_value = waveform_sample(self.lfo1_waveform, self.lfo1_phase, 0.5);
@@ -1557,18 +1766,31 @@ impl WaveVoice {
         let osc1_warp_amount = (self.osc1_warp_amount + osc1_warp_delta).clamp(0.0, 1.0);
         let osc2_warp_amount = (self.osc2_warp_amount + osc2_warp_delta).clamp(0.0, 1.0);
 
-        let mut osc1_raw = 0.0f32;
+        // Spread osc1's unison voices across L/R the same way `Voice::next_sample` does — see
+        // `unison_pan_gains`'s doc comment. osc2/sub/noise have no unison stacking of their own,
+        // so they stay centered below.
+        let mut osc1_l = 0.0f32;
+        let mut osc1_r = 0.0f32;
         for i in 0..self.unison {
             let phase_inc = freq * self.unison_ratios[i] / self.sample_rate;
             let warped =
                 wavetable::warp_phase(self.unison_phases[i], self.osc1_warp_mode, osc1_warp_amount);
-            osc1_raw += wavetable::sample(self.osc1_table, osc1_position, warped, self.osc1_mip);
+            let sample_i = wavetable::sample(self.osc1_table, osc1_position, warped, self.osc1_mip);
+            let position = if self.unison <= 1 {
+                0.0
+            } else {
+                (i as f32 / (self.unison - 1) as f32) * 2.0 - 1.0
+            };
+            let (gain_l, gain_r) = unison_pan_gains(position * self.unison_width);
+            osc1_l += sample_i * gain_l;
+            osc1_r += sample_i * gain_r;
             self.unison_phases[i] += phase_inc;
             if self.unison_phases[i] >= 1.0 {
                 self.unison_phases[i] -= 1.0;
             }
         }
-        osc1_raw /= self.unison as f32;
+        osc1_l /= self.unison as f32;
+        osc1_r /= self.unison as f32;
 
         let osc2_inc = freq * self.osc2_ratio / self.sample_rate;
         let osc2_warped =
@@ -1590,19 +1812,26 @@ impl WaveVoice {
         self.noise_seed = self.noise_seed.wrapping_add(0x9E37_79B9);
         let noise_raw = hash_to_bipolar(self.noise_seed);
 
-        let osc_sum = osc1_raw * self.osc1_level
-            + osc2_raw * self.osc2_level
-            + sub_raw * self.sub_level
-            + noise_raw * self.noise_level;
+        // osc2/sub/noise stay centered (no unison of their own), so their contribution to the mix
+        // is identical on both channels — only osc1's already-panned `osc1_l`/`osc1_r` differ.
+        let osc2_and_rest =
+            osc2_raw * self.osc2_level + sub_raw * self.sub_level + noise_raw * self.noise_level;
+        let osc_sum_l = osc1_l * self.osc1_level + osc2_and_rest;
+        let osc_sum_r = osc1_r * self.osc1_level + osc2_and_rest;
 
-        let driven = if self.filter_drive > 0.0 {
-            (osc_sum * (1.0 + self.filter_drive * 4.0)).tanh()
-        } else {
-            osc_sum
+        let drive = |osc_sum: f32| {
+            if self.filter_drive > 0.0 {
+                (osc_sum * (1.0 + self.filter_drive * 4.0)).tanh()
+            } else {
+                osc_sum
+            }
         };
+        let driven_l = drive(osc_sum_l);
+        let driven_r = drive(osc_sum_r);
 
         let amp_value = self.amp_env.advance();
-        let enveloped = driven * amp_value;
+        let enveloped_l = driven_l * amp_value;
+        let enveloped_r = driven_r * amp_value;
 
         let filter1_cutoff =
             (self.filter1_cutoff_hz + filter1_cutoff_delta).clamp(20.0, self.sample_rate * 0.49);
@@ -1611,43 +1840,43 @@ impl WaveVoice {
         let filter2_cutoff =
             (self.filter2_cutoff_hz + filter2_cutoff_delta).clamp(20.0, self.sample_rate * 0.49);
 
-        let filter1_out = run_filter_stage(
-            enveloped,
+        // Two independent dual-filter chains (own integrator state each, see
+        // `filter1_ic1eq_l`'s doc comment) sharing `run_dual_filter_stage` — see that function's
+        // doc comment for why it's a free function rather than a `&self` method.
+        let output_l = run_dual_filter_stage(
+            enveloped_l,
+            self.filter_routing,
             filter1_cutoff,
             filter1_resonance,
             self.filter1_type,
             self.filter1_slope,
+            &mut self.filter1_ic1eq_l,
+            &mut self.filter1_ic2eq_l,
+            filter2_cutoff,
+            self.filter2_resonance,
+            self.filter2_type,
+            self.filter2_slope,
+            &mut self.filter2_ic1eq_l,
+            &mut self.filter2_ic2eq_l,
             self.sample_rate,
-            &mut self.filter1_ic1eq,
-            &mut self.filter1_ic2eq,
         );
-
-        let output = match self.filter_routing {
-            FilterRouting::Off => filter1_out,
-            FilterRouting::Series => run_filter_stage(
-                filter1_out,
-                filter2_cutoff,
-                self.filter2_resonance,
-                self.filter2_type,
-                self.filter2_slope,
-                self.sample_rate,
-                &mut self.filter2_ic1eq,
-                &mut self.filter2_ic2eq,
-            ),
-            FilterRouting::Parallel => {
-                let filter2_out = run_filter_stage(
-                    enveloped,
-                    filter2_cutoff,
-                    self.filter2_resonance,
-                    self.filter2_type,
-                    self.filter2_slope,
-                    self.sample_rate,
-                    &mut self.filter2_ic1eq,
-                    &mut self.filter2_ic2eq,
-                );
-                filter1_out + filter2_out
-            }
-        };
+        let output_r = run_dual_filter_stage(
+            enveloped_r,
+            self.filter_routing,
+            filter1_cutoff,
+            filter1_resonance,
+            self.filter1_type,
+            self.filter1_slope,
+            &mut self.filter1_ic1eq_r,
+            &mut self.filter1_ic2eq_r,
+            filter2_cutoff,
+            self.filter2_resonance,
+            self.filter2_type,
+            self.filter2_slope,
+            &mut self.filter2_ic1eq_r,
+            &mut self.filter2_ic2eq_r,
+            self.sample_rate,
+        );
 
         // Lifecycle mirrors `TrineVoice`'s: once the amp envelope has entered Release and decayed
         // below the floor, this voice is done.
@@ -1655,7 +1884,7 @@ impl WaveVoice {
             self.active = false;
         }
 
-        output
+        (output_l, output_r)
     }
 }
 
@@ -1859,15 +2088,16 @@ impl Sequencer {
         self.last_triggered_tick
     }
 
-    /// Renders `frames` samples, writing one dry mix per track into `track_out[i]` (resized to
-    /// match `snapshot.tracks`). Track count can change between calls (e.g. after loading a
-    /// different song) — `track_voices` is resized to match, discarding in-flight voices for any
-    /// removed track.
+    /// Renders `frames` samples, writing one dry stereo mix per track into `track_out_l[i]`/
+    /// `track_out_r[i]` (both resized to match `snapshot.tracks`). Track count can change between
+    /// calls (e.g. after loading a different song) — `track_voices` is resized to match,
+    /// discarding in-flight voices for any removed track.
     fn process(
         &mut self,
         snapshot: &Song,
         frames: usize,
-        track_out: &mut Vec<Vec<f32>>,
+        track_out_l: &mut Vec<Vec<f32>>,
+        track_out_r: &mut Vec<Vec<f32>>,
         metronome_enabled: bool,
         metronome_out: &mut Vec<f32>,
     ) {
@@ -1876,8 +2106,9 @@ impl Sequencer {
         }
         self.track_voices.truncate(snapshot.tracks.len());
 
-        track_out.resize_with(snapshot.tracks.len(), Vec::new);
-        for buf in track_out.iter_mut() {
+        track_out_l.resize_with(snapshot.tracks.len(), Vec::new);
+        track_out_r.resize_with(snapshot.tracks.len(), Vec::new);
+        for buf in track_out_l.iter_mut().chain(track_out_r.iter_mut()) {
             buf.clear();
             buf.resize(frames, 0.0);
         }
@@ -2100,22 +2331,34 @@ impl Sequencer {
             self.samples_until_next_tick -= 1.0;
 
             for (track_index, tv) in self.track_voices.iter_mut().enumerate() {
-                let mut mixed = 0.0f32;
+                let mut mixed_l = 0.0f32;
+                let mut mixed_r = 0.0f32;
                 for voice in tv.voices.iter_mut() {
-                    mixed += voice.next_sample();
+                    let (l, r) = voice.next_sample();
+                    mixed_l += l;
+                    mixed_r += r;
                 }
                 let mod_slots = &snapshot.tracks[track_index].trine.mod_slots;
                 for voice in tv.trine_voices.iter_mut() {
-                    mixed += voice.next_sample(mod_slots);
+                    let (l, r) = voice.next_sample(mod_slots);
+                    mixed_l += l;
+                    mixed_r += r;
                 }
                 let wave_mod_slots = &snapshot.tracks[track_index].wave.mod_slots;
                 for voice in tv.wave_voices.iter_mut() {
-                    mixed += voice.next_sample(wave_mod_slots);
+                    let (l, r) = voice.next_sample(wave_mod_slots);
+                    mixed_l += l;
+                    mixed_r += r;
                 }
+                // Audio-clip playback is still a mono source (see `SampleVoice`) — centered by
+                // adding equally to both channels, same as before this feature.
                 for voice in tv.sample_voices.iter_mut() {
-                    mixed += voice.next_sample();
+                    let s = voice.next_sample();
+                    mixed_l += s;
+                    mixed_r += s;
                 }
-                track_out[track_index][sample_index] = mixed;
+                track_out_l[track_index][sample_index] = mixed_l;
+                track_out_r[track_index][sample_index] = mixed_r;
             }
             metronome_out[sample_index] = self.next_metronome_click_sample();
         }
@@ -2148,7 +2391,8 @@ where
     let mut sequencer = Sequencer::new(sample_rate);
     let mut scratch_l: Vec<f32> = Vec::with_capacity(max_frames);
     let mut scratch_r: Vec<f32> = Vec::with_capacity(max_frames);
-    let mut track_dry: Vec<Vec<f32>> = Vec::new();
+    let mut track_dry_l: Vec<Vec<f32>> = Vec::new();
+    let mut track_dry_r: Vec<Vec<f32>> = Vec::new();
     let mut metronome_dry: Vec<f32> = Vec::with_capacity(max_frames);
 
     // Per-track CLAP insert-effect-chain scratch (one `Vec<EffectScratch>` per track index, grown
@@ -2178,7 +2422,8 @@ where
         for _ in 0..snapshot.tracks.len() {
             sequencer.track_voices.push(TrackVoices::new());
         }
-        track_dry.resize_with(snapshot.tracks.len(), || Vec::with_capacity(max_frames));
+        track_dry_l.resize_with(snapshot.tracks.len(), || Vec::with_capacity(max_frames));
+        track_dry_r.resize_with(snapshot.tracks.len(), || Vec::with_capacity(max_frames));
         last_snapshot = Some(snapshot.clone());
     }
     if let Ok(chains) = track_effects.lock() {
@@ -2228,7 +2473,8 @@ where
                 sequencer.process(
                     snapshot,
                     frames,
-                    &mut track_dry,
+                    &mut track_dry_l,
+                    &mut track_dry_r,
                     transport.is_metronome_enabled(),
                     &mut metronome_dry,
                 );
@@ -2244,10 +2490,12 @@ where
                 track_effect_out_l.resize(frames, 0.0);
                 track_effect_out_r.resize(frames, 0.0);
                 if let Ok(mut chains) = track_effects.lock() {
-                    while track_scratch.len() < track_dry.len() {
+                    while track_scratch.len() < track_dry_l.len() {
                         track_scratch.push(Vec::new());
                     }
-                    for (track_index, dry) in track_dry.iter().enumerate() {
+                    for (track_index, (dry_l, dry_r)) in
+                        track_dry_l.iter().zip(track_dry_r.iter()).enumerate()
+                    {
                         let track = snapshot.tracks.get(track_index);
                         let volume = track.map_or(1.0, |t| t.volume);
                         let (pan_l, pan_r) = equal_power_pan_gains(track.map_or(0.0, |t| t.pan));
@@ -2260,8 +2508,8 @@ where
                         }
                         let used = plugin_host::process_effect_chain(
                             chain,
-                            dry,
-                            dry,
+                            dry_l,
+                            dry_r,
                             &mut track_effect_out_l,
                             &mut track_effect_out_r,
                             stage_scratch,
@@ -2275,19 +2523,21 @@ where
                             }
                         } else {
                             for i in 0..frames {
-                                scratch_l[i] += volume * pan_l * dry[i];
-                                scratch_r[i] += volume * pan_r * dry[i];
+                                scratch_l[i] += volume * pan_l * dry_l[i];
+                                scratch_r[i] += volume * pan_r * dry_r[i];
                             }
                         }
                     }
                 } else {
-                    for (track_index, dry) in track_dry.iter().enumerate() {
+                    for (track_index, (dry_l, dry_r)) in
+                        track_dry_l.iter().zip(track_dry_r.iter()).enumerate()
+                    {
                         let track = snapshot.tracks.get(track_index);
                         let volume = track.map_or(1.0, |t| t.volume);
                         let (pan_l, pan_r) = equal_power_pan_gains(track.map_or(0.0, |t| t.pan));
                         for i in 0..frames {
-                            scratch_l[i] += volume * pan_l * dry[i];
-                            scratch_r[i] += volume * pan_r * dry[i];
+                            scratch_l[i] += volume * pan_l * dry_l[i];
+                            scratch_r[i] += volume * pan_r * dry_r[i];
                         }
                     }
                 }
@@ -2373,24 +2623,28 @@ pub fn render_song_to_wav(
     // Dry-only, matching live playback's scope cut: CLAP/built-in effects (master or per-track)
     // don't route into the bounce — only each track's volume and pan do.
     let mut sequencer = Sequencer::new(sample_rate as f32);
-    let mut track_dry: Vec<Vec<f32>> = Vec::new();
+    let mut track_dry_l: Vec<Vec<f32>> = Vec::new();
+    let mut track_dry_r: Vec<Vec<f32>> = Vec::new();
     let mut metronome_dry: Vec<f32> = Vec::new();
     // The metronome is a monitoring aid, not part of the song — bounces never include it.
     sequencer.process(
         song,
         total_samples,
-        &mut track_dry,
+        &mut track_dry_l,
+        &mut track_dry_r,
         false,
         &mut metronome_dry,
     );
 
     let mut buffer_l = vec![0.0f32; total_samples];
     let mut buffer_r = vec![0.0f32; total_samples];
-    for (track_buf, track) in track_dry.iter().zip(&song.tracks) {
+    for (track_index, track) in song.tracks.iter().enumerate() {
         let (pan_l, pan_r) = equal_power_pan_gains(track.pan);
+        let dry_l = &track_dry_l[track_index];
+        let dry_r = &track_dry_r[track_index];
         for i in 0..total_samples {
-            buffer_l[i] += track.volume * pan_l * track_buf[i];
-            buffer_r[i] += track.volume * pan_r * track_buf[i];
+            buffer_l[i] += track.volume * pan_l * dry_l[i];
+            buffer_r[i] += track.volume * pan_r * dry_r[i];
         }
     }
     for s in buffer_l.iter_mut().chain(buffer_r.iter_mut()) {
@@ -2450,7 +2704,7 @@ mod tests {
 
         let mut early_peak = 0.0f32;
         for _ in 0..200 {
-            early_peak = early_peak.max(voice.next_sample().abs());
+            early_peak = early_peak.max(voice.next_sample().0.abs());
         }
         assert!(
             early_peak > 0.05,
@@ -2458,14 +2712,14 @@ mod tests {
         );
 
         for _ in 0..(sample_rate as usize) {
-            voice.next_sample();
+            voice.next_sample().0;
         }
         assert!(
             !voice.active,
             "voice should have decayed to silence within 1 second"
         );
         assert_eq!(
-            voice.next_sample(),
+            voice.next_sample().0,
             0.0,
             "an inactive voice must output silence"
         );
@@ -2496,8 +2750,8 @@ mod tests {
         );
 
         for _ in 0..(sample_rate * 0.3) as usize {
-            short.next_sample();
-            long.next_sample();
+            short.next_sample().0;
+            long.next_sample().0;
         }
         assert!(!short.active, "short-decay voice should be done after 0.3s");
         assert!(
@@ -2526,7 +2780,7 @@ mod tests {
 
         // Right after trigger, a Square wave at full amplitude would already be
         // near +/-1.0; with a 50ms attack ramping from 0, it should start much quieter.
-        let first = voice.next_sample().abs();
+        let first = voice.next_sample().0.abs();
         assert!(
             first < 0.1,
             "voice should start near silent during its attack ramp, got {first}"
@@ -2534,11 +2788,11 @@ mod tests {
 
         // After the attack window elapses the voice should be in full swing.
         for _ in 0..(sample_rate * 0.05) as usize {
-            voice.next_sample();
+            voice.next_sample().0;
         }
         let mut peak = 0.0f32;
         for _ in 0..50 {
-            peak = peak.max(voice.next_sample().abs());
+            peak = peak.max(voice.next_sample().0.abs());
         }
         assert!(
             peak > 0.9,
@@ -2562,11 +2816,11 @@ mod tests {
         // Skip the filter's brief startup transient (zero initial filter state means the first
         // handful of samples ramp toward the input rather than matching it outright).
         for _ in 0..20 {
-            voice.next_sample();
+            voice.next_sample().0;
         }
         let mut peak = 0.0f32;
         for _ in 0..50 {
-            peak = peak.max(voice.next_sample().abs());
+            peak = peak.max(voice.next_sample().0.abs());
         }
         assert!(
             peak > 0.9,
@@ -2592,10 +2846,10 @@ mod tests {
             // waveform's own discontinuities (Saw/Square's sharp edges) before settling into a
             // stable, bounded periodic response.
             for _ in 0..500 {
-                voice.next_sample();
+                voice.next_sample().0;
             }
             for _ in 0..200 {
-                let s = voice.next_sample();
+                let s = voice.next_sample().0;
                 assert!(
                     (-1.5..=1.5).contains(&s),
                     "{waveform:?} sample out of range after settling: {s}"
@@ -2642,11 +2896,11 @@ mod tests {
 
         // Run past attack+decay, into the sustain plateau, well before the gate closes.
         for _ in 0..(sample_rate * 0.1) as usize {
-            voice.next_sample();
+            voice.next_sample().0;
         }
         let mut sustain_peak = 0.0f32;
         for _ in 0..50 {
-            sustain_peak = sustain_peak.max(voice.next_sample().abs());
+            sustain_peak = sustain_peak.max(voice.next_sample().0.abs());
         }
         assert!(
             sustain_peak > 0.5,
@@ -2656,7 +2910,7 @@ mod tests {
 
         // Run past the gate close (0.2s) plus the release tail.
         for _ in 0..(sample_rate * 0.2) as usize {
-            voice.next_sample();
+            voice.next_sample().0;
         }
         assert!(
             !voice.active,
@@ -2674,12 +2928,48 @@ mod tests {
         let mut voice = Voice::default();
         voice.trigger(pitch_to_freq(60), 127, 48_000.0, 1.0, &synth, None);
         for _ in 0..200 {
-            let s = voice.next_sample();
+            let s = voice.next_sample().0;
             assert!(
                 (-1.01..=1.01).contains(&s),
                 "unison output out of range: {s}"
             );
         }
+    }
+
+    #[test]
+    fn unison_width_zero_keeps_left_and_right_identical() {
+        let synth = synth(|s| {
+            s.unison_voices = 3;
+            s.unison_detune_cents = 15.0;
+            s.unison_width = 0.0;
+            s.decay_seconds = 1.0;
+        });
+        let mut voice = Voice::default();
+        voice.trigger(pitch_to_freq(60), 127, 48_000.0, 1.0, &synth, None);
+        for _ in 0..200 {
+            let (l, r) = voice.next_sample();
+            assert_eq!(l, r, "unison_width 0.0 should keep every channel identical");
+        }
+    }
+
+    #[test]
+    fn unison_width_above_zero_spreads_left_and_right_apart() {
+        let synth = synth(|s| {
+            s.unison_voices = 3;
+            s.unison_detune_cents = 15.0;
+            s.unison_width = 1.0;
+            s.decay_seconds = 1.0;
+        });
+        let mut voice = Voice::default();
+        voice.trigger(pitch_to_freq(60), 127, 48_000.0, 1.0, &synth, None);
+        let differs = (0..200).any(|_| {
+            let (l, r) = voice.next_sample();
+            (l - r).abs() > 1e-4
+        });
+        assert!(
+            differs,
+            "unison_width 1.0 with 3 unison voices should produce a genuinely different left and right signal"
+        );
     }
 
     #[test]
@@ -2694,11 +2984,11 @@ mod tests {
             let mut voice = Voice::default();
             voice.trigger(pitch_to_freq(69), 127, sample_rate, 1.0, &synth, None); // A4, ~440 Hz
             for _ in 0..1000 {
-                voice.next_sample(); // let the filter settle
+                voice.next_sample().0; // let the filter settle
             }
             let mut peak = 0.0f32;
             for _ in 0..200 {
-                peak = peak.max(voice.next_sample().abs());
+                peak = peak.max(voice.next_sample().0.abs());
             }
             peak
         };
@@ -2727,10 +3017,10 @@ mod tests {
             let mut voice = Voice::default();
             voice.trigger(pitch_to_freq(60), 127, 48_000.0, 1.0, &synth, None);
             for _ in 0..500 {
-                voice.next_sample(); // let the filter settle
+                voice.next_sample().0; // let the filter settle
             }
             for _ in 0..200 {
-                let s = voice.next_sample();
+                let s = voice.next_sample().0;
                 assert!(
                     (-2.0..=2.0).contains(&s),
                     "{filter_type:?} sample out of range after settling: {s}"
@@ -2752,12 +3042,12 @@ mod tests {
             let mut voice = Voice::default();
             voice.trigger(pitch_to_freq(45), 127, sample_rate, 1.0, &synth, None); // A2, ~110 Hz, well below cutoff
             for _ in 0..1000 {
-                voice.next_sample(); // let the filter settle
+                voice.next_sample().0; // let the filter settle
             }
             let n = 400;
             let sum_sq: f32 = (0..n)
                 .map(|_| {
-                    let s = voice.next_sample();
+                    let s = voice.next_sample().0;
                     s * s
                 })
                 .sum();
@@ -2788,14 +3078,14 @@ mod tests {
             let mut voice = Voice::default();
             voice.trigger(pitch_to_freq(69), 127, sample_rate, 1.0, &synth, None);
             for _ in 0..500 {
-                voice.next_sample(); // settle past attack/decay
+                voice.next_sample().0; // settle past attack/decay
             }
             let window = (sample_rate / 40.0) as usize; // 25ms, 4 windows per LFO cycle
             (0..8)
                 .map(|_| {
                     let mut peak = 0.0f32;
                     for _ in 0..window {
-                        peak = peak.max(voice.next_sample().abs());
+                        peak = peak.max(voice.next_sample().0.abs());
                     }
                     peak
                 })
@@ -2833,9 +3123,9 @@ mod tests {
             let mut voice = Voice::default();
             voice.trigger(pitch_to_freq(60), 127, sample_rate, 1.0, &synth, None);
             for _ in 0..500 {
-                voice.next_sample();
+                voice.next_sample().0;
             }
-            (0..400).map(|_| voice.next_sample()).collect()
+            (0..400).map(|_| voice.next_sample().0).collect()
         };
 
         let osc1_only = render(0.0);
@@ -2866,9 +3156,9 @@ mod tests {
             let mut voice = Voice::default();
             voice.trigger(pitch_to_freq(60), 127, sample_rate, 1.0, &synth, None);
             for _ in 0..500 {
-                voice.next_sample();
+                voice.next_sample().0;
             }
-            (0..400).map(|_| voice.next_sample()).collect()
+            (0..400).map(|_| voice.next_sample().0).collect()
         };
 
         let unsynced = render(false);
@@ -2896,12 +3186,12 @@ mod tests {
             let mut voice = Voice::default();
             voice.trigger(pitch_to_freq(69), 127, sample_rate, 1.0, &synth, None);
             for _ in 0..500 {
-                voice.next_sample();
+                voice.next_sample().0;
             }
             let n = 400;
             let sum_sq: f32 = (0..n)
                 .map(|_| {
-                    let s = voice.next_sample();
+                    let s = voice.next_sample().0;
                     s * s
                 })
                 .sum();
@@ -2946,7 +3236,7 @@ mod tests {
         voice.trigger(target_freq, 127, sample_rate, 1.0, &synth, Some(start_freq));
 
         let window = 2000; // ~42ms
-        let early: Vec<f32> = (0..window).map(|_| voice.next_sample()).collect();
+        let early: Vec<f32> = (0..window).map(|_| voice.next_sample().0).collect();
         let early_freq = rising_zero_crossing_freq(&early, sample_rate);
         assert!(
             (early_freq - start_freq).abs() < (target_freq - start_freq) * 0.5,
@@ -2957,9 +3247,9 @@ mod tests {
         // Run out the rest of the glide plus a settling margin, then sample a late window.
         let glide_samples = (glide_seconds * sample_rate) as usize;
         for _ in 0..(glide_samples - window + 500) {
-            voice.next_sample();
+            voice.next_sample().0;
         }
-        let late: Vec<f32> = (0..window).map(|_| voice.next_sample()).collect();
+        let late: Vec<f32> = (0..window).map(|_| voice.next_sample().0).collect();
         let late_freq = rising_zero_crossing_freq(&late, sample_rate);
         assert!(
             (late_freq - target_freq).abs() < target_freq * 0.05,
@@ -3188,17 +3478,25 @@ mod tests {
         };
 
         let mut sequencer = Sequencer::new(48_000.0);
-        let mut track_out = Vec::new();
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
         let mut metronome_out = Vec::new();
         // A few tick's worth of frames, enough for each track's note to trigger and decay somewhat.
-        sequencer.process(&song, 4096, &mut track_out, false, &mut metronome_out);
+        sequencer.process(
+            &song,
+            4096,
+            &mut track_out_l,
+            &mut track_out_r,
+            false,
+            &mut metronome_out,
+        );
 
         assert!(
-            track_out[0].iter().any(|&s| s != 0.0),
+            track_out_l[0].iter().any(|&s| s != 0.0),
             "track A's own region should sound"
         );
         assert!(
-            track_out[1].iter().any(|&s| s != 0.0),
+            track_out_l[1].iter().any(|&s| s != 0.0),
             "track B's own region should sound"
         );
     }
@@ -3279,7 +3577,7 @@ mod tests {
 
         let mut early_peak = 0.0f32;
         for _ in 0..200 {
-            early_peak = early_peak.max(voice.next_sample(&[]).abs());
+            early_peak = early_peak.max(voice.next_sample(&[]).0.abs());
         }
         assert!(
             early_peak > 0.05,
@@ -3287,16 +3585,50 @@ mod tests {
         );
 
         for _ in 0..(sample_rate as usize) {
-            voice.next_sample(&[]);
+            voice.next_sample(&[]).0;
         }
         assert!(
             !voice.active,
             "voice should have decayed to silence within 1 second"
         );
         assert_eq!(
-            voice.next_sample(&[]),
+            voice.next_sample(&[]).0,
             0.0,
             "an inactive voice must output silence"
+        );
+    }
+
+    #[test]
+    fn trine_analog_drift_zero_keeps_left_and_right_identical() {
+        let sample_rate = 48_000.0;
+        let mut voice = TrineVoice::default();
+        let trine = trine(|p| {
+            p.analog_drift = 0.0;
+            p.env3_decay_seconds = 1.0;
+        });
+        voice.trigger(pitch_to_freq(60), 100, sample_rate, 1.0, &trine);
+        for _ in 0..500 {
+            let (l, r) = voice.next_sample(&[]);
+            assert_eq!(l, r, "analog_drift 0.0 should keep every channel identical");
+        }
+    }
+
+    #[test]
+    fn trine_analog_drift_above_zero_spreads_left_and_right_apart() {
+        let sample_rate = 48_000.0;
+        let mut voice = TrineVoice::default();
+        let trine = trine(|p| {
+            p.analog_drift = 1.0;
+            p.env3_decay_seconds = 1.0;
+        });
+        voice.trigger(pitch_to_freq(60), 100, sample_rate, 1.0, &trine);
+        let differs = (0..2000).any(|_| {
+            let (l, r) = voice.next_sample(&[]);
+            (l - r).abs() > 1e-4
+        });
+        assert!(
+            differs,
+            "analog_drift 1.0 should eventually decorrelate left and right"
         );
     }
 
@@ -3310,7 +3642,7 @@ mod tests {
 
         let mut peak = 0.0f32;
         for _ in 0..1000 {
-            peak = peak.max(voice.next_sample(&[]).abs());
+            peak = peak.max(voice.next_sample(&[]).0.abs());
         }
         assert!(
             peak > 0.05,
@@ -3338,7 +3670,7 @@ mod tests {
                 });
                 voice.trigger(pitch_to_freq(60), 127, sample_rate, 1.0, &trine);
                 for _ in 0..sample_rate as usize {
-                    let s = voice.next_sample(&[]);
+                    let s = voice.next_sample(&[]).0;
                     assert!(
                         s.is_finite() && s.abs() < 10.0,
                         "routing {routing:?} slope {slope:?} produced an unbounded/non-finite sample: {s}"
@@ -3355,7 +3687,7 @@ mod tests {
         let trine = trine(|p| p.osc1_waveform = SynthWaveform::Noise);
         voice.trigger(pitch_to_freq(60), 127, sample_rate, 1.0, &trine);
         for _ in 0..sample_rate as usize {
-            let s = voice.next_sample(&[]);
+            let s = voice.next_sample(&[]).0;
             assert!(
                 s.is_finite() && s.abs() <= 1.5,
                 "noise oscillator sample out of range: {s}"
@@ -3376,7 +3708,7 @@ mod tests {
         let render = |mod_slots: &[ModSlot]| -> Vec<f32> {
             let mut voice = TrineVoice::default();
             voice.trigger(pitch_to_freq(48), 127, sample_rate, 1.0, &trine);
-            (0..2000).map(|_| voice.next_sample(mod_slots)).collect()
+            (0..2000).map(|_| voice.next_sample(mod_slots).0).collect()
         };
 
         let unrouted = render(&[]);
@@ -3428,7 +3760,7 @@ mod tests {
 
         let mut early_peak = 0.0f32;
         for _ in 0..200 {
-            early_peak = early_peak.max(voice.next_sample(&[]).abs());
+            early_peak = early_peak.max(voice.next_sample(&[]).0.abs());
         }
         assert!(
             early_peak > 0.05,
@@ -3436,16 +3768,52 @@ mod tests {
         );
 
         for _ in 0..(sample_rate as usize) {
-            voice.next_sample(&[]);
+            voice.next_sample(&[]).0;
         }
         assert!(
             !voice.active,
             "voice should have decayed to silence within 1 second"
         );
         assert_eq!(
-            voice.next_sample(&[]),
+            voice.next_sample(&[]).0,
             0.0,
             "an inactive voice must output silence"
+        );
+    }
+
+    #[test]
+    fn wave_unison_width_zero_keeps_left_and_right_identical() {
+        let sample_rate = 48_000.0;
+        let mut voice = WaveVoice::default();
+        let wave = wave(|p| {
+            p.unison_voices = 3;
+            p.unison_detune_cents = 15.0;
+            p.unison_width = 0.0;
+        });
+        voice.trigger(pitch_to_freq(60), 100, sample_rate, 1.0, &wave);
+        for _ in 0..200 {
+            let (l, r) = voice.next_sample(&[]);
+            assert_eq!(l, r, "unison_width 0.0 should keep every channel identical");
+        }
+    }
+
+    #[test]
+    fn wave_unison_width_above_zero_spreads_left_and_right_apart() {
+        let sample_rate = 48_000.0;
+        let mut voice = WaveVoice::default();
+        let wave = wave(|p| {
+            p.unison_voices = 3;
+            p.unison_detune_cents = 15.0;
+            p.unison_width = 1.0;
+        });
+        voice.trigger(pitch_to_freq(60), 100, sample_rate, 1.0, &wave);
+        let differs = (0..200).any(|_| {
+            let (l, r) = voice.next_sample(&[]);
+            (l - r).abs() > 1e-4
+        });
+        assert!(
+            differs,
+            "unison_width 1.0 with 3 unison voices should produce a genuinely different left and right signal"
         );
     }
 
@@ -3460,7 +3828,7 @@ mod tests {
 
         let mut peak = 0.0f32;
         for _ in 0..1000 {
-            peak = peak.max(voice.next_sample(&[]).abs());
+            peak = peak.max(voice.next_sample(&[]).0.abs());
         }
         assert!(
             peak > 0.05,
@@ -3489,7 +3857,7 @@ mod tests {
                 });
                 voice.trigger(pitch_to_freq(60), 127, sample_rate, 1.0, &wave);
                 for _ in 0..sample_rate as usize {
-                    let s = voice.next_sample(&[]);
+                    let s = voice.next_sample(&[]).0;
                     assert!(
                         s.is_finite() && s.abs() < 10.0,
                         "routing {routing:?} slope {slope:?} produced an unbounded/non-finite sample: {s}"
@@ -3522,7 +3890,7 @@ mod tests {
                 });
                 voice.trigger(pitch_to_freq(72), 127, sample_rate, 1.0, &wave);
                 for _ in 0..1000 {
-                    let s = voice.next_sample(&[]);
+                    let s = voice.next_sample(&[]).0;
                     assert!(
                         s.is_finite() && s.abs() < 10.0,
                         "table {table:?} warp {warp_mode:?} produced an unbounded/non-finite sample: {s}"
@@ -3544,7 +3912,7 @@ mod tests {
         let render = |mod_slots: &[WaveModSlot]| -> Vec<f32> {
             let mut voice = WaveVoice::default();
             voice.trigger(pitch_to_freq(48), 127, sample_rate, 1.0, &wave);
-            (0..2000).map(|_| voice.next_sample(mod_slots)).collect()
+            (0..2000).map(|_| voice.next_sample(mod_slots).0).collect()
         };
 
         let unrouted = render(&[]);

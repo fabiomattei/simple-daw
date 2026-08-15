@@ -2021,6 +2021,11 @@ fn synth_oscillators_ui(ui: &mut egui::Ui, synth: &mut SynthParams) {
             .text("Detune")
             .suffix(" cents"),
     );
+    ui.add_enabled(
+        synth.unison_voices > 1,
+        egui::Slider::new(&mut synth.unison_width, 0.0..=1.0).text("Width"),
+    )
+    .on_hover_text("Spreads unison voices across the stereo field. 0 keeps them centered.");
     oscillator_preview_ui(ui, synth);
 
     ui.separator();
@@ -3200,6 +3205,11 @@ fn wave_oscillators_ui(ui: &mut egui::Ui, wave: &mut WaveParams) {
             .text("Unison detune")
             .suffix(" cents"),
     );
+    ui.add_enabled(
+        wave.unison_voices > 1,
+        egui::Slider::new(&mut wave.unison_width, 0.0..=1.0).text("Unison width"),
+    )
+    .on_hover_text("Spreads unison voices across the stereo field. 0 keeps them centered.");
 
     ui.separator();
     ui.strong("Oscillator 2");

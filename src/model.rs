@@ -178,6 +178,11 @@ pub struct SynthParams {
     /// spread symmetrically around the true pitch by `unison_detune_cents`.
     pub unison_voices: u8,
     pub unison_detune_cents: f32,
+    /// How far unison voices spread across the stereo field, 0.0..1.0. 0.0 (default) keeps every
+    /// unison voice centered — identical to this engine's pre-stereo behavior, so existing songs
+    /// sound unchanged until this is raised. Only affects sound when `unison_voices > 1`; see
+    /// `audio::Voice::next_sample`.
+    pub unison_width: f32,
 
     pub attack_seconds: f32,
     pub decay_seconds: f32,
@@ -235,6 +240,7 @@ impl Default for SynthParams {
             pulse_width: 0.5,
             unison_voices: 1,
             unison_detune_cents: 12.0,
+            unison_width: 0.0,
             attack_seconds: 0.0,
             decay_seconds: 0.25,
             sustain_level: 0.0,
@@ -568,6 +574,8 @@ pub struct WaveParams {
     /// mechanism as `SynthParams::unison_voices`, applied to Oscillator 1 only.
     pub unison_voices: u8,
     pub unison_detune_cents: f32,
+    /// Same mechanism as `SynthParams::unison_width` — see that field's doc comment.
+    pub unison_width: f32,
 
     /// A sine sub-oscillator mixed in additively (not crossfaded), for extra low-end weight.
     pub sub_osc_level: f32,
@@ -634,6 +642,7 @@ impl Default for WaveParams {
             osc2_level: 0.0,
             unison_voices: 1,
             unison_detune_cents: 12.0,
+            unison_width: 0.0,
             sub_osc_level: 0.0,
             sub_osc_semitones: -12,
             noise_level: 0.0,
@@ -2374,6 +2383,7 @@ mod tests {
             pulse_width: 0.3,
             unison_voices: 3,
             unison_detune_cents: 25.0,
+            unison_width: 0.6,
             attack_seconds: 0.2,
             decay_seconds: 0.6,
             sustain_level: 0.4,
