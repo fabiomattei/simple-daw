@@ -4,6 +4,7 @@ mod builtin_fx;
 mod factory_presets;
 #[cfg(unix)]
 mod mcp_control;
+mod metering;
 mod midi_import;
 mod model;
 mod plugin_host;
@@ -19,6 +20,7 @@ use audio::{AudioEngine, Transport};
 use builtin_fx::BuiltInEffect;
 use clack_host::prelude::PluginInstance;
 use factory_presets::factory_presets;
+use metering::{MeterHandles, MeterReadings};
 use model::{
     AudioClip, EqBandType, FilterMode, FilterRouting, FilterSlope, FilterType, Lane,
     LfoTarget, ModSlot, ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, Song,
@@ -434,6 +436,13 @@ struct SimpleDawApp {
     track_effect_guis: Vec<Vec<Option<PluginGuiHandle>>>,
     track_effect_paths: Vec<Vec<String>>,
     track_effect_messages: Vec<Vec<Option<(bool, String)>>>,
+    /// Live peak/RMS/LUFS readings published by the audio thread — one entry per track, kept in
+    /// sync with `song.tracks` via `resize_track_meters`/`remove_track_meter` the same way
+    /// `track_effect_slots` is kept in sync via `resize_track_effects`/`remove_track_effects`. The
+    /// master bus's own meter (`master_meter`) is the same type pinned to a single row, mirroring
+    /// `master_effect_slots`/`MasterEffectSlots`.
+    track_meters: MeterHandles,
+    master_meter: MeterHandles,
     /// Which effect's parameter-editor window (if any) is currently open.
     effect_editor: Option<EffectEditorTarget>,
     /// Index of the track whose synth-settings window (waveform/attack/decay) is currently open,
@@ -554,11 +563,15 @@ impl SimpleDawApp {
         let master_effect_slots = plugin_host::new_master_effect_slots();
         let track_count = song.lock().unwrap().tracks.len();
         let track_effect_slots = plugin_host::new_track_effect_slots(track_count);
+        let track_meters = metering::new_track_meter_handles(track_count);
+        let master_meter = metering::new_master_meter_handles();
         let engine = AudioEngine::start(
             song.clone(),
             transport.clone(),
             master_effect_slots.clone(),
             track_effect_slots.clone(),
+            track_meters.clone(),
+            master_meter.clone(),
             None,
             None,
         );
@@ -618,6 +631,8 @@ impl SimpleDawApp {
             track_effect_guis: (0..track_count).map(|_| Vec::new()).collect(),
             track_effect_paths: (0..track_count).map(|_| Vec::new()).collect(),
             track_effect_messages: (0..track_count).map(|_| Vec::new()).collect(),
+            track_meters,
+            master_meter,
             effect_editor: None,
             synth_editor: None,
             lane_synth_editor: None,
@@ -667,6 +682,7 @@ struct ChannelRackUi<'a> {
     track_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
     track_effect_paths: &'a mut Vec<Vec<String>>,
     track_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
+    track_meters: &'a MeterHandles,
     effect_editor: &'a mut Option<EffectEditorTarget>,
     synth_editor: &'a mut Option<usize>,
     /// The record-armed `Audio`-kind track (if any) and its chosen input device — see
@@ -701,6 +717,7 @@ fn channel_rack_contents_ui(
                     rack.track_effect_messages,
                     song.tracks.len(),
                 );
+                resize_track_meters(rack.track_meters, song.tracks.len());
                 ui.close();
             }
             if ui.button("Step Grid Track").clicked() {
@@ -715,6 +732,7 @@ fn channel_rack_contents_ui(
                     rack.track_effect_messages,
                     song.tracks.len(),
                 );
+                resize_track_meters(rack.track_meters, song.tracks.len());
                 ui.close();
             }
             if ui.button("Audio Track").clicked() {
@@ -730,6 +748,7 @@ fn channel_rack_contents_ui(
                     rack.track_effect_messages,
                     song.tracks.len(),
                 );
+                resize_track_meters(rack.track_meters, song.tracks.len());
                 ui.close();
             }
         });
@@ -791,12 +810,14 @@ struct MixerUi<'a> {
     track_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
     track_effect_paths: &'a mut Vec<Vec<String>>,
     track_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
+    track_meters: &'a MeterHandles,
     effect_editor: &'a mut Option<EffectEditorTarget>,
     master_effect_paths: &'a mut Vec<String>,
     master_effect_slots: MasterEffectSlots,
     master_effect_instances: &'a mut Vec<Option<PluginInstance<DawHost>>>,
     master_effect_guis: &'a mut Vec<Option<PluginGuiHandle>>,
     master_effect_messages: &'a mut Vec<Option<(bool, String)>>,
+    master_meter: &'a MeterHandles,
 }
 
 /// The Mixer's heading/Detach toggle plus one classic vertical channel strip per track, ending in
@@ -845,7 +866,13 @@ fn mixer_contents_ui(
                     synth_editor: &mut unused_synth_editor,
                     remove_requested: &mut unused_remove_requested,
                 };
-                mixer_channel_strip_ui(ui, track, track_index, &mut fx);
+                let meter = mixer
+                    .track_meters
+                    .lock()
+                    .ok()
+                    .and_then(|handles| handles.get(track_index).map(|m| m.snapshot()))
+                    .unwrap_or_default();
+                mixer_channel_strip_ui(ui, track, track_index, &mut fx, meter);
             }
 
             let mut unused_synth_editor: Option<usize> = None;
@@ -864,22 +891,99 @@ fn mixer_contents_ui(
                 synth_editor: &mut unused_synth_editor,
                 remove_requested: &mut unused_remove_requested,
             };
-            mixer_master_strip_ui(ui, &mut master_fx);
+            let master_meter = mixer
+                .master_meter
+                .lock()
+                .ok()
+                .and_then(|handles| handles.first().map(|m| m.snapshot()))
+                .unwrap_or_default();
+            mixer_master_strip_ui(ui, &mut master_fx, master_meter);
         });
     });
 }
 
+/// Floor of the peak/RMS bar meters' dB scale — anything quieter than this reads as an empty bar.
+const METER_MIN_DB: f32 = -60.0;
+/// Bar meter width/height for one channel (L or R) — see `peak_rms_bar_meter_ui`.
+const METER_BAR_SIZE: egui::Vec2 = egui::vec2(6.0, 140.0);
+
+/// Maps a linear amplitude to a 0.0..1.0 bar-fill fraction on `METER_MIN_DB..0dB`.
+fn meter_amplitude_to_unit(amplitude: f32) -> f32 {
+    if amplitude <= 0.0 {
+        0.0
+    } else {
+        ((20.0 * amplitude.log10() - METER_MIN_DB) / -METER_MIN_DB).clamp(0.0, 1.0)
+    }
+}
+
+/// Green under -6dB-ish, yellow approaching 0dB, red once a channel is effectively clipping —
+/// the same traffic-light convention as this app's `FL_ACCENT_*` palette elsewhere.
+fn meter_zone_color(unit: f32) -> egui::Color32 {
+    if unit > 0.95 {
+        egui::Color32::RED
+    } else if unit > 0.8 {
+        FL_ACCENT_YELLOW
+    } else {
+        FL_ACCENT_GREEN
+    }
+}
+
+/// A small vertical L/R peak+RMS bar meter: each channel's RMS level fills the bar (colored by
+/// how close to 0dB it is), with a bright peak-hold cap line drawn on top — the same
+/// `rect_filled`-on-`allocate_exact_size` custom-widget idiom the recording-level meter uses.
+fn peak_rms_bar_meter_ui(ui: &mut egui::Ui, readings: MeterReadings) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (peak, rms) in [(readings.peak_l, readings.rms_l), (readings.peak_r, readings.rms_r)] {
+            let (rect, _) = ui.allocate_exact_size(METER_BAR_SIZE, egui::Sense::hover());
+            ui.painter().rect_filled(rect, 1.0, ui.visuals().extreme_bg_color);
+
+            let rms_unit = meter_amplitude_to_unit(rms);
+            if rms_unit > 0.0 {
+                let mut fill_rect = rect;
+                fill_rect.set_top(rect.bottom() - rect.height() * rms_unit);
+                ui.painter().rect_filled(fill_rect, 1.0, meter_zone_color(rms_unit));
+            }
+
+            let peak_unit = meter_amplitude_to_unit(peak);
+            let peak_y = rect.bottom() - rect.height() * peak_unit;
+            let cap = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), (peak_y - 1.0).max(rect.top())),
+                egui::pos2(rect.right(), peak_y + 1.0),
+            );
+            ui.painter().rect_filled(cap, 0.0, egui::Color32::WHITE);
+        }
+    });
+}
+
+/// "-14.2" for a normal reading, or an em dash once a channel is at/below the meter's silence
+/// floor (no signal yet, or gated out of the integrated-loudness average).
+fn format_lufs(value: f32) -> String {
+    if value <= metering::SILENCE_LUFS {
+        "\u{2014}".to_string()
+    } else {
+        format!("{value:.1}")
+    }
+}
+
 /// One track's classic vertical channel strip in the Mixer: name, an "FX" menu (the same
-/// `fx_chain_ui` the Channel Rack's "FX" button opens), a pan slider, Mute/Solo buttons, and a
-/// tall vertical volume fader — see `mixer_contents_ui`.
-fn mixer_channel_strip_ui(ui: &mut egui::Ui, track: &mut Track, track_index: usize, fx: &mut TrackFxUi) {
+/// `fx_chain_ui` the Channel Rack's "FX" button opens), a pan slider, Mute/Solo buttons, a peak/RMS
+/// bar meter beside a tall vertical volume fader, and an integrated-LUFS readout (momentary/
+/// short-term available via tooltip) — see `mixer_contents_ui`.
+fn mixer_channel_strip_ui(
+    ui: &mut egui::Ui,
+    track: &mut Track,
+    track_index: usize,
+    fx: &mut TrackFxUi,
+    meter: MeterReadings,
+) {
     let color = track_color(track_index);
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(40, 40, 40))
         .corner_radius(3.0)
         .inner_margin(egui::Margin::same(4))
         .show(ui, |ui| {
-            ui.set_width(70.0);
+            ui.set_width(92.0);
             ui.vertical_centered(|ui| {
                 let (swatch_rect, _) =
                     ui.allocate_exact_size(egui::vec2(58.0, 4.0), egui::Sense::hover());
@@ -935,33 +1039,51 @@ fn mixer_channel_strip_ui(ui: &mut egui::Ui, track: &mut Track, track_index: usi
                 });
 
                 ui.add_space(4.0);
-                ui.add_sized(
-                    [28.0, 140.0],
-                    egui::Slider::new(&mut track.volume, 0.0..=1.5)
-                        .vertical()
-                        .show_value(false),
-                )
-                .on_hover_text(format!("Volume: {:.2}", track.volume));
+                ui.horizontal(|ui| {
+                    peak_rms_bar_meter_ui(ui, meter);
+                    ui.add_sized(
+                        [28.0, METER_BAR_SIZE.y],
+                        egui::Slider::new(&mut track.volume, 0.0..=1.5)
+                            .vertical()
+                            .show_value(false),
+                    )
+                    .on_hover_text(format!("Volume: {:.2}", track.volume));
+                });
                 ui.label(egui::RichText::new(format!("{:.2}", track.volume)).small());
+                ui.label(egui::RichText::new(format!("{} LUFS", format_lufs(meter.lufs_integrated))).small())
+                    .on_hover_text(format!(
+                        "Momentary: {} LUFS\nShort-term: {} LUFS\nIntegrated: {} LUFS",
+                        format_lufs(meter.lufs_momentary),
+                        format_lufs(meter.lufs_short_term),
+                        format_lufs(meter.lufs_integrated),
+                    ));
             });
         });
 }
 
-/// The Mixer's Master strip: just a label and the master bus's own "FX" menu (the same chain the
-/// "Plugins" window's "Master bus FX chain" section edits) — there's no `Song::master_volume`/pan/
-/// mute/solo field to put a fader or M/S buttons on, unlike a real track's strip.
-fn mixer_master_strip_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
+/// The Mixer's Master strip: a label, the master bus's own "FX" menu (the same chain the
+/// "Plugins" window's "Master bus FX chain" section edits), a peak/RMS bar meter, and all three
+/// LUFS readings stacked (there's no `Song::master_volume`/pan/mute/solo field to put a fader or
+/// M/S buttons on, unlike a real track's strip, so there's headroom for the full loudness readout
+/// here rather than the per-track strip's tooltip-only momentary/short-term).
+fn mixer_master_strip_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi, meter: MeterReadings) {
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(50, 46, 30))
         .corner_radius(3.0)
         .inner_margin(egui::Margin::same(4))
         .show(ui, |ui| {
-            ui.set_width(70.0);
+            ui.set_width(92.0);
             ui.vertical_centered(|ui| {
                 ui.strong("Master");
                 ui.menu_button("FX", |ui| {
                     fx_chain_ui(ui, fx);
                 });
+                ui.add_space(4.0);
+                peak_rms_bar_meter_ui(ui, meter);
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(format!("M {}", format_lufs(meter.lufs_momentary))).small());
+                ui.label(egui::RichText::new(format!("S {}", format_lufs(meter.lufs_short_term))).small());
+                ui.label(egui::RichText::new(format!("I {}", format_lufs(meter.lufs_integrated))).small());
             });
         });
 }
@@ -1125,6 +1247,25 @@ fn remove_track_effects(
     }
 }
 
+/// Resizes a per-track `MeterHandles` (see `metering`'s module doc) to `track_count` entries,
+/// mirroring `resize_track_effects` — called at the same sites, right alongside it, whenever
+/// `song.tracks` grows.
+fn resize_track_meters(meters: &MeterHandles, track_count: usize) {
+    if let Ok(mut guard) = meters.lock() {
+        guard.resize_with(track_count, || Arc::new(metering::ChannelMeterAtomics::new()));
+    }
+}
+
+/// Removes the meter entry at `index`, mirroring `remove_track_effects` — called alongside it
+/// whenever a track is deleted from the middle of `song.tracks`.
+fn remove_track_meter(meters: &MeterHandles, index: usize) {
+    if let Ok(mut guard) = meters.lock()
+        && index < guard.len()
+    {
+        guard.remove(index);
+    }
+}
+
 /// Bundles the pieces of `SimpleDawApp` an MCP command handler needs, mirroring `ChannelRackUi`'s
 /// "disjoint field borrows" pattern (see above) — `song` in `apply_mcp_command` is borrowed
 /// straight from `self.song.lock()`, not through `self`, so a real `&mut self` method can't be
@@ -1145,6 +1286,7 @@ struct McpContext<'a> {
     track_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
     track_effect_paths: &'a mut Vec<Vec<String>>,
     track_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
+    track_meters: &'a MeterHandles,
 }
 
 #[cfg(unix)]
@@ -1376,6 +1518,7 @@ fn apply_mcp_command(
                 ctx.track_effect_messages,
                 song.tracks.len(),
             );
+            resize_track_meters(ctx.track_meters, song.tracks.len());
             Ok(json!({ "index": index }))
         }
         "remove_track" => {
@@ -1396,6 +1539,7 @@ fn apply_mcp_command(
                 ctx.track_effect_messages,
                 p.track,
             );
+            remove_track_meter(ctx.track_meters, p.track);
             Ok(json!({}))
         }
         "set_track_volume" => {
@@ -1587,6 +1731,7 @@ fn apply_mcp_command(
                 ctx.track_effect_messages,
                 track_count,
             );
+            resize_track_meters(ctx.track_meters, track_count);
             apply_loaded_effects(
                 ctx.master_effect_paths,
                 ctx.master_effect_instances,
@@ -4367,6 +4512,7 @@ impl eframe::App for SimpleDawApp {
                     track_effect_guis: &mut self.track_effect_guis,
                     track_effect_paths: &mut self.track_effect_paths,
                     track_effect_messages: &mut self.track_effect_messages,
+                    track_meters: &self.track_meters,
                 };
                 let result = apply_mcp_command(&req.cmd, req.params, song, &mut mcp_ctx);
                 let _ = req.reply.send(result);
@@ -4428,6 +4574,7 @@ impl eframe::App for SimpleDawApp {
                                             &mut self.track_effect_messages,
                                             track_count,
                                         );
+                                        resize_track_meters(&self.track_meters, track_count);
                                         let engine_config = self.engine.as_ref().ok().map(|e| {
                                             (
                                                 e.status.sample_rate as f64,
@@ -4740,6 +4887,8 @@ impl eframe::App for SimpleDawApp {
                                     self.transport.clone(),
                                     self.master_effect_slots.clone(),
                                     self.track_effect_slots.clone(),
+                                    self.track_meters.clone(),
+                                    self.master_meter.clone(),
                                     self.selected_output_device.as_deref(),
                                     self.selected_output_sample_rate,
                                 ) {
@@ -4936,6 +5085,7 @@ impl eframe::App for SimpleDawApp {
                                         &mut self.track_effect_messages,
                                         song.tracks.len(),
                                     );
+                                    resize_track_meters(&self.track_meters, song.tracks.len());
                                     let mut message = format!(
                                         "Imported {added} track(s) from {}",
                                         self.import_midi_path.trim()
@@ -5386,6 +5536,7 @@ impl eframe::App for SimpleDawApp {
             track_effect_guis: &mut self.track_effect_guis,
             track_effect_paths: &mut self.track_effect_paths,
             track_effect_messages: &mut self.track_effect_messages,
+            track_meters: &self.track_meters,
             effect_editor: &mut self.effect_editor,
             synth_editor: &mut self.synth_editor,
             record_armed_track: &mut self.record_armed_track,
@@ -5454,6 +5605,7 @@ impl eframe::App for SimpleDawApp {
                 &mut self.track_effect_messages,
                 index,
             );
+            remove_track_meter(&self.track_meters, index);
             // The removed track shifts every later index down by one; if it was the selected
             // one, fall back to the next available piano-roll track (or none).
             self.selected_track = match self.selected_track {
@@ -5494,12 +5646,14 @@ impl eframe::App for SimpleDawApp {
                 track_effect_guis: &mut self.track_effect_guis,
                 track_effect_paths: &mut self.track_effect_paths,
                 track_effect_messages: &mut self.track_effect_messages,
+                track_meters: &self.track_meters,
                 effect_editor: &mut self.effect_editor,
                 master_effect_paths: &mut self.master_effect_paths,
                 master_effect_slots: self.master_effect_slots.clone(),
                 master_effect_instances: &mut self.master_effect_instances,
                 master_effect_guis: &mut self.master_effect_guis,
                 master_effect_messages: &mut self.master_effect_messages,
+                master_meter: &self.master_meter,
             };
 
             if mixer_already_detached {

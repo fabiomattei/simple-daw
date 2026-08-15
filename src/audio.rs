@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 
+use crate::metering::{LoudnessMeter, MeterHandles};
 use crate::model::{
     FilterRouting, FilterSlope, FilterType, LfoTarget, ModSlot, ModSource, ModTarget,
     RegionContent, Song, SynthEngine, SynthParams, SynthWaveform, TICKS_PER_STEP, Track,
@@ -173,6 +174,8 @@ impl AudioEngine {
         transport: Transport,
         master_effects: MasterEffectSlots,
         track_effects: TrackEffectSlots,
+        track_meters: MeterHandles,
+        master_meter: MeterHandles,
         device_name: Option<&str>,
         sample_rate: Option<u32>,
     ) -> Result<Self> {
@@ -228,6 +231,8 @@ impl AudioEngine {
                 transport,
                 master_effects,
                 track_effects,
+                track_meters,
+                master_meter,
                 max_frames as usize,
             )?,
             SampleFormat::I16 => build_playback_stream::<i16>(
@@ -237,6 +242,8 @@ impl AudioEngine {
                 transport,
                 master_effects,
                 track_effects,
+                track_meters,
+                master_meter,
                 max_frames as usize,
             )?,
             SampleFormat::U16 => build_playback_stream::<u16>(
@@ -246,6 +253,8 @@ impl AudioEngine {
                 transport,
                 master_effects,
                 track_effects,
+                track_meters,
+                master_meter,
                 max_frames as usize,
             )?,
             other => bail!("unsupported output sample format: {other:?}"),
@@ -2380,6 +2389,8 @@ fn build_playback_stream<T>(
     transport: Transport,
     master_effects: MasterEffectSlots,
     track_effects: TrackEffectSlots,
+    track_meters: MeterHandles,
+    master_meter: MeterHandles,
     max_frames: usize,
 ) -> Result<Stream>
 where
@@ -2395,6 +2406,14 @@ where
     let mut track_dry_r: Vec<Vec<f32>> = Vec::new();
     let mut metronome_dry: Vec<f32> = Vec::with_capacity(max_frames);
 
+    // One `LoudnessMeter` per track (post-fader/pan, resized in lockstep with `track_dry_l`
+    // below) plus one for the master bus (post-master-FX) — audio-thread-owned real-time state,
+    // published each buffer into `track_meters`/`master_meter` for the UI thread to poll (see
+    // `metering`'s module doc).
+    let mut track_loudness: Vec<LoudnessMeter> = Vec::new();
+    let mut master_loudness = LoudnessMeter::new(sample_rate);
+    let mut was_playing = false;
+
     // Per-track CLAP insert-effect-chain scratch (one `Vec<EffectScratch>` per track index, grown
     // lazily to match that track's chain length) and a pair of reusable stereo buffers plus the
     // chain's own in-flight stereo scratch for whichever track is currently being processed.
@@ -2403,6 +2422,10 @@ where
     let mut track_effect_out_r: Vec<f32> = Vec::with_capacity(max_frames);
     let mut track_chain_run_l: Vec<f32> = Vec::with_capacity(max_frames);
     let mut track_chain_run_r: Vec<f32> = Vec::with_capacity(max_frames);
+    // Reused scratch for whichever track's post-fader/pan signal is currently being fed to its
+    // `LoudnessMeter` (see below) — not summed anywhere itself, just a metering tap.
+    let mut track_meter_l: Vec<f32> = Vec::with_capacity(max_frames);
+    let mut track_meter_r: Vec<f32> = Vec::with_capacity(max_frames);
 
     // Scratch for the master bus's own effect chain — same shape as `track_scratch`'s per-track
     // entries (one `EffectScratch` per chain slot), since the master chain runs through the exact
@@ -2461,6 +2484,19 @@ where
             scratch_l.iter_mut().for_each(|s| *s = 0.0);
             scratch_r.iter_mut().for_each(|s| *s = 0.0);
 
+            // Integrated LUFS measures "since the last time playback started" (see
+            // `LoudnessMeter::reset`'s doc comment) — reset every meter exactly on the
+            // playing-to-stopped edge, the same transition that resets the sequencer's position
+            // below, rather than continuing to accumulate through a stop.
+            let is_playing = transport.is_playing();
+            if was_playing && !is_playing {
+                master_loudness.reset();
+                for meter in track_loudness.iter_mut() {
+                    meter.reset();
+                }
+            }
+            was_playing = is_playing;
+
             // Note: even when stopped, silence still runs through the master
             // effect below rather than short-circuiting straight to the
             // device — otherwise a delay/reverb tail would cut off instantly
@@ -2468,7 +2504,7 @@ where
             // (Per-track effects don't get this treatment: while stopped, no
             // track has anything playing through them, so there's no tail to
             // preserve there — only the master bus stays fed with silence.)
-            if transport.is_playing() {
+            if is_playing {
                 // Snapshot the song once per callback (not per sample) so the real-time thread
                 // only briefly touches the shared lock. Uses `try_lock`, not `lock`, and falls
                 // back to the previous snapshot on contention: the UI thread holds this same
@@ -2494,13 +2530,26 @@ where
                     .current_tick
                     .store(sequencer.current_tick(), Ordering::Relaxed);
 
+                // Track count can change between callbacks (tracks added/removed) — resize in
+                // lockstep with `track_dry_l`, same as `sequencer.track_voices` above.
+                while track_loudness.len() < track_dry_l.len() {
+                    track_loudness.push(LoudnessMeter::new(sample_rate));
+                }
+                track_loudness.truncate(track_dry_l.len());
+                let published_track_meters = track_meters.lock().ok();
+
                 // Run each track's dry mix through its own CLAP/built-in insert effect chain (if
                 // any are loaded there — the chain now carries real stereo between stages, see
                 // `plugin_host::process_effect_chain`), apply that track's volume and pan (as an
                 // equal-power gain split, the same point a channel strip's pan pot sits after its
-                // inserts), then sum every track into the master bus.
+                // inserts), then sum every track into the master bus. The same post-fader/pan
+                // samples feed that track's `LoudnessMeter` — the natural tap point for a channel
+                // strip's meter, distinct from both the raw synthesis (`track_dry_l/r`) and the
+                // final master mix.
                 track_effect_out_l.resize(frames, 0.0);
                 track_effect_out_r.resize(frames, 0.0);
+                track_meter_l.resize(frames, 0.0);
+                track_meter_r.resize(frames, 0.0);
                 if let Ok(mut chains) = track_effects.lock() {
                     while track_scratch.len() < track_dry_l.len() {
                         track_scratch.push(Vec::new());
@@ -2530,14 +2579,28 @@ where
                         );
                         if used {
                             for i in 0..frames {
-                                scratch_l[i] += volume * pan_l * track_effect_out_l[i];
-                                scratch_r[i] += volume * pan_r * track_effect_out_r[i];
+                                let l = volume * pan_l * track_effect_out_l[i];
+                                let r = volume * pan_r * track_effect_out_r[i];
+                                scratch_l[i] += l;
+                                scratch_r[i] += r;
+                                track_meter_l[i] = l;
+                                track_meter_r[i] = r;
                             }
                         } else {
                             for i in 0..frames {
-                                scratch_l[i] += volume * pan_l * dry_l[i];
-                                scratch_r[i] += volume * pan_r * dry_r[i];
+                                let l = volume * pan_l * dry_l[i];
+                                let r = volume * pan_r * dry_r[i];
+                                scratch_l[i] += l;
+                                scratch_r[i] += r;
+                                track_meter_l[i] = l;
+                                track_meter_r[i] = r;
                             }
+                        }
+                        let readings = track_loudness[track_index].process(&track_meter_l, &track_meter_r);
+                        if let Some(handle) =
+                            published_track_meters.as_ref().and_then(|h| h.get(track_index))
+                        {
+                            handle.publish(&readings);
                         }
                     }
                 } else {
@@ -2548,8 +2611,18 @@ where
                         let volume = track.map_or(1.0, |t| t.volume);
                         let (pan_l, pan_r) = equal_power_pan_gains(track.map_or(0.0, |t| t.pan));
                         for i in 0..frames {
-                            scratch_l[i] += volume * pan_l * dry_l[i];
-                            scratch_r[i] += volume * pan_r * dry_r[i];
+                            let l = volume * pan_l * dry_l[i];
+                            let r = volume * pan_r * dry_r[i];
+                            scratch_l[i] += l;
+                            scratch_r[i] += r;
+                            track_meter_l[i] = l;
+                            track_meter_r[i] = r;
+                        }
+                        let readings = track_loudness[track_index].process(&track_meter_l, &track_meter_r);
+                        if let Some(handle) =
+                            published_track_meters.as_ref().and_then(|h| h.get(track_index))
+                        {
+                            handle.publish(&readings);
                         }
                     }
                 }
@@ -2602,6 +2675,13 @@ where
             } else {
                 (&scratch_l, &scratch_r)
             };
+
+            let master_readings = master_loudness.process(left, right);
+            if let Ok(handles) = master_meter.lock()
+                && let Some(handle) = handles.first()
+            {
+                handle.publish(&master_readings);
+            }
 
             for (i, frame) in data.chunks_mut(channels).enumerate() {
                 frame[0] = T::from_sample(left[i]);
