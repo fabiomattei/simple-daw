@@ -21,6 +21,7 @@ mod delay;
 mod distortion;
 mod filter;
 mod flanger;
+mod limiter;
 mod noise_gate;
 mod phase_invert;
 mod phaser;
@@ -40,6 +41,7 @@ pub(crate) use delay::DelayEffect;
 pub(crate) use distortion::DistortionEffect;
 pub(crate) use filter::FilterEffect;
 pub(crate) use flanger::FlangerEffect;
+pub(crate) use limiter::LimiterEffect;
 pub(crate) use noise_gate::NoiseGateEffect;
 pub(crate) use phase_invert::PhaseInvertEffect;
 pub(crate) use phaser::PhaserEffect;
@@ -66,6 +68,7 @@ pub enum BuiltInEffect {
     NoiseGate(NoiseGateEffect),
     PhaseInvert(PhaseInvertEffect),
     ChannelEq(ChannelEqEffect),
+    Limiter(LimiterEffect),
 }
 
 impl BuiltInEffect {
@@ -172,6 +175,16 @@ impl BuiltInEffect {
             TrackEffectConfig::ChannelEq { bands } => {
                 BuiltInEffect::ChannelEq(ChannelEqEffect::new(bands.clone(), sample_rate))
             }
+            TrackEffectConfig::Limiter {
+                input_gain_db,
+                ceiling_db,
+                release_ms,
+            } => BuiltInEffect::Limiter(LimiterEffect::new(
+                *input_gain_db,
+                *ceiling_db,
+                *release_ms,
+                sample_rate,
+            )),
             TrackEffectConfig::Clap { .. } => return None,
         })
     }
@@ -251,6 +264,11 @@ impl BuiltInEffect {
             BuiltInEffect::ChannelEq(e) => TrackEffectConfig::ChannelEq {
                 bands: e.bands.clone(),
             },
+            BuiltInEffect::Limiter(e) => TrackEffectConfig::Limiter {
+                input_gain_db: e.input_gain_db,
+                ceiling_db: e.ceiling_db,
+                release_ms: e.release_ms,
+            },
         }
     }
 
@@ -271,6 +289,7 @@ impl BuiltInEffect {
             BuiltInEffect::NoiseGate(_) => "Noise Gate",
             BuiltInEffect::PhaseInvert(_) => "Phase Invert",
             BuiltInEffect::ChannelEq(_) => "Channel EQ",
+            BuiltInEffect::Limiter(_) => "Limiter",
         }
     }
 
@@ -293,6 +312,7 @@ impl BuiltInEffect {
             BuiltInEffect::NoiseGate(e) => e.process(l, r),
             BuiltInEffect::PhaseInvert(e) => e.process(l, r),
             BuiltInEffect::ChannelEq(e) => e.process(l, r),
+            BuiltInEffect::Limiter(e) => e.process(l, r),
         }
     }
 }

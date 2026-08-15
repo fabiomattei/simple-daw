@@ -27,7 +27,7 @@ use model::{
     clear_overlaps, find_note_mut, remove_note,
 };
 use plugin_host::{
-    DawHost, EffectInstance, LoadedEffect, MasterEffectSlot, PluginGuiHandle, PluginParamInfo,
+    DawHost, EffectInstance, LoadedEffect, MasterEffectSlots, PluginGuiHandle, PluginParamInfo,
     TrackEffectSlots,
 };
 use sample::SampleBuffer;
@@ -358,11 +358,12 @@ struct AudioClipDrag {
 }
 
 /// Which effect's parameter-editor window (if any) is currently open. There's only ever one such
-/// window at a time, shared by the master bus and every track. `Track(track_index, slot_index)`
-/// identifies one slot within that track's effect chain.
+/// window at a time, shared by the master bus and every track. `Master(slot_index)`/
+/// `Track(track_index, slot_index)` identify one slot within the master chain/that track's chain
+/// respectively.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EffectEditorTarget {
-    Master,
+    Master(usize),
     Track(usize, usize),
 }
 
@@ -409,17 +410,22 @@ struct SimpleDawApp {
     /// Whether the "Plugins" window (project-level CLAP plugin library — import, load onto
     /// master, remove) is open.
     show_plugins_panel: bool,
-    master_effect_path: String,
-    master_effect_slot: MasterEffectSlot,
+    /// The master bus's own effect-chain bookkeeping — same shape as the per-track
+    /// `track_effect_*` fields below, just flat (one implicit chain) rather than one `Vec` per
+    /// track, since there's only ever one master bus. `master_effect_slots` is the live chain
+    /// shared with the audio thread (see `plugin_host::MasterEffectSlots`), always exactly one
+    /// "track" long at the outer level.
+    master_effect_paths: Vec<String>,
+    master_effect_slots: MasterEffectSlots,
     /// Kept alive for the app's lifetime once loaded — see phase 7 plan for
     /// why there's no unload/deactivate support yet.
-    master_effect_instance: Option<PluginInstance<DawHost>>,
+    master_effect_instances: Vec<Option<PluginInstance<DawHost>>>,
     /// The master effect's floating GUI window state, if a plugin implementing the `gui`
     /// extension is loaded — see `plugin_host::PluginGuiHandle`.
-    master_effect_gui: Option<PluginGuiHandle>,
-    master_effect_message: Option<(bool, String)>,
+    master_effect_guis: Vec<Option<PluginGuiHandle>>,
+    master_effect_messages: Vec<Option<(bool, String)>>,
     track_effect_slots: TrackEffectSlots,
-    /// Kept alive for the app's lifetime once loaded, same as `master_effect_instance`. Outer
+    /// Kept alive for the app's lifetime once loaded, same as `master_effect_instances`. Outer
     /// index is the track (same as `song.tracks`), inner index is the slot within that track's
     /// effect chain (same as `Track::effects`/`track_effect_slots`'s inner `Vec`); kept in sync
     /// via `resize_track_effects`/`remove_track_effects`.
@@ -492,6 +498,14 @@ struct SimpleDawApp {
     /// Whether the Playlist (arrangement timeline) window is open — toggled from the toolbar,
     /// always detached like the Piano Roll/Beats windows (no docked mode).
     playlist_open: bool,
+    /// Whether the Mixer (classic vertical channel-strip view — one strip per track plus a Master
+    /// strip) is visible at all, toggled from the toolbar. Same dock/detach split as the Channel
+    /// Rack (see `mixer_detached`), but unlike the Channel Rack it can be hidden entirely, since
+    /// the same volume/mute/solo/FX controls already live inline on each Channel Rack row.
+    mixer_open: bool,
+    /// Whether the (visible) Mixer is popped out into its own native OS window instead of docked
+    /// as a bottom `egui::Panel` — see `channel_rack_detached`.
+    mixer_detached: bool,
     /// Zoom for the Playlist timeline, independent of `piano_roll_zoom` since it's a separate view.
     playlist_zoom: f32,
     /// At most one Playlist clip is being dragged at a time — see `piano_roll_drag`.
@@ -537,21 +551,42 @@ impl SimpleDawApp {
     fn new() -> Self {
         let song = Arc::new(Mutex::new(Song::demo()));
         let transport = Transport::new();
-        let master_effect_slot = plugin_host::new_master_effect_slot();
+        let master_effect_slots = plugin_host::new_master_effect_slots();
         let track_count = song.lock().unwrap().tracks.len();
         let track_effect_slots = plugin_host::new_track_effect_slots(track_count);
         let engine = AudioEngine::start(
             song.clone(),
             transport.clone(),
-            master_effect_slot.clone(),
+            master_effect_slots.clone(),
             track_effect_slots.clone(),
             None,
             None,
         );
         let sample_rate = engine.as_ref().ok().map(|e| e.status.sample_rate);
+        let engine_config = engine
+            .as_ref()
+            .ok()
+            .map(|e| (e.status.sample_rate as f64, e.status.min_frames, e.status.max_frames));
 
         if let Some(sample_rate) = sample_rate {
             preload_demo_samples(&song, sample_rate);
+        }
+
+        // `Song::demo()` seeds a default master-bus limiter (see its own doc comment) — build and
+        // load it into the live chain now, the same way loading a song file does, so a fresh
+        // session actually hears it rather than just recording it in `Song::master_effects`.
+        let master_specs = song.lock().unwrap().master_effects.clone();
+        let (
+            master_effect_paths,
+            master_effect_instances,
+            master_effect_guis,
+            master_effect_messages,
+            master_chain,
+        ) = build_effect_chain(master_specs, engine_config);
+        if let Ok(mut slots) = master_effect_slots.lock()
+            && let Some(slot) = slots.get_mut(0)
+        {
+            *slot = master_chain;
         }
 
         Self {
@@ -573,11 +608,11 @@ impl SimpleDawApp {
             import_midi_apply_bpm: false,
             import_midi_message: None,
             show_plugins_panel: false,
-            master_effect_path: String::new(),
-            master_effect_slot,
-            master_effect_instance: None,
-            master_effect_gui: None,
-            master_effect_message: None,
+            master_effect_paths,
+            master_effect_slots,
+            master_effect_instances,
+            master_effect_guis,
+            master_effect_messages,
             track_effect_slots,
             track_effect_instances: (0..track_count).map(|_| Vec::new()).collect(),
             track_effect_guis: (0..track_count).map(|_| Vec::new()).collect(),
@@ -600,6 +635,8 @@ impl SimpleDawApp {
             beats_region: None,
             channel_rack_detached: false,
             playlist_open: true,
+            mixer_open: false,
+            mixer_detached: false,
             playlist_zoom: 1.0,
             playlist_drag: None,
             audio_clip_drag: None,
@@ -713,6 +750,7 @@ fn channel_rack_contents_ui(
         for (track_index, track) in song.tracks.iter_mut().enumerate() {
             let mut fx = TrackFxUi {
                 track_index,
+                is_master: false,
                 paths: &mut rack.track_effect_paths[track_index],
                 messages: &mut rack.track_effect_messages[track_index],
                 slots: rack.track_effect_slots.clone(),
@@ -739,6 +777,193 @@ fn channel_rack_contents_ui(
             ui.add_space(4.0);
         }
     });
+}
+
+/// Bundles the Mixer's mutable app-state borrows, for the same reason as `ChannelRackUi` — reused
+/// between the docked and detached-window renderings. Also carries the master bus's own
+/// effect-chain bookkeeping (see `SimpleDawApp::master_effect_paths` and friends) so the Mixer can
+/// show a Master strip alongside the per-track ones, the same chain the "Plugins" window's "Master
+/// bus FX chain" section edits.
+struct MixerUi<'a> {
+    detached: &'a mut bool,
+    track_effect_slots: &'a TrackEffectSlots,
+    track_effect_instances: &'a mut Vec<Vec<Option<PluginInstance<DawHost>>>>,
+    track_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
+    track_effect_paths: &'a mut Vec<Vec<String>>,
+    track_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
+    effect_editor: &'a mut Option<EffectEditorTarget>,
+    master_effect_paths: &'a mut Vec<String>,
+    master_effect_slots: MasterEffectSlots,
+    master_effect_instances: &'a mut Vec<Option<PluginInstance<DawHost>>>,
+    master_effect_guis: &'a mut Vec<Option<PluginGuiHandle>>,
+    master_effect_messages: &'a mut Vec<Option<(bool, String)>>,
+}
+
+/// The Mixer's heading/Detach toggle plus one classic vertical channel strip per track, ending in
+/// a Master strip — shared by the docked and detached-window renderings so the two stay in sync.
+/// Unlike the Channel Rack's compact horizontal rows, each strip lays its controls out top to
+/// bottom (name, FX, pan, mute/solo, then a tall fader) the way a hardware/DAW mixer console does.
+/// These are the same `Track::volume`/`pan`/`muted`/`solo`/`effects` the Channel Rack row already
+/// edits inline — the Mixer is an additional view onto the same data, not a separate copy of it.
+fn mixer_contents_ui(
+    ui: &mut egui::Ui,
+    song: &mut Song,
+    engine_config: Option<(f64, u32, u32)>,
+    mixer: &mut MixerUi,
+) {
+    ui.horizontal(|ui| {
+        ui.heading("Mixer");
+        if ui
+            .small_button(if *mixer.detached { "⏷ Dock" } else { "⧉ Detach" })
+            .clicked()
+        {
+            *mixer.detached = !*mixer.detached;
+        }
+    });
+    ui.separator();
+
+    egui::ScrollArea::horizontal().show(ui, |ui| {
+        ui.horizontal_top(|ui| {
+            for (track_index, track) in song.tracks.iter_mut().enumerate() {
+                // Unused by `fx_chain_ui` itself (only `channel_rack_row_ui`'s own Synth/Remove
+                // buttons touch these) — the Mixer strip has neither button, but `TrackFxUi` needs
+                // somewhere to point since it's shared with the Channel Rack. Same pattern as the
+                // "Plugins" window's master-chain `unused_synth_editor`/`unused_remove_requested`.
+                let mut unused_synth_editor: Option<usize> = None;
+                let mut unused_remove_requested: Option<usize> = None;
+                let mut fx = TrackFxUi {
+                    track_index,
+                    is_master: false,
+                    paths: &mut mixer.track_effect_paths[track_index],
+                    messages: &mut mixer.track_effect_messages[track_index],
+                    slots: mixer.track_effect_slots.clone(),
+                    instances: &mut mixer.track_effect_instances[track_index],
+                    guis: &mut mixer.track_effect_guis[track_index],
+                    engine_config,
+                    known_plugins: &song.plugins,
+                    editor: &mut *mixer.effect_editor,
+                    synth_editor: &mut unused_synth_editor,
+                    remove_requested: &mut unused_remove_requested,
+                };
+                mixer_channel_strip_ui(ui, track, track_index, &mut fx);
+            }
+
+            let mut unused_synth_editor: Option<usize> = None;
+            let mut unused_remove_requested: Option<usize> = None;
+            let mut master_fx = TrackFxUi {
+                track_index: 0,
+                is_master: true,
+                paths: mixer.master_effect_paths,
+                messages: mixer.master_effect_messages,
+                slots: mixer.master_effect_slots.clone(),
+                instances: mixer.master_effect_instances,
+                guis: mixer.master_effect_guis,
+                engine_config,
+                known_plugins: &song.plugins,
+                editor: &mut *mixer.effect_editor,
+                synth_editor: &mut unused_synth_editor,
+                remove_requested: &mut unused_remove_requested,
+            };
+            mixer_master_strip_ui(ui, &mut master_fx);
+        });
+    });
+}
+
+/// One track's classic vertical channel strip in the Mixer: name, an "FX" menu (the same
+/// `fx_chain_ui` the Channel Rack's "FX" button opens), a pan slider, Mute/Solo buttons, and a
+/// tall vertical volume fader — see `mixer_contents_ui`.
+fn mixer_channel_strip_ui(ui: &mut egui::Ui, track: &mut Track, track_index: usize, fx: &mut TrackFxUi) {
+    let color = track_color(track_index);
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(40, 40, 40))
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::same(4))
+        .show(ui, |ui| {
+            ui.set_width(70.0);
+            ui.vertical_centered(|ui| {
+                let (swatch_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(58.0, 4.0), egui::Sense::hover());
+                ui.painter().rect_filled(swatch_rect, 1.0, color);
+
+                ui.add(
+                    egui::TextEdit::singleline(&mut track.name)
+                        .desired_width(64.0)
+                        .font(egui::TextStyle::Small),
+                );
+
+                ui.menu_button("FX", |ui| {
+                    fx_chain_ui(ui, fx);
+                });
+
+                ui.add(egui::Slider::new(&mut track.pan, -1.0..=1.0).show_value(false))
+                    .on_hover_text(format!("Pan: {}", pan_label(track.pan)));
+
+                ui.horizontal(|ui| {
+                    let mute_color = if track.muted {
+                        FL_ACCENT_ORANGE
+                    } else {
+                        egui::Color32::from_gray(150)
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("M").color(mute_color))
+                                .small()
+                                .min_size(egui::vec2(18.0, 20.0)),
+                        )
+                        .on_hover_text(if track.muted { "Unmute" } else { "Mute" })
+                        .clicked()
+                    {
+                        track.muted = !track.muted;
+                    }
+
+                    let solo_color = if track.solo {
+                        FL_ACCENT_YELLOW
+                    } else {
+                        egui::Color32::from_gray(150)
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("S").color(solo_color))
+                                .small()
+                                .min_size(egui::vec2(18.0, 20.0)),
+                        )
+                        .on_hover_text(if track.solo { "Unsolo" } else { "Solo" })
+                        .clicked()
+                    {
+                        track.solo = !track.solo;
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.add_sized(
+                    [28.0, 140.0],
+                    egui::Slider::new(&mut track.volume, 0.0..=1.5)
+                        .vertical()
+                        .show_value(false),
+                )
+                .on_hover_text(format!("Volume: {:.2}", track.volume));
+                ui.label(egui::RichText::new(format!("{:.2}", track.volume)).small());
+            });
+        });
+}
+
+/// The Mixer's Master strip: just a label and the master bus's own "FX" menu (the same chain the
+/// "Plugins" window's "Master bus FX chain" section edits) — there's no `Song::master_volume`/pan/
+/// mute/solo field to put a fader or M/S buttons on, unlike a real track's strip.
+fn mixer_master_strip_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(50, 46, 30))
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::same(4))
+        .show(ui, |ui| {
+            ui.set_width(70.0);
+            ui.vertical_centered(|ui| {
+                ui.strong("Master");
+                ui.menu_button("FX", |ui| {
+                    fx_chain_ui(ui, fx);
+                });
+            });
+        });
 }
 
 /// Bundles the Piano Roll's mutable app-state borrows for the same reason as `ChannelRackUi`.
@@ -910,11 +1135,11 @@ struct McpContext<'a> {
     sample_rate: Option<u32>,
     engine_config: Option<(f64, u32, u32)>,
     song_path: &'a mut String,
-    master_effect_path: &'a mut String,
-    master_effect_slot: &'a MasterEffectSlot,
-    master_effect_instance: &'a mut Option<PluginInstance<DawHost>>,
-    master_effect_gui: &'a mut Option<PluginGuiHandle>,
-    master_effect_message: &'a mut Option<(bool, String)>,
+    master_effect_paths: &'a mut Vec<String>,
+    master_effect_slots: &'a MasterEffectSlots,
+    master_effect_instances: &'a mut Vec<Option<PluginInstance<DawHost>>>,
+    master_effect_guis: &'a mut Vec<Option<PluginGuiHandle>>,
+    master_effect_messages: &'a mut Vec<Option<(bool, String)>>,
     track_effect_slots: &'a TrackEffectSlots,
     track_effect_instances: &'a mut Vec<Vec<Option<PluginInstance<DawHost>>>>,
     track_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
@@ -1330,8 +1555,8 @@ fn apply_mcp_command(
             let p: McpSaveSongParams = parse_mcp_params(params)?;
             sync_song_effects(
                 song,
-                ctx.master_effect_path,
-                ctx.master_effect_slot,
+                ctx.master_effect_paths,
+                ctx.master_effect_slots,
                 ctx.track_effect_paths,
                 ctx.track_effect_slots,
             );
@@ -1349,8 +1574,7 @@ fn apply_mcp_command(
             let path = p.path.trim().to_string();
             let loaded = perform_load(&path, ctx.sample_rate)?;
             let track_count = loaded.tracks.len();
-            let master_effect_path = loaded.master_effect_path.clone();
-            let master_effect_params = loaded.master_effect_params.clone();
+            let master_effect_specs = loaded.master_effects.clone();
             let track_effect_specs: Vec<Vec<TrackEffectConfig>> =
                 loaded.tracks.iter().map(|t| t.effects.clone()).collect();
             *song = loaded;
@@ -1364,13 +1588,12 @@ fn apply_mcp_command(
                 track_count,
             );
             apply_loaded_effects(
-                ctx.master_effect_path,
-                ctx.master_effect_instance,
-                ctx.master_effect_gui,
-                ctx.master_effect_slot,
-                ctx.master_effect_message,
-                master_effect_path,
-                master_effect_params,
+                ctx.master_effect_paths,
+                ctx.master_effect_instances,
+                ctx.master_effect_guis,
+                ctx.master_effect_slots,
+                ctx.master_effect_messages,
+                master_effect_specs,
                 ctx.track_effect_paths,
                 ctx.track_effect_instances,
                 ctx.track_effect_guis,
@@ -1593,6 +1816,23 @@ fn built_in_effect_params_ui(ui: &mut egui::Ui, effect: &mut BuiltInEffect) {
         BuiltInEffect::PhaseInvert(e) => {
             ui.checkbox(&mut e.invert_left, "Invert L");
             ui.checkbox(&mut e.invert_right, "Invert R");
+        }
+        BuiltInEffect::Limiter(e) => {
+            ui.add(
+                egui::Slider::new(&mut e.input_gain_db, -12.0..=24.0)
+                    .text("Input Gain")
+                    .suffix(" dB"),
+            );
+            ui.add(
+                egui::Slider::new(&mut e.ceiling_db, -12.0..=0.0)
+                    .text("Ceiling")
+                    .suffix(" dB"),
+            );
+            ui.add(
+                egui::Slider::new(&mut e.release_ms, 5.0..=500.0)
+                    .text("Release")
+                    .suffix(" ms"),
+            );
         }
         BuiltInEffect::ChannelEq(e) => {
             for (index, band) in e.bands.iter_mut().enumerate() {
@@ -3713,50 +3953,50 @@ fn finish_recording(
     (true, format!("Recorded {}", path.display()))
 }
 
-/// Writes the app's live effect state (master + every track's effect chain) into `song`'s
-/// `master_effect_*`/`Track::effects` fields so `save_to_file` captures it.
+/// Snapshots one live effect chain (the master bus, or a single track) back into its
+/// `TrackEffectConfig` list form for persisting to a song file — the shared body behind
+/// `sync_song_effects`'s master and per-track cases, which differ only in which chain/paths
+/// they're reading.
+fn chain_to_config(chain: &[Option<EffectInstance>], paths: &[String]) -> Vec<TrackEffectConfig> {
+    chain
+        .iter()
+        .enumerate()
+        .map(|(slot_index, slot)| match slot {
+            Some(EffectInstance::Clap(effect)) => TrackEffectConfig::Clap {
+                path: paths.get(slot_index).cloned().unwrap_or_default(),
+                params: effect.param_snapshot(),
+            },
+            Some(EffectInstance::BuiltIn(effect)) => effect.to_config(),
+            None => TrackEffectConfig::Clap {
+                path: paths.get(slot_index).cloned().unwrap_or_default(),
+                params: Vec::new(),
+            },
+        })
+        .collect()
+}
+
+/// Writes the app's live effect state (master bus + every track's effect chain) into `song`'s
+/// `master_effects`/`Track::effects` fields so `save_to_file` captures it.
 fn sync_song_effects(
     song: &mut Song,
-    master_effect_path: &str,
-    master_effect_slot: &MasterEffectSlot,
+    master_effect_paths: &[String],
+    master_effect_slots: &MasterEffectSlots,
     track_effect_paths: &[Vec<String>],
     track_effect_slots: &TrackEffectSlots,
 ) {
-    song.master_effect_path = master_effect_path.to_string();
-    song.master_effect_params = master_effect_slot
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(LoadedEffect::param_snapshot))
-        .unwrap_or_default();
+    if let Ok(chains) = master_effect_slots.lock() {
+        song.master_effects = chains
+            .first()
+            .map(|chain| chain_to_config(chain, master_effect_paths))
+            .unwrap_or_default();
+    }
 
     if let Ok(chains) = track_effect_slots.lock() {
         for (index, track) in song.tracks.iter_mut().enumerate() {
-            let paths = track_effect_paths.get(index);
+            let paths = track_effect_paths.get(index).map(Vec::as_slice).unwrap_or(&[]);
             track.effects = chains
                 .get(index)
-                .map(|chain| {
-                    chain
-                        .iter()
-                        .enumerate()
-                        .map(|(slot_index, slot)| match slot {
-                            Some(EffectInstance::Clap(effect)) => TrackEffectConfig::Clap {
-                                path: paths
-                                    .and_then(|p| p.get(slot_index))
-                                    .cloned()
-                                    .unwrap_or_default(),
-                                params: effect.param_snapshot(),
-                            },
-                            Some(EffectInstance::BuiltIn(effect)) => effect.to_config(),
-                            None => TrackEffectConfig::Clap {
-                                path: paths
-                                    .and_then(|p| p.get(slot_index))
-                                    .cloned()
-                                    .unwrap_or_default(),
-                                params: Vec::new(),
-                            },
-                        })
-                        .collect()
-                })
+                .map(|chain| chain_to_config(chain, paths))
                 .unwrap_or_default();
         }
     }
@@ -3781,19 +4021,86 @@ fn load_effect(
     Ok((instance, effect, gui))
 }
 
-/// Re-loads the master and every track's CLAP effect after a `Song` is loaded from a file,
-/// restoring each plugin's saved parameter values. Takes the loaded path/params by value
-/// (extracted from the `Song` before it's swapped into place) rather than the `Song` itself, so
-/// it can run as a free function alongside the caller's `&mut Song` borrow.
+/// Builds one live effect chain (the master bus, or a single track) from its saved
+/// `TrackEffectConfig`s — loading any referenced CLAP plugin and instantiating any built-in DSP
+/// effect. The shared body behind `apply_loaded_effects`'s master and per-track cases, and behind
+/// `SimpleDawApp::new()`'s startup load of `Song::demo()`'s default master effects.
+#[allow(clippy::type_complexity)]
+fn build_effect_chain(
+    specs: Vec<TrackEffectConfig>,
+    engine_config: Option<(f64, u32, u32)>,
+) -> (
+    Vec<String>,
+    Vec<Option<PluginInstance<DawHost>>>,
+    Vec<Option<PluginGuiHandle>>,
+    Vec<Option<(bool, String)>>,
+    Vec<Option<EffectInstance>>,
+) {
+    let sample_rate = engine_config.map(|(sr, _, _)| sr as f32);
+    let mut paths = Vec::with_capacity(specs.len());
+    let mut instances = Vec::with_capacity(specs.len());
+    let mut guis = Vec::with_capacity(specs.len());
+    let mut messages = Vec::with_capacity(specs.len());
+    let mut chain: Vec<Option<EffectInstance>> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match spec {
+            TrackEffectConfig::Clap { path, params } => {
+                paths.push(path.clone());
+                if path.trim().is_empty() {
+                    instances.push(None);
+                    guis.push(None);
+                    chain.push(None);
+                    messages.push(None);
+                } else {
+                    match load_effect(&path, &params, engine_config) {
+                        Ok((instance, effect, gui)) => {
+                            instances.push(Some(instance));
+                            guis.push(Some(gui));
+                            chain.push(Some(EffectInstance::Clap(effect)));
+                            messages.push(Some((true, format!("Loaded {path}"))));
+                        }
+                        Err(err) => {
+                            instances.push(None);
+                            guis.push(None);
+                            chain.push(None);
+                            messages.push(Some((false, err)));
+                        }
+                    }
+                }
+            }
+            builtin_spec => {
+                paths.push(String::new());
+                instances.push(None);
+                guis.push(None);
+                match sample_rate.and_then(|sr| BuiltInEffect::from_config(&builtin_spec, sr)) {
+                    Some(effect) => {
+                        chain.push(Some(EffectInstance::BuiltIn(effect)));
+                        messages.push(None);
+                    }
+                    None => {
+                        chain.push(None);
+                        messages.push(Some((false, "Audio engine not running".to_string())));
+                    }
+                }
+            }
+        }
+    }
+    (paths, instances, guis, messages, chain)
+}
+
+/// Re-loads the master bus's and every track's effect chain after a `Song` is loaded from a file,
+/// restoring each CLAP plugin's saved parameter values and re-instantiating every built-in effect.
+/// Takes the loaded specs by value (extracted from the `Song` before it's swapped into place)
+/// rather than the `Song` itself, so it can run as a free function alongside the caller's
+/// `&mut Song` borrow.
 #[allow(clippy::too_many_arguments)]
 fn apply_loaded_effects(
-    master_effect_path_field: &mut String,
-    master_effect_instance: &mut Option<PluginInstance<DawHost>>,
-    master_effect_gui: &mut Option<PluginGuiHandle>,
-    master_effect_slot: &MasterEffectSlot,
-    master_effect_message: &mut Option<(bool, String)>,
-    loaded_master_path: String,
-    loaded_master_params: Vec<(u32, f64)>,
+    master_effect_paths: &mut Vec<String>,
+    master_effect_instances: &mut Vec<Option<PluginInstance<DawHost>>>,
+    master_effect_guis: &mut Vec<Option<PluginGuiHandle>>,
+    master_effect_slots: &MasterEffectSlots,
+    master_effect_messages: &mut Vec<Option<(bool, String)>>,
+    loaded_master_specs: Vec<TrackEffectConfig>,
     track_effect_paths: &mut [Vec<String>],
     track_effect_instances: &mut [Vec<Option<PluginInstance<DawHost>>>],
     track_effect_guis: &mut [Vec<Option<PluginGuiHandle>>],
@@ -3802,80 +4109,20 @@ fn apply_loaded_effects(
     loaded_track_specs: Vec<Vec<TrackEffectConfig>>,
     engine_config: Option<(f64, u32, u32)>,
 ) {
-    *master_effect_path_field = loaded_master_path.clone();
-    *master_effect_instance = None;
-    *master_effect_gui = None;
-    if let Ok(mut slot) = master_effect_slot.lock() {
-        *slot = None;
+    let (paths, instances, guis, messages, chain) =
+        build_effect_chain(loaded_master_specs, engine_config);
+    *master_effect_paths = paths;
+    *master_effect_instances = instances;
+    *master_effect_guis = guis;
+    *master_effect_messages = messages;
+    if let Ok(mut slots) = master_effect_slots.lock()
+        && let Some(slot) = slots.get_mut(0)
+    {
+        *slot = chain;
     }
-    *master_effect_message = if loaded_master_path.trim().is_empty() {
-        None
-    } else {
-        Some(
-            match load_effect(&loaded_master_path, &loaded_master_params, engine_config) {
-                Ok((instance, effect, gui)) => {
-                    *master_effect_instance = Some(instance);
-                    *master_effect_gui = Some(gui);
-                    if let Ok(mut slot) = master_effect_slot.lock() {
-                        *slot = Some(effect);
-                    }
-                    (true, format!("Loaded {loaded_master_path}"))
-                }
-                Err(err) => (false, err),
-            },
-        )
-    };
 
-    let sample_rate = engine_config.map(|(sr, _, _)| sr as f32);
     for (index, track_specs) in loaded_track_specs.into_iter().enumerate() {
-        let mut paths = Vec::with_capacity(track_specs.len());
-        let mut instances = Vec::with_capacity(track_specs.len());
-        let mut guis = Vec::with_capacity(track_specs.len());
-        let mut messages = Vec::with_capacity(track_specs.len());
-        let mut chain: Vec<Option<EffectInstance>> = Vec::with_capacity(track_specs.len());
-        for spec in track_specs {
-            match spec {
-                TrackEffectConfig::Clap { path, params } => {
-                    paths.push(path.clone());
-                    if path.trim().is_empty() {
-                        instances.push(None);
-                        guis.push(None);
-                        chain.push(None);
-                        messages.push(None);
-                    } else {
-                        match load_effect(&path, &params, engine_config) {
-                            Ok((instance, effect, gui)) => {
-                                instances.push(Some(instance));
-                                guis.push(Some(gui));
-                                chain.push(Some(EffectInstance::Clap(effect)));
-                                messages.push(Some((true, format!("Loaded {path}"))));
-                            }
-                            Err(err) => {
-                                instances.push(None);
-                                guis.push(None);
-                                chain.push(None);
-                                messages.push(Some((false, err)));
-                            }
-                        }
-                    }
-                }
-                builtin_spec => {
-                    paths.push(String::new());
-                    instances.push(None);
-                    guis.push(None);
-                    match sample_rate.and_then(|sr| BuiltInEffect::from_config(&builtin_spec, sr)) {
-                        Some(effect) => {
-                            chain.push(Some(EffectInstance::BuiltIn(effect)));
-                            messages.push(None);
-                        }
-                        None => {
-                            chain.push(None);
-                            messages.push(Some((false, "Audio engine not running".to_string())));
-                        }
-                    }
-                }
-            }
-        }
+        let (paths, instances, guis, messages, chain) = build_effect_chain(track_specs, engine_config);
         if let Ok(mut slots) = track_effect_slots.lock() {
             if let Some(slot) = slots.get_mut(index) {
                 *slot = chain;
@@ -4110,11 +4357,11 @@ impl eframe::App for SimpleDawApp {
                     sample_rate: self.sample_rate,
                     engine_config,
                     song_path: &mut self.song_path,
-                    master_effect_path: &mut self.master_effect_path,
-                    master_effect_slot: &self.master_effect_slot,
-                    master_effect_instance: &mut self.master_effect_instance,
-                    master_effect_gui: &mut self.master_effect_gui,
-                    master_effect_message: &mut self.master_effect_message,
+                    master_effect_paths: &mut self.master_effect_paths,
+                    master_effect_slots: &self.master_effect_slots,
+                    master_effect_instances: &mut self.master_effect_instances,
+                    master_effect_guis: &mut self.master_effect_guis,
+                    master_effect_messages: &mut self.master_effect_messages,
                     track_effect_slots: &self.track_effect_slots,
                     track_effect_instances: &mut self.track_effect_instances,
                     track_effect_guis: &mut self.track_effect_guis,
@@ -4154,9 +4401,7 @@ impl eframe::App for SimpleDawApp {
                                 match perform_load(&self.song_path, self.sample_rate) {
                                     Ok(loaded) => {
                                         let track_count = loaded.tracks.len();
-                                        let master_effect_path = loaded.master_effect_path.clone();
-                                        let master_effect_params =
-                                            loaded.master_effect_params.clone();
+                                        let master_effect_specs = loaded.master_effects.clone();
                                         let track_effect_specs: Vec<Vec<TrackEffectConfig>> =
                                             loaded
                                                 .tracks
@@ -4191,13 +4436,12 @@ impl eframe::App for SimpleDawApp {
                                             )
                                         });
                                         apply_loaded_effects(
-                                            &mut self.master_effect_path,
-                                            &mut self.master_effect_instance,
-                                            &mut self.master_effect_gui,
-                                            &self.master_effect_slot,
-                                            &mut self.master_effect_message,
-                                            master_effect_path,
-                                            master_effect_params,
+                                            &mut self.master_effect_paths,
+                                            &mut self.master_effect_instances,
+                                            &mut self.master_effect_guis,
+                                            &self.master_effect_slots,
+                                            &mut self.master_effect_messages,
+                                            master_effect_specs,
                                             &mut self.track_effect_paths,
                                             &mut self.track_effect_instances,
                                             &mut self.track_effect_guis,
@@ -4221,8 +4465,8 @@ impl eframe::App for SimpleDawApp {
                         {
                             sync_song_effects(
                                 song,
-                                &self.master_effect_path,
-                                &self.master_effect_slot,
+                                &self.master_effect_paths,
+                                &self.master_effect_slots,
                                 &self.track_effect_paths,
                                 &self.track_effect_slots,
                             );
@@ -4399,6 +4643,9 @@ impl eframe::App for SimpleDawApp {
                             {
                                 self.playlist_open = !self.playlist_open;
                             }
+                            if ui.selectable_label(self.mixer_open, "🎚 Mixer").clicked() {
+                                self.mixer_open = !self.mixer_open;
+                            }
                         });
                     });
 
@@ -4481,8 +4728,8 @@ impl eframe::App for SimpleDawApp {
                             if restart_output {
                                 sync_song_effects(
                                     song,
-                                    &self.master_effect_path,
-                                    &self.master_effect_slot,
+                                    &self.master_effect_paths,
+                                    &self.master_effect_slots,
                                     &self.track_effect_paths,
                                     &self.track_effect_slots,
                                 );
@@ -4491,7 +4738,7 @@ impl eframe::App for SimpleDawApp {
                                 match AudioEngine::start(
                                     self.song.clone(),
                                     self.transport.clone(),
-                                    self.master_effect_slot.clone(),
+                                    self.master_effect_slots.clone(),
                                     self.track_effect_slots.clone(),
                                     self.selected_output_device.as_deref(),
                                     self.selected_output_sample_rate,
@@ -4507,13 +4754,12 @@ impl eframe::App for SimpleDawApp {
                                         self.sample_rate = Some(sample_rate);
                                         song.reload_samples(sample_rate);
                                         apply_loaded_effects(
-                                            &mut self.master_effect_path,
-                                            &mut self.master_effect_instance,
-                                            &mut self.master_effect_gui,
-                                            &self.master_effect_slot,
-                                            &mut self.master_effect_message,
-                                            song.master_effect_path.clone(),
-                                            song.master_effect_params.clone(),
+                                            &mut self.master_effect_paths,
+                                            &mut self.master_effect_instances,
+                                            &mut self.master_effect_guis,
+                                            &self.master_effect_slots,
+                                            &mut self.master_effect_messages,
+                                            song.master_effects.clone(),
                                             &mut self.track_effect_paths,
                                             &mut self.track_effect_instances,
                                             &mut self.track_effect_guis,
@@ -4604,8 +4850,8 @@ impl eframe::App for SimpleDawApp {
                             self.song_path = self.save_as_path.clone();
                             sync_song_effects(
                                 song,
-                                &self.master_effect_path,
-                                &self.master_effect_slot,
+                                &self.master_effect_paths,
+                                &self.master_effect_slots,
                                 &self.track_effect_paths,
                                 &self.track_effect_slots,
                             );
@@ -4729,6 +4975,13 @@ impl eframe::App for SimpleDawApp {
 
         if self.show_plugins_panel {
             let mut open = true;
+            let engine_config = self.engine.as_ref().ok().map(|e| {
+                (
+                    e.status.sample_rate as f64,
+                    e.status.min_frames,
+                    e.status.max_frames,
+                )
+            });
             egui::Window::new("Plugins")
                 .collapsible(false)
                 .resizable(true)
@@ -4750,7 +5003,7 @@ impl eframe::App for SimpleDawApp {
                     ui.separator();
 
                     let mut plugin_to_remove: Option<usize> = None;
-                    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
                         for (index, plugin) in song.plugins.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
                                 ui.add_sized(
@@ -4758,30 +5011,6 @@ impl eframe::App for SimpleDawApp {
                                     egui::TextEdit::singleline(&mut plugin.name).hint_text("Name"),
                                 )
                                 .on_hover_text(plugin.path.as_str());
-                                let can_load = self.engine.is_ok();
-                                if ui.add_enabled(can_load, egui::Button::new("Load on Master")).clicked() {
-                                    if let Ok(engine) = &self.engine {
-                                        let clap_path = Path::new(&plugin.path);
-                                        let result = plugin_host::load_and_activate(
-                                            clap_path,
-                                            engine.status.sample_rate as f64,
-                                            engine.status.min_frames,
-                                            engine.status.max_frames,
-                                        );
-                                        self.master_effect_message = Some(match result {
-                                            Ok((instance, effect, gui)) => {
-                                                self.master_effect_path = plugin.path.clone();
-                                                self.master_effect_instance = Some(instance);
-                                                self.master_effect_gui = Some(gui);
-                                                if let Ok(mut slot) = self.master_effect_slot.lock() {
-                                                    *slot = Some(effect);
-                                                }
-                                                (true, format!("Loaded {}", plugin.name))
-                                            }
-                                            Err(err) => (false, format!("{err:#}")),
-                                        });
-                                    }
-                                }
                                 if ui
                                     .small_button("✕")
                                     .on_hover_text("Remove from the project plugin list")
@@ -4797,14 +5026,27 @@ impl eframe::App for SimpleDawApp {
                     }
 
                     ui.separator();
-                    let can_open_params = self.master_effect_instance.is_some();
-                    if ui.add_enabled(can_open_params, egui::Button::new("Master FX Params")).clicked() {
-                        self.effect_editor = Some(EffectEditorTarget::Master);
-                    }
-                    if let Some((ok, message)) = &self.master_effect_message {
-                        let color = if *ok { FL_ACCENT_GREEN } else { egui::Color32::RED };
-                        ui.colored_label(color, message);
-                    }
+                    ui.strong("Master bus FX chain");
+                    // Unused by `fx_chain_ui` itself (only `channel_rack_row_ui`'s own buttons
+                    // touch these) — the master bus has no synth to open and can't be deleted, but
+                    // `TrackFxUi` needs somewhere to point since it's shared with tracks.
+                    let mut unused_synth_editor: Option<usize> = None;
+                    let mut unused_remove_requested: Option<usize> = None;
+                    let mut master_fx = TrackFxUi {
+                        track_index: 0,
+                        is_master: true,
+                        paths: &mut self.master_effect_paths,
+                        messages: &mut self.master_effect_messages,
+                        slots: self.master_effect_slots.clone(),
+                        instances: &mut self.master_effect_instances,
+                        guis: &mut self.master_effect_guis,
+                        engine_config,
+                        known_plugins: &song.plugins,
+                        editor: &mut self.effect_editor,
+                        synth_editor: &mut unused_synth_editor,
+                        remove_requested: &mut unused_remove_requested,
+                    };
+                    fx_chain_ui(ui, &mut master_fx);
                 });
             if !open {
                 self.show_plugins_panel = false;
@@ -4864,7 +5106,9 @@ impl eframe::App for SimpleDawApp {
 
         if let Some(target) = self.effect_editor {
             let title = match target {
-                EffectEditorTarget::Master => "Master FX Params".to_string(),
+                EffectEditorTarget::Master(slot_index) => {
+                    format!("Master FX {} Params", slot_index + 1)
+                }
                 EffectEditorTarget::Track(track_index, slot_index) => {
                     format!("Track {} FX {} Params", track_index + 1, slot_index + 1)
                 }
@@ -4876,13 +5120,29 @@ impl eframe::App for SimpleDawApp {
                 .resizable(true)
                 .open(&mut open)
                 .show(ui.ctx(), |ui| match target {
-                    EffectEditorTarget::Master => {
-                        if let Ok(mut guard) = self.master_effect_slot.lock() {
-                            effect_params_ui(ui, guard.as_mut());
+                    EffectEditorTarget::Master(slot_index) => {
+                        if let Ok(mut guard) = self.master_effect_slots.lock() {
+                            let slot = guard
+                                .first_mut()
+                                .and_then(|chain| chain.get_mut(slot_index))
+                                .and_then(|slot| slot.as_mut());
+                            match slot {
+                                Some(EffectInstance::Clap(effect)) => {
+                                    effect_params_ui(ui, Some(effect))
+                                }
+                                Some(EffectInstance::BuiltIn(effect)) => {
+                                    built_in_effect_params_ui(ui, effect)
+                                }
+                                None => effect_params_ui(ui, None),
+                            }
                         }
                         if let (Some(instance), Some(gui)) = (
-                            self.master_effect_instance.as_mut(),
-                            self.master_effect_gui.as_mut(),
+                            self.master_effect_instances
+                                .get_mut(slot_index)
+                                .and_then(|instance| instance.as_mut()),
+                            self.master_effect_guis
+                                .get_mut(slot_index)
+                                .and_then(|gui| gui.as_mut()),
                         ) {
                             plugin_gui_button_ui(ui, instance, gui, &gui_title);
                         }
@@ -5219,6 +5479,60 @@ impl eframe::App for SimpleDawApp {
             };
         }
 
+        if self.mixer_open {
+            let mixer_frame = || {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(26, 26, 26))
+                    .inner_margin(egui::Margin::same(6))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(12, 12, 12)))
+            };
+            let mixer_already_detached = self.mixer_detached;
+            let mut mixer_ui_state = MixerUi {
+                detached: &mut self.mixer_detached,
+                track_effect_slots: &self.track_effect_slots,
+                track_effect_instances: &mut self.track_effect_instances,
+                track_effect_guis: &mut self.track_effect_guis,
+                track_effect_paths: &mut self.track_effect_paths,
+                track_effect_messages: &mut self.track_effect_messages,
+                effect_editor: &mut self.effect_editor,
+                master_effect_paths: &mut self.master_effect_paths,
+                master_effect_slots: self.master_effect_slots.clone(),
+                master_effect_instances: &mut self.master_effect_instances,
+                master_effect_guis: &mut self.master_effect_guis,
+                master_effect_messages: &mut self.master_effect_messages,
+            };
+
+            if mixer_already_detached {
+                let ctx = ui.ctx().clone();
+                let mut still_open = true;
+                ctx.show_viewport_immediate(
+                    egui::ViewportId::from_hash_of("mixer_viewport"),
+                    egui::ViewportBuilder::default()
+                        .with_title("Mixer")
+                        .with_inner_size(egui::vec2(900.0, 320.0)),
+                    |ui, _class| {
+                        egui::CentralPanel::default().frame(mixer_frame()).show(ui, |ui| {
+                            mixer_contents_ui(ui, song, engine_config, &mut mixer_ui_state);
+                        });
+                        if ui.ctx().input(|i| i.viewport().close_requested()) {
+                            still_open = false;
+                        }
+                    },
+                );
+                if !still_open {
+                    self.mixer_open = false;
+                }
+            } else {
+                egui::Panel::bottom("mixer")
+                    .default_size(220.0)
+                    .size_range(160.0..=420.0)
+                    .frame(mixer_frame())
+                    .show(ui, |ui| {
+                        mixer_contents_ui(ui, song, engine_config, &mut mixer_ui_state);
+                    });
+            }
+        }
+
         let piano_roll_open = self
             .selected_track
             .filter(|&i| i < song.tracks.len())
@@ -5343,12 +5657,19 @@ impl eframe::App for SimpleDawApp {
     }
 }
 
-/// Per-track CLAP effect-chain UI state, bundled to keep `track_ui`'s parameter list manageable.
-/// `paths`/`instances`/`messages` are this one track's chain, indexed the same as
-/// `Track::effects` (slot 0 first, feeding into slot 1, and so on) — one entry per effect slot,
-/// whether or not that slot has successfully loaded a plugin yet.
+/// Per-track (or master-bus) CLAP/built-in effect-chain UI state, bundled to keep `track_ui`'s
+/// parameter list manageable. `paths`/`instances`/`messages` are this one chain, indexed the same
+/// as `Track::effects`/`Song::master_effects` (slot 0 first, feeding into slot 1, and so on) — one
+/// entry per effect slot, whether or not that slot has successfully loaded a plugin yet.
 struct TrackFxUi<'a> {
+    /// Row into `slots` this chain lives at — always 0 when `is_master` (see
+    /// `plugin_host::MasterEffectSlots`'s doc comment on why the master chain still uses the
+    /// per-track `TrackEffectSlots` shape, just pinned to one row).
     track_index: usize,
+    /// Whether this is the master bus's chain rather than a real track's — only changes which
+    /// `EffectEditorTarget` variant the "Params" button opens, so master's editor state doesn't
+    /// collide with `Track(0, ..)`'s.
+    is_master: bool,
     paths: &'a mut Vec<String>,
     messages: &'a mut Vec<Option<(bool, String)>>,
     slots: TrackEffectSlots,
@@ -5363,10 +5684,23 @@ struct TrackFxUi<'a> {
     known_plugins: &'a [ProjectPlugin],
     editor: &'a mut Option<EffectEditorTarget>,
     /// Set by channel_rack_row_ui's "🎹" button to open that track's synth-settings window.
+    /// Unused (and meaningless) for the master bus, which has no synth.
     synth_editor: &'a mut Option<usize>,
     /// Set by channel_rack_row_ui's "✕" button; applied by the caller after the track loop ends
-    /// (can't remove from `song.tracks` mid-iteration since it's borrowed via `iter_mut`).
+    /// (can't remove from `song.tracks` mid-iteration since it's borrowed via `iter_mut`). Unused
+    /// for the master bus, which can't be deleted.
     remove_requested: &'a mut Option<usize>,
+}
+
+/// This chain's `fx.editor` target for `slot_index` — `Master` for the master bus, `Track` for a
+/// real track, so the two never collide even though the master chain's own `TrackEffectSlots` row
+/// index is always 0 (same as a real track 0 would use).
+fn fx_editor_target(fx: &TrackFxUi, slot_index: usize) -> EffectEditorTarget {
+    if fx.is_master {
+        EffectEditorTarget::Master(slot_index)
+    } else {
+        EffectEditorTarget::Track(fx.track_index, slot_index)
+    }
 }
 
 /// Hover-text label for a `Track::pan` value: "C" at dead center, otherwise a percentage toward
@@ -5775,6 +6109,7 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
             ("Noise Gate", TrackEffectConfig::default_noise_gate()),
             ("Phase Invert", TrackEffectConfig::default_phase_invert()),
             ("Channel EQ", TrackEffectConfig::default_channel_eq()),
+            ("Limiter", TrackEffectConfig::default_limiter()),
         ] {
             if ui.button(label).clicked() {
                 fx.paths.push(String::new());
@@ -5868,7 +6203,7 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
                 }
             }
             if ui.small_button("Params").clicked() {
-                *fx.editor = Some(EffectEditorTarget::Track(fx.track_index, slot_index));
+                *fx.editor = Some(fx_editor_target(fx, slot_index));
             }
             if let Some((ok, message)) = fx.messages[slot_index].as_ref() {
                 let color = if *ok {
@@ -5902,8 +6237,7 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
                 }
             }
         }
-        if matches!(fx.editor, Some(EffectEditorTarget::Track(t, s)) if *t == fx.track_index && *s == slot_index)
-        {
+        if *fx.editor == Some(fx_editor_target(fx, slot_index)) {
             *fx.editor = None;
         }
     }

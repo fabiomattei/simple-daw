@@ -68,8 +68,8 @@ impl LoadedEffect {
 
     /// Sets a parameter by its stable CLAP id rather than index — used to re-apply saved values
     /// after loading a plugin fresh (see `Song::save_to_file`/`load_from_file` and
-    /// `Song::master_effect_params`/`TrackEffectConfig::params`). A no-op if the plugin has no
-    /// parameter with that id.
+    /// `TrackEffectConfig::Clap`'s `params`, the shape `Song::master_effects` and
+    /// `Track::effects` both use). A no-op if the plugin has no parameter with that id.
     pub fn set_param_by_id(&mut self, id: u32, value: f64) {
         if let Some(index) = self.params.iter().position(|p| p.id.get() == id) {
             self.set_param(index, value);
@@ -130,11 +130,6 @@ impl PluginGuiHandle {
     }
 }
 
-/// Shared between the UI thread (which loads/activates plugins) and the real-time audio callback
-/// (which owns processing from then on). `None` means no master effect is loaded; the mix passes
-/// through unchanged.
-pub type MasterEffectSlot = Arc<Mutex<Option<LoadedEffect>>>;
-
 /// One effect in a track's chain: either a hosted CLAP plugin, or one of the app's built-in DSP
 /// effects (`builtin_fx::BuiltInEffect`) that need no external plugin file. The chain processes
 /// both kinds interchangeably (see `process_effect_chain`), so a track can freely mix CLAP
@@ -152,9 +147,15 @@ pub enum EffectInstance {
 /// reach every track's chain, consistent with how `Song` itself is shared.
 pub type TrackEffectSlots = Arc<Mutex<Vec<Vec<Option<EffectInstance>>>>>;
 
-/// An empty `MasterEffectSlot` (no master-bus effect loaded).
-pub fn new_master_effect_slot() -> MasterEffectSlot {
-    Arc::new(Mutex::new(None))
+/// The master bus's own effect chain — structurally identical to `TrackEffectSlots`, just always
+/// exactly one "track" long (index 0 is the whole chain; there's no second row). Reusing the same
+/// type means the master chain processes through the exact same `process_effect_chain` call, and
+/// its "+ Add Effect" UI reuses the exact same per-track chain UI, as any real track's chain does.
+pub type MasterEffectSlots = TrackEffectSlots;
+
+/// An empty `MasterEffectSlots` (no master-bus effects loaded).
+pub fn new_master_effect_slots() -> MasterEffectSlots {
+    new_track_effect_slots(1)
 }
 
 /// A `TrackEffectSlots` with `track_count` empty per-track chains.

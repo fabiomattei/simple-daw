@@ -944,6 +944,18 @@ pub enum TrackEffectConfig {
         #[serde(default = "default_channel_eq_bands")]
         bands: Vec<EqBand>,
     },
+    /// Look-ahead brickwall/peak limiter: `input_gain_db` drives the signal in, `ceiling_db` is
+    /// the hard output ceiling, `release_ms` sets gain recovery speed after a loud passage. See
+    /// `LimiterEffect` for why look-ahead makes this a hard ceiling rather than a soft target the
+    /// way `Compressor` is.
+    Limiter {
+        #[serde(default = "default_limiter_input_gain_db")]
+        input_gain_db: f32,
+        #[serde(default = "default_limiter_ceiling_db")]
+        ceiling_db: f32,
+        #[serde(default = "default_limiter_release_ms")]
+        release_ms: f32,
+    },
 }
 
 /// Which frequencies a `TrackEffectConfig::Filter`/`FilterEffect` passes through.
@@ -1154,6 +1166,15 @@ fn default_noise_gate_release_ms() -> f32 {
 fn default_noise_gate_range_db() -> f32 {
     -60.0
 }
+fn default_limiter_input_gain_db() -> f32 {
+    0.0
+}
+fn default_limiter_ceiling_db() -> f32 {
+    -0.3
+}
+fn default_limiter_release_ms() -> f32 {
+    50.0
+}
 
 impl TrackEffectConfig {
     /// Default parameter values used when a user picks "Delay / Echo" from the "+ Add Effect"
@@ -1267,6 +1288,14 @@ impl TrackEffectConfig {
     pub fn default_channel_eq() -> Self {
         TrackEffectConfig::ChannelEq {
             bands: default_channel_eq_bands(),
+        }
+    }
+    /// Default parameter values used when a user picks "Limiter" from the "+ Add Effect" menu.
+    pub fn default_limiter() -> Self {
+        TrackEffectConfig::Limiter {
+            input_gain_db: default_limiter_input_gain_db(),
+            ceiling_db: default_limiter_ceiling_db(),
+            release_ms: default_limiter_release_ms(),
         }
     }
 }
@@ -1548,12 +1577,12 @@ pub struct Song {
     /// Monotonically increasing counter for `Note::id` allocation, shared
     /// across every track's piano roll so ids never collide.
     pub next_note_id: u64,
-    /// The master-bus CLAP effect's plugin path and parameter values — same shape and same
-    /// re-load contract as one entry of `Track::effects`.
+    /// The master bus's insert effect chain — same shape and processing order as
+    /// `Track::effects`, just with no track attached. `#[serde(default)]` so song files saved
+    /// before this was a chain (a single CLAP plugin path/params pair) still load; see
+    /// `load_from_file`'s old-shape migration.
     #[serde(default)]
-    pub master_effect_path: String,
-    #[serde(default)]
-    pub master_effect_params: Vec<(u32, f64)>,
+    pub master_effects: Vec<TrackEffectConfig>,
     /// Project-level library of imported CLAP plugins, each tagged with a mnemonic name so it can
     /// be picked by name — from the master Plugins window or a track's "+ Add Effect" menu —
     /// instead of by its (often long) filesystem path. Entries are just name/path pairs, not live
@@ -1734,8 +1763,10 @@ impl Song {
             bpm: 120.0,
             tracks: vec![drums, bass],
             next_note_id,
-            master_effect_path: String::new(),
-            master_effect_params: Vec::new(),
+            // A default master-bus limiter, matching how e.g. Logic ships an Adaptive Limiter on
+            // the master by default — a safety net against clipping rather than a creative choice,
+            // so new songs get one without the user having to think about gain staging first.
+            master_effects: vec![TrackEffectConfig::default_limiter()],
             plugins: Vec::new(),
             synth_presets: Vec::new(),
             time_signature_numerator: 4,
@@ -1787,6 +1818,12 @@ impl Song {
     /// `Region`s, neither of the above → deserializes straight into `Song`. Tier 1 is upgraded to
     /// tier 2's shape first, then both tiers 1 and 2 finish through the same `migrate_patterns_song`
     /// call, so there's exactly one place that produces the final `Region`-based shape.
+    ///
+    /// Independently of tier, a save from before the master bus became a chain (`master_effects`)
+    /// only has a top-level `master_effect_path`/`master_effect_params` pair (one CLAP plugin) —
+    /// read directly off the raw JSON here, since none of the three tier shapes above carry it
+    /// anymore, and wrapped into a one-entry `master_effects` chain if the new-shape field came
+    /// back empty.
     pub fn load_from_file(path: &Path, sample_rate: Option<u32>) -> Result<Self> {
         let json = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
@@ -1797,6 +1834,15 @@ impl Song {
             .and_then(|t| t.as_array())
             .and_then(|tracks| tracks.first())
             .is_some_and(|t| t.get("pattern").is_some());
+        let old_master_effect_path = raw
+            .get("master_effect_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let old_master_effect_params: Vec<(u32, f64)> = raw
+            .get("master_effect_params")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
         let mut song: Song = if raw.get("patterns").is_some() {
             let mid: PatternsEraSong =
                 serde_json::from_value(raw).context("failed to parse song file")?;
@@ -1808,6 +1854,12 @@ impl Song {
         } else {
             serde_json::from_value(raw).context("failed to parse song file")?
         };
+        if song.master_effects.is_empty() && !old_master_effect_path.trim().is_empty() {
+            song.master_effects = vec![TrackEffectConfig::Clap {
+                path: old_master_effect_path,
+                params: old_master_effect_params,
+            }];
+        }
         if let Some(rate) = sample_rate {
             song.reload_samples(rate);
         }
@@ -1891,10 +1943,6 @@ struct LegacySong {
     tracks: Vec<LegacyTrack>,
     next_note_id: u64,
     #[serde(default)]
-    master_effect_path: String,
-    #[serde(default)]
-    master_effect_params: Vec<(u32, f64)>,
-    #[serde(default)]
     synth_presets: Vec<SynthPreset>,
 }
 
@@ -1929,10 +1977,6 @@ struct PatternsEraSong {
     // `regions` just comes back empty, and `migrate_patterns_song` fills it in.
     tracks: Vec<Track>,
     next_note_id: u64,
-    #[serde(default)]
-    master_effect_path: String,
-    #[serde(default)]
-    master_effect_params: Vec<(u32, f64)>,
     #[serde(default)]
     synth_presets: Vec<SynthPreset>,
     #[serde(default)]
@@ -2009,8 +2053,6 @@ fn legacy_to_patterns_era(legacy: LegacySong) -> PatternsEraSong {
         bpm: legacy.bpm,
         tracks,
         next_note_id: legacy.next_note_id,
-        master_effect_path: legacy.master_effect_path,
-        master_effect_params: legacy.master_effect_params,
         synth_presets: legacy.synth_presets,
         patterns,
         arrangement,
@@ -2059,8 +2101,10 @@ fn migrate_patterns_song(mid: PatternsEraSong) -> Song {
         bpm: mid.bpm,
         tracks,
         next_note_id: mid.next_note_id,
-        master_effect_path: mid.master_effect_path,
-        master_effect_params: mid.master_effect_params,
+        // Populated uniformly by `load_from_file` from the raw JSON's old
+        // `master_effect_path`/`master_effect_params` keys (present on saves from any era, this
+        // migration function's own tier included), not threaded through here.
+        master_effects: Vec::new(),
         plugins: Vec::new(),
         synth_presets: mid.synth_presets,
         time_signature_numerator: 4,
@@ -2167,8 +2211,10 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_effect_state() {
         let mut song = Song::demo();
-        song.master_effect_path = "/usr/lib64/clap/ZamDelay.clap".to_string();
-        song.master_effect_params = vec![(0, 0.5), (2, 1.0)];
+        song.master_effects = vec![TrackEffectConfig::Clap {
+            path: "/usr/lib64/clap/ZamDelay.clap".to_string(),
+            params: vec![(0, 0.5), (2, 1.0)],
+        }];
         song.tracks[1].effects = vec![TrackEffectConfig::Clap {
             path: "/usr/lib64/clap/ZamGate.clap".to_string(),
             params: vec![(1, 0.25)],
@@ -2182,8 +2228,13 @@ mod tests {
         let loaded = Song::load_from_file(&path, None).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(loaded.master_effect_path, song.master_effect_path);
-        assert_eq!(loaded.master_effect_params, song.master_effect_params);
+        match &loaded.master_effects[..] {
+            [TrackEffectConfig::Clap { path, params }] => {
+                assert_eq!(path, "/usr/lib64/clap/ZamDelay.clap");
+                assert_eq!(params, &vec![(0, 0.5), (2, 1.0)]);
+            }
+            other => panic!("expected a single master Clap effect, got {other:?}"),
+        }
         assert_eq!(loaded.tracks[1].effects.len(), 1);
         match &loaded.tracks[1].effects[0] {
             TrackEffectConfig::Clap { path, params } => {
@@ -2486,6 +2537,38 @@ mod tests {
     }
 
     #[test]
+    fn save_then_load_round_trips_limiter() {
+        let mut song = Song::demo();
+        song.tracks[0].effects = vec![TrackEffectConfig::Limiter {
+            input_gain_db: 6.0,
+            ceiling_db: -0.5,
+            release_ms: 80.0,
+        }];
+
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-fx-limiter-{}.json",
+            std::process::id()
+        ));
+        song.save_to_file(&path).unwrap();
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.tracks[0].effects.len(), 1);
+        match &loaded.tracks[0].effects[0] {
+            TrackEffectConfig::Limiter {
+                input_gain_db,
+                ceiling_db,
+                release_ms,
+            } => {
+                assert_eq!(*input_gain_db, 6.0);
+                assert_eq!(*ceiling_db, -0.5);
+                assert_eq!(*release_ms, 80.0);
+            }
+            other => panic!("expected a Limiter effect, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn load_from_file_defaults_effect_fields_for_pre_existing_song_files() {
         // A song file saved before effect persistence existed has no `effects` /
         // `master_effect_path` / `master_effect_params` keys at all.
@@ -2512,10 +2595,39 @@ mod tests {
         let loaded = Song::load_from_file(&path, None).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(loaded.master_effect_path, "");
-        assert!(loaded.master_effect_params.is_empty());
+        assert!(loaded.master_effects.is_empty());
         assert!(loaded.tracks[0].effects.is_empty());
         assert_eq!(loaded.tracks[0].volume, 1.0);
+    }
+
+    #[test]
+    fn load_from_file_migrates_old_master_effect_path_into_master_effects_chain() {
+        // A song saved before the master bus became a chain: a single top-level
+        // `master_effect_path`/`master_effect_params` pair instead of `master_effects`.
+        let json = r#"{
+            "name": "Old Song",
+            "bpm": 120.0,
+            "next_note_id": 0,
+            "master_effect_path": "/usr/lib64/clap/ZamDelay.clap",
+            "master_effect_params": [[0, 0.5]],
+            "tracks": []
+        }"#;
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-migrate-master-effect-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        match &loaded.master_effects[..] {
+            [TrackEffectConfig::Clap { path, params }] => {
+                assert_eq!(path, "/usr/lib64/clap/ZamDelay.clap");
+                assert_eq!(params, &vec![(0, 0.5)]);
+            }
+            other => panic!("expected a single master Clap effect, got {other:?}"),
+        }
     }
 
     #[test]

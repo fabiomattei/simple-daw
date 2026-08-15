@@ -10,7 +10,7 @@ use crate::model::{
     RegionContent, Song, SynthEngine, SynthParams, SynthWaveform, TICKS_PER_STEP, Track,
     TrackKind, TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams,
 };
-use crate::plugin_host::{self, MasterEffectSlot, TrackEffectSlots};
+use crate::plugin_host::{self, MasterEffectSlots, TrackEffectSlots};
 use crate::sample::SampleBuffer;
 use crate::wavetable::{self, WaveWarpMode, WavetableId};
 
@@ -171,7 +171,7 @@ impl AudioEngine {
     pub fn start(
         song: Arc<Mutex<Song>>,
         transport: Transport,
-        master_effect: MasterEffectSlot,
+        master_effects: MasterEffectSlots,
         track_effects: TrackEffectSlots,
         device_name: Option<&str>,
         sample_rate: Option<u32>,
@@ -226,7 +226,7 @@ impl AudioEngine {
                 &config,
                 song,
                 transport,
-                master_effect,
+                master_effects,
                 track_effects,
                 max_frames as usize,
             )?,
@@ -235,7 +235,7 @@ impl AudioEngine {
                 &config,
                 song,
                 transport,
-                master_effect,
+                master_effects,
                 track_effects,
                 max_frames as usize,
             )?,
@@ -244,7 +244,7 @@ impl AudioEngine {
                 &config,
                 song,
                 transport,
-                master_effect,
+                master_effects,
                 track_effects,
                 max_frames as usize,
             )?,
@@ -2378,7 +2378,7 @@ fn build_playback_stream<T>(
     config: &StreamConfig,
     song: Arc<Mutex<Song>>,
     transport: Transport,
-    master_effect: MasterEffectSlot,
+    master_effects: MasterEffectSlots,
     track_effects: TrackEffectSlots,
     max_frames: usize,
 ) -> Result<Stream>
@@ -2404,9 +2404,12 @@ where
     let mut track_chain_run_l: Vec<f32> = Vec::with_capacity(max_frames);
     let mut track_chain_run_r: Vec<f32> = Vec::with_capacity(max_frames);
 
-    // Scratch for the master-bus CLAP effect. Allocated once and reused every callback.
-    let mut master_scratch = plugin_host::EffectScratch::new();
-    master_scratch.reserve(max_frames);
+    // Scratch for the master bus's own effect chain — same shape as `track_scratch`'s per-track
+    // entries (one `EffectScratch` per chain slot), since the master chain runs through the exact
+    // same `process_effect_chain` call a track's chain does.
+    let mut master_scratch: Vec<plugin_host::EffectScratch> = Vec::new();
+    let mut master_chain_run_l: Vec<f32> = Vec::with_capacity(max_frames);
+    let mut master_chain_run_r: Vec<f32> = Vec::with_capacity(max_frames);
     let mut plugin_out_l: Vec<f32> = Vec::with_capacity(max_frames);
     let mut plugin_out_r: Vec<f32> = Vec::with_capacity(max_frames);
 
@@ -2435,6 +2438,15 @@ where
                 stage_scratch.push(s);
             }
             track_scratch.push(stage_scratch);
+        }
+    }
+    if let Ok(chains) = master_effects.lock()
+        && let Some(chain) = chains.first()
+    {
+        for _ in chain {
+            let mut s = plugin_host::EffectScratch::new();
+            s.reserve(max_frames);
+            master_scratch.push(s);
         }
     }
 
@@ -2558,29 +2570,34 @@ where
                 transport.current_tick.store(0, Ordering::Relaxed);
             }
 
-            // Run the mix through the master-bus CLAP effect, if one is loaded.
-            // Falls back to the dry stereo mix on any failure. Channel counts come
-            // from what the plugin actually declared via the `audio-ports`
-            // extension (see `plugin_host::load_and_activate`) — assuming every
-            // effect is 2-in/2-out caused real plugins (e.g. ZamDelay, which is
-            // mono-in) to read past their declared buffers.
-            let mut used_plugin = false;
-            if let Ok(mut guard) = master_effect.lock() {
-                if let Some(effect) = guard.as_mut() {
-                    plugin_out_l.resize(frames, 0.0);
-                    plugin_out_r.resize(frames, 0.0);
-                    used_plugin = plugin_host::process_effect(
-                        effect,
-                        &scratch_l,
-                        &scratch_r,
-                        &mut plugin_out_l,
-                        &mut plugin_out_r,
-                        &mut master_scratch,
-                    );
+            // Run the mix through the master bus's effect chain (CLAP and/or built-in stages, same
+            // machinery a track's own chain uses — see `plugin_host::process_effect_chain`), if
+            // any effects are loaded there. Falls back to the dry stereo mix if the chain is empty
+            // or nothing in it actually processed. Channel counts for a CLAP stage come from what
+            // the plugin actually declared via the `audio-ports` extension (see
+            // `plugin_host::load_and_activate`) — assuming every effect is 2-in/2-out caused real
+            // plugins (e.g. ZamDelay, which is mono-in) to read past their declared buffers.
+            let mut used_master_chain = false;
+            if let Ok(mut chains) = master_effects.lock() {
+                let chain = chains.get_mut(0).map_or(&mut [][..], Vec::as_mut_slice);
+                while master_scratch.len() < chain.len() {
+                    master_scratch.push(plugin_host::EffectScratch::new());
                 }
+                plugin_out_l.resize(frames, 0.0);
+                plugin_out_r.resize(frames, 0.0);
+                used_master_chain = plugin_host::process_effect_chain(
+                    chain,
+                    &scratch_l,
+                    &scratch_r,
+                    &mut plugin_out_l,
+                    &mut plugin_out_r,
+                    &mut master_scratch,
+                    &mut master_chain_run_l,
+                    &mut master_chain_run_r,
+                );
             }
 
-            let (left, right): (&[f32], &[f32]) = if used_plugin {
+            let (left, right): (&[f32], &[f32]) = if used_master_chain {
                 (&plugin_out_l, &plugin_out_r)
             } else {
                 (&scratch_l, &scratch_r)
@@ -3336,8 +3353,7 @@ mod tests {
             bpm: 120.0,
             tracks: vec![track],
             next_note_id: 0,
-            master_effect_path: String::new(),
-            master_effect_params: Vec::new(),
+            master_effects: Vec::new(),
             plugins: Vec::new(),
             synth_presets: Vec::new(),
             time_signature_numerator: 4,
@@ -3469,8 +3485,7 @@ mod tests {
             bpm: 120.0,
             tracks: vec![track_a, track_b],
             next_note_id: 0,
-            master_effect_path: String::new(),
-            master_effect_params: Vec::new(),
+            master_effects: Vec::new(),
             plugins: Vec::new(),
             synth_presets: Vec::new(),
             time_signature_numerator: 4,
@@ -3521,8 +3536,7 @@ mod tests {
             bpm: 120.0,
             tracks: vec![track],
             next_note_id: 0,
-            master_effect_path: String::new(),
-            master_effect_params: Vec::new(),
+            master_effects: Vec::new(),
             plugins: Vec::new(),
             synth_presets: Vec::new(),
             time_signature_numerator: 4,

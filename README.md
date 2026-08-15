@@ -15,7 +15,7 @@ Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three bu
 - **MIDI import** — load a standard `.mid` file into a track's piano roll.
 - **Song persistence** — save/load the whole song (tracks, regions, sample paths, loaded effect paths and parameter values) to/from a JSON file via the File menu.
 - **WAV export** — bounce the song to a file for a configurable number of loops; export uses the exact same sequencing/mixing code as live playback (dry only — CLAP effects aren't included in the bounce).
-- **CLAP effect hosting** — load a CLAP plugin as a master-bus insert effect *and* as a per-track insert effect, with host-side parameter editing (a generic "Params" window driven by the plugin's declared CLAP parameters). No plugin GUI, no host-side automation, and no unload mid-session once a plugin is loaded.
+- **Effect chains, master bus and per track** — mix built-in DSP (delay, reverb, compressor, limiter, channel EQ, and more) with hosted CLAP plugins in any order, on the master bus or on any track. New songs start with a default Limiter loaded on the master bus, the way Logic ships an Adaptive Limiter on master by default. CLAP hosting has host-side parameter editing (a generic "Params" window driven by the plugin's declared CLAP parameters) but no plugin GUI, no host-side automation, and no unload mid-session once a plugin is loaded.
 
 ## Building
 
@@ -69,8 +69,8 @@ Unit tests cover synth/DSP math and the WAV exporter, but can't prove the live a
 - `src/main.rs` — egui/eframe UI. Owns the `Song` behind an `Arc<Mutex<Song>>`, shared with the audio thread. Also has the File menu (Load/Save/Save As/Export), the channel rack, piano roll and step-grid canvases, and the per-engine/per-effect parameter windows.
 - `src/model.rs` — pure data model: `Song` → `Track` → `Region` → `RegionContent` (`Lane` steps or `Note`s). No audio, no UI. Also owns JSON save/load (`serde`/`serde_json`).
 - `src/factory_presets.rs` — the built-in `SynthPreset` catalog shipped with the app, several patches per synth engine.
-- `src/audio.rs` — the real-time engine: cpal stream setup, the step/tick clock and per-track synth voice pools (one per engine, plus a sample-playback pool), CLAP master- and per-track-effect integration, and the offline WAV exporter.
-- `src/builtin_fx.rs` — DSP for the built-in (non-CLAP) effects: delay, bitcrusher, distortion, reverb, chorus, filter, tremolo, compressor, flanger, phaser, ring modulator, noise gate, phase invert.
+- `src/audio.rs` — the real-time engine: cpal stream setup, the step/tick clock and per-track synth voice pools (one per engine, plus a sample-playback pool), master-bus and per-track effect chain processing (CLAP and built-in), and the offline WAV exporter.
+- `src/builtin_fx/` — DSP for the built-in (non-CLAP) effects, one file per effect: delay, bitcrusher, distortion, reverb, chorus, filter, tremolo, compressor, flanger, phaser, ring modulator, noise gate, phase invert, channel EQ, limiter.
 - `src/plugin_host.rs` — CLAP plugin hosting (loading, activating, querying audio-port channel counts and plugin parameters, running audio through a loaded effect).
 - `src/sample.rs` — WAV decoding and resampling for one-shot sample playback.
 - `src/wavetable.rs` — wavetable data and sampling for the `Wave` synth engine.

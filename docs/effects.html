@@ -39,6 +39,7 @@
       <div class="card"><h4>Noise Gate</h4></div>
       <div class="card"><h4>Phase Invert</h4></div>
       <div class="card"><h4>Channel EQ</h4></div>
+      <div class="card"><h4>Limiter</h4></div>
     </div>
 
     <h2>Per-track FX chain</h2>
@@ -48,7 +49,12 @@
 
     <h2>Master bus FX</h2>
     <p>The master bus has its own effect chain, applied after every track has been mixed together,
-      configured the same way as a per-track chain.</p>
+      configured the same way as a per-track chain — open it from the <strong>Plugins</strong>
+      window's "Master bus FX chain" section.</p>
+    <p>New songs start with a built-in <strong>Limiter</strong> already loaded on the master bus
+      (a look-ahead peak/brickwall limiter, not a same-instant compressor — see its params for
+      ceiling/release/input gain), the same way Logic ships an Adaptive Limiter on the master by
+      default. Remove it from the chain if you don't want it.</p>
 
     <h2>CLAP plugin hosting</h2>
     <p>Any FX slot (per-track or master) can instead host a CLAP plugin:</p>
