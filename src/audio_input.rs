@@ -36,8 +36,13 @@ pub struct InputRecorder {
 
 impl InputRecorder {
     /// Starts capturing from the input device named `device_name`, falling back to the host's
-    /// default input device if `None` or if no device with that name is found.
-    pub fn start(device_name: Option<&str>) -> Result<Self> {
+    /// default input device if `None` or if no device with that name is found. `input_gain` is
+    /// the armed track's preamp trim (see `Track::input_gain`) — applied once, in the input
+    /// callback, before samples reach the capture buffer or the level meter, so the meter reflects
+    /// what actually gets recorded. Fixed for the session's lifetime, same as `device_name`: this
+    /// app has no live input monitoring, so there's no path by which changing the trim mid-take
+    /// would need to take effect.
+    pub fn start(device_name: Option<&str>, input_gain: f32) -> Result<Self> {
         let host = cpal::default_host();
         let named_device = device_name.and_then(|name| {
             host.input_devices().ok()?.find(|d| {
@@ -61,15 +66,27 @@ impl InputRecorder {
         let peak_bits = Arc::new(AtomicU32::new(0));
 
         let stream = match sample_format {
-            SampleFormat::F32 => {
-                build_input_stream::<f32>(&device, &config, buffer.clone(), peak_bits.clone())?
-            }
-            SampleFormat::I16 => {
-                build_input_stream::<i16>(&device, &config, buffer.clone(), peak_bits.clone())?
-            }
-            SampleFormat::U16 => {
-                build_input_stream::<u16>(&device, &config, buffer.clone(), peak_bits.clone())?
-            }
+            SampleFormat::F32 => build_input_stream::<f32>(
+                &device,
+                &config,
+                buffer.clone(),
+                peak_bits.clone(),
+                input_gain,
+            )?,
+            SampleFormat::I16 => build_input_stream::<i16>(
+                &device,
+                &config,
+                buffer.clone(),
+                peak_bits.clone(),
+                input_gain,
+            )?,
+            SampleFormat::U16 => build_input_stream::<u16>(
+                &device,
+                &config,
+                buffer.clone(),
+                peak_bits.clone(),
+                input_gain,
+            )?,
             other => bail!("unsupported input sample format: {other:?}"),
         };
         stream.play().context("failed to start input stream")?;
@@ -105,6 +122,7 @@ fn build_input_stream<T>(
     config: &StreamConfig,
     buffer: Arc<Mutex<Vec<f32>>>,
     peak_bits: Arc<AtomicU32>,
+    input_gain: f32,
 ) -> Result<Stream>
 where
     T: SizedSample,
@@ -120,7 +138,7 @@ where
                 .chunks(channels)
                 .map(|frame| {
                     let sum: f32 = frame.iter().map(|s| f32::from_sample(*s)).sum();
-                    let value = sum / channels as f32;
+                    let value = (sum / channels as f32) * input_gain;
                     block_peak = block_peak.max(value.abs());
                     value
                 })

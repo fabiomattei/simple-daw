@@ -70,7 +70,7 @@ Unit tests cover synth/DSP math and the WAV exporter, but can't prove the live a
 - `src/model.rs` — pure data model: `Song` → `Track` → `Region` → `RegionContent` (`Lane` steps or `Note`s). No audio, no UI. Also owns JSON save/load (`serde`/`serde_json`).
 - `src/factory_presets.rs` — the built-in `SynthPreset` catalog shipped with the app, several patches per synth engine.
 - `src/audio.rs` — the real-time engine: cpal stream setup, the step/tick clock and per-track synth voice pools (one per engine, plus a sample-playback pool), CLAP master- and per-track-effect integration, and the offline WAV exporter.
-- `src/builtin_fx.rs` — DSP for the built-in (non-CLAP) effects: delay, bitcrusher, distortion, reverb, chorus, filter, tremolo, compressor, flanger, phaser, ring modulator, noise gate.
+- `src/builtin_fx.rs` — DSP for the built-in (non-CLAP) effects: delay, bitcrusher, distortion, reverb, chorus, filter, tremolo, compressor, flanger, phaser, ring modulator, noise gate, phase invert.
 - `src/plugin_host.rs` — CLAP plugin hosting (loading, activating, querying audio-port channel counts and plugin parameters, running audio through a loaded effect).
 - `src/sample.rs` — WAV decoding and resampling for one-shot sample playback.
 - `src/wavetable.rs` — wavetable data and sampling for the `Wave` synth engine.

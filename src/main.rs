@@ -20,11 +20,11 @@ use builtin_fx::BuiltInEffect;
 use clack_host::prelude::PluginInstance;
 use factory_presets::factory_presets;
 use model::{
-    AudioClip, FilterMode, FilterRouting, FilterSlope, FilterType, Lane, LfoTarget, ModSlot,
-    ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, Song, SynthEngine,
-    SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP, Track, TrackEffectConfig, TrackKind,
-    TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams, add_note, clear_overlaps,
-    find_note_mut, remove_note,
+    AudioClip, EqBandType, FilterMode, FilterRouting, FilterSlope, FilterType, Lane,
+    LfoTarget, ModSlot, ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, Song,
+    SynthEngine, SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP, Track, TrackEffectConfig,
+    TrackKind, TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams, add_note,
+    clear_overlaps, find_note_mut, remove_note,
 };
 use plugin_host::{
     DawHost, EffectInstance, LoadedEffect, MasterEffectSlot, PluginGuiHandle, PluginParamInfo,
@@ -1590,6 +1590,60 @@ fn built_in_effect_params_ui(ui: &mut egui::Ui, effect: &mut BuiltInEffect) {
                     .suffix(" dB"),
             );
         }
+        BuiltInEffect::PhaseInvert(e) => {
+            ui.checkbox(&mut e.invert_left, "Invert L");
+            ui.checkbox(&mut e.invert_right, "Invert R");
+        }
+        BuiltInEffect::ChannelEq(e) => {
+            for (index, band) in e.bands.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut band.enabled, "");
+                    egui::ComboBox::from_id_salt(("channel-eq-band-type", index))
+                        .selected_text(eq_band_type_label(band.band_type))
+                        .show_ui(ui, |ui| {
+                            for band_type in [
+                                EqBandType::HighPass,
+                                EqBandType::LowShelf,
+                                EqBandType::Peak,
+                                EqBandType::HighShelf,
+                                EqBandType::LowPass,
+                            ] {
+                                ui.selectable_value(
+                                    &mut band.band_type,
+                                    band_type,
+                                    eq_band_type_label(band_type),
+                                );
+                            }
+                        });
+                    ui.add(
+                        egui::Slider::new(&mut band.freq_hz, 20.0..=20_000.0)
+                            .logarithmic(true)
+                            .text("Freq")
+                            .suffix(" Hz"),
+                    );
+                    let has_gain =
+                        !matches!(band.band_type, EqBandType::HighPass | EqBandType::LowPass);
+                    ui.add_enabled(
+                        has_gain,
+                        egui::Slider::new(&mut band.gain_db, -18.0..=18.0)
+                            .text("Gain")
+                            .suffix(" dB"),
+                    );
+                    ui.add(egui::Slider::new(&mut band.q, 0.1..=10.0).text("Q"));
+                });
+            }
+        }
+    }
+}
+
+/// Short label for a Channel EQ band's shape, used by the type combo box in `render_effect_params`.
+fn eq_band_type_label(band_type: EqBandType) -> &'static str {
+    match band_type {
+        EqBandType::HighPass => "High Pass",
+        EqBandType::LowShelf => "Low Shelf",
+        EqBandType::Peak => "Peak",
+        EqBandType::HighShelf => "High Shelf",
+        EqBandType::LowPass => "Low Pass",
     }
 }
 
@@ -4268,8 +4322,13 @@ impl eframe::App for SimpleDawApp {
                                         self.sample_rate,
                                     ));
                                 } else if let Some(track_index) = self.record_armed_track {
+                                    let input_gain = song
+                                        .tracks
+                                        .get(track_index)
+                                        .map_or(1.0, |t| t.input_gain);
                                     match audio_input::InputRecorder::start(
                                         self.selected_input_device.as_deref(),
+                                        input_gain,
                                     ) {
                                         Ok(recorder) => {
                                             self.transport.set_playing(true);
@@ -5495,6 +5554,9 @@ fn channel_rack_row_ui(
                                 }
                             }
                         });
+                    ui.weak("Trim:");
+                    ui.add(egui::Slider::new(&mut track.input_gain, 0.0..=2.0).show_value(false))
+                        .on_hover_text(format!("Input gain: {:.2}", track.input_gain));
                 });
             }
         });
@@ -5711,6 +5773,8 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
                 TrackEffectConfig::default_ring_modulator(),
             ),
             ("Noise Gate", TrackEffectConfig::default_noise_gate()),
+            ("Phase Invert", TrackEffectConfig::default_phase_invert()),
+            ("Channel EQ", TrackEffectConfig::default_channel_eq()),
         ] {
             if ui.button(label).clicked() {
                 fx.paths.push(String::new());

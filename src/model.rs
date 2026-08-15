@@ -929,6 +929,21 @@ pub enum TrackEffectConfig {
         #[serde(default = "default_noise_gate_range_db")]
         range_db: f32,
     },
+    /// Flips signal polarity, independently per channel — for stereo phase troubleshooting (e.g.
+    /// correcting an out-of-phase mic pair), not tone shaping, so it has no dry/wet mix.
+    PhaseInvert {
+        #[serde(default)]
+        invert_left: bool,
+        #[serde(default)]
+        invert_right: bool,
+    },
+    /// A parametric multiband EQ modeled on Logic's Channel EQ: a fixed chain of 8 bands (low
+    /// cut, low shelf, four peaking bands, high shelf, high cut), each independently switchable
+    /// and tunable. See `EqBand`.
+    ChannelEq {
+        #[serde(default = "default_channel_eq_bands")]
+        bands: Vec<EqBand>,
+    },
 }
 
 /// Which frequencies a `TrackEffectConfig::Filter`/`FilterEffect` passes through.
@@ -936,6 +951,108 @@ pub enum TrackEffectConfig {
 pub enum FilterMode {
     LowPass,
     HighPass,
+}
+
+/// The filter shape one `EqBand` applies. `HighPass`/`LowPass` ignore `EqBand::gain_db` (a cut
+/// has no gain, only a corner frequency and a resonance); the other three shape gain around
+/// `freq_hz`, wide (shelf) or narrow (peak).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EqBandType {
+    HighPass,
+    LowShelf,
+    #[default]
+    Peak,
+    HighShelf,
+    LowPass,
+}
+
+/// One band of a `TrackEffectConfig::ChannelEq`/`ChannelEqEffect`: a single biquad stage with its
+/// own shape, corner/center frequency, gain (peak/shelf only), resonance/bandwidth, and bypass.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EqBand {
+    pub band_type: EqBandType,
+    pub freq_hz: f32,
+    pub gain_db: f32,
+    pub q: f32,
+    pub enabled: bool,
+}
+
+impl Default for EqBand {
+    fn default() -> Self {
+        Self {
+            band_type: EqBandType::Peak,
+            freq_hz: 1000.0,
+            gain_db: 0.0,
+            q: 0.7,
+            enabled: true,
+        }
+    }
+}
+
+/// The 8-band layout `TrackEffectConfig::default_channel_eq()` starts a new Channel EQ with,
+/// mirroring Logic's Channel EQ: a low cut and high cut (off by default, since a cut is
+/// immediately audible) bracketing a low shelf, four peaking bands spread across the audible
+/// range, and a high shelf (all four on, at 0dB gain so they start transparent).
+fn default_channel_eq_bands() -> Vec<EqBand> {
+    vec![
+        EqBand {
+            band_type: EqBandType::HighPass,
+            freq_hz: 30.0,
+            gain_db: 0.0,
+            q: 0.7,
+            enabled: false,
+        },
+        EqBand {
+            band_type: EqBandType::LowShelf,
+            freq_hz: 100.0,
+            gain_db: 0.0,
+            q: 0.7,
+            enabled: true,
+        },
+        EqBand {
+            band_type: EqBandType::Peak,
+            freq_hz: 250.0,
+            gain_db: 0.0,
+            q: 0.7,
+            enabled: true,
+        },
+        EqBand {
+            band_type: EqBandType::Peak,
+            freq_hz: 1000.0,
+            gain_db: 0.0,
+            q: 0.7,
+            enabled: true,
+        },
+        EqBand {
+            band_type: EqBandType::Peak,
+            freq_hz: 2500.0,
+            gain_db: 0.0,
+            q: 0.7,
+            enabled: true,
+        },
+        EqBand {
+            band_type: EqBandType::Peak,
+            freq_hz: 6000.0,
+            gain_db: 0.0,
+            q: 0.7,
+            enabled: true,
+        },
+        EqBand {
+            band_type: EqBandType::HighShelf,
+            freq_hz: 10000.0,
+            gain_db: 0.0,
+            q: 0.7,
+            enabled: true,
+        },
+        EqBand {
+            band_type: EqBandType::LowPass,
+            freq_hz: 18000.0,
+            gain_db: 0.0,
+            q: 0.7,
+            enabled: false,
+        },
+    ]
 }
 
 fn default_delay_time_ms() -> f32 {
@@ -1139,9 +1256,26 @@ impl TrackEffectConfig {
             range_db: default_noise_gate_range_db(),
         }
     }
+    /// Default parameter values used when a user picks "Phase Invert" from the "+ Add Effect" menu.
+    pub fn default_phase_invert() -> Self {
+        TrackEffectConfig::PhaseInvert {
+            invert_left: false,
+            invert_right: false,
+        }
+    }
+    /// Default parameter values used when a user picks "Channel EQ" from the "+ Add Effect" menu.
+    pub fn default_channel_eq() -> Self {
+        TrackEffectConfig::ChannelEq {
+            bands: default_channel_eq_bands(),
+        }
+    }
 }
 
 fn default_track_volume() -> f32 {
+    1.0
+}
+
+fn default_input_gain() -> f32 {
     1.0
 }
 
@@ -1236,6 +1370,13 @@ pub struct Track {
     /// existed still load centered.
     #[serde(default)]
     pub pan: f32,
+    /// Linear gain applied to incoming audio while this track is armed and recording, before it's
+    /// written to the take's WAV file — a preamp trim, distinct from `volume` (the mix fader
+    /// applied on playback). Only meaningful for `TrackKind::Audio`. 1.0 is unity.
+    /// `#[serde(default = "default_input_gain")]` so song files saved before this field existed
+    /// still load at unity input gain.
+    #[serde(default = "default_input_gain")]
+    pub input_gain: f32,
     /// This track's built-in synth voice settings (waveform + attack/decay). `#[serde(default)]`
     /// so song files saved before this field existed still load, defaulting to the original
     /// sine-with-instant-attack sound.
@@ -1279,6 +1420,7 @@ impl Track {
             effects: Vec::new(),
             volume: 1.0,
             pan: 0.0,
+            input_gain: 1.0,
             synth: SynthParams::default(),
             synth_engine: SynthEngine::default(),
             trine: TrineParams::default(),
@@ -1300,6 +1442,7 @@ impl Track {
             effects: Vec::new(),
             volume: 1.0,
             pan: 0.0,
+            input_gain: 1.0,
             synth: SynthParams::default(),
             synth_engine: SynthEngine::default(),
             trine: TrineParams::default(),
@@ -1321,6 +1464,7 @@ impl Track {
             effects: Vec::new(),
             volume: 1.0,
             pan: 0.0,
+            input_gain: 1.0,
             synth: SynthParams::default(),
             synth_engine: SynthEngine::default(),
             trine: TrineParams::default(),
@@ -1830,6 +1974,7 @@ fn legacy_to_patterns_era(legacy: LegacySong) -> PatternsEraSong {
             effects: legacy_track.effects,
             volume: legacy_track.volume,
             pan: 0.0,
+            input_gain: default_input_gain(),
             synth: legacy_track.synth,
             synth_engine: legacy_track.synth_engine,
             trine: legacy_track.trine,
@@ -2029,6 +2174,7 @@ mod tests {
             params: vec![(1, 0.25)],
         }];
         song.tracks[1].volume = 0.6;
+        song.tracks[1].input_gain = 1.4;
 
         let path =
             std::env::temp_dir().join(format!("simple-daw-test-fx-{}.json", std::process::id()));
@@ -2047,6 +2193,7 @@ mod tests {
             other => panic!("expected a Clap effect, got {other:?}"),
         }
         assert_eq!(loaded.tracks[1].volume, 0.6);
+        assert_eq!(loaded.tracks[1].input_gain, 1.4);
         assert!(
             loaded.tracks[0].effects.is_empty(),
             "track with no effect loaded should round-trip as empty, not inherit another track's"
@@ -2289,6 +2436,52 @@ mod tests {
                 assert_eq!(*range_db, -70.0);
             }
             other => panic!("expected a NoiseGate effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_channel_eq_bands() {
+        let mut song = Song::demo();
+        song.tracks[0].effects = vec![TrackEffectConfig::ChannelEq {
+            bands: vec![
+                EqBand {
+                    band_type: EqBandType::HighPass,
+                    freq_hz: 45.0,
+                    gain_db: 0.0,
+                    q: 0.9,
+                    enabled: true,
+                },
+                EqBand {
+                    band_type: EqBandType::Peak,
+                    freq_hz: 1200.0,
+                    gain_db: -4.5,
+                    q: 1.4,
+                    enabled: false,
+                },
+            ],
+        }];
+
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-fx-channel-eq-{}.json",
+            std::process::id()
+        ));
+        song.save_to_file(&path).unwrap();
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.tracks[0].effects.len(), 1);
+        match &loaded.tracks[0].effects[0] {
+            TrackEffectConfig::ChannelEq { bands } => {
+                assert_eq!(bands.len(), 2);
+                assert_eq!(bands[0].band_type, EqBandType::HighPass);
+                assert_eq!(bands[0].freq_hz, 45.0);
+                assert_eq!(bands[0].q, 0.9);
+                assert!(bands[0].enabled);
+                assert_eq!(bands[1].band_type, EqBandType::Peak);
+                assert_eq!(bands[1].gain_db, -4.5);
+                assert!(!bands[1].enabled);
+            }
+            other => panic!("expected a ChannelEq effect, got {other:?}"),
         }
     }
 

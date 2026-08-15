@@ -14,6 +14,7 @@
 //! history, not from a deliberate L/R phase or tuning offset.
 
 mod bitcrusher;
+mod channel_eq;
 mod chorus;
 mod compressor;
 mod delay;
@@ -21,6 +22,7 @@ mod distortion;
 mod filter;
 mod flanger;
 mod noise_gate;
+mod phase_invert;
 mod phaser;
 mod reverb;
 mod ring_modulator;
@@ -31,6 +33,7 @@ use crate::model::TrackEffectConfig;
 // their own submodules stay private, but `main.rs` pattern-matches `BuiltInEffect`'s variants and
 // reads/writes the bound struct's `pub` fields directly to build each effect's UI sliders.
 pub(crate) use bitcrusher::BitcrusherEffect;
+pub(crate) use channel_eq::ChannelEqEffect;
 pub(crate) use chorus::ChorusEffect;
 pub(crate) use compressor::CompressorEffect;
 pub(crate) use delay::DelayEffect;
@@ -38,6 +41,7 @@ pub(crate) use distortion::DistortionEffect;
 pub(crate) use filter::FilterEffect;
 pub(crate) use flanger::FlangerEffect;
 pub(crate) use noise_gate::NoiseGateEffect;
+pub(crate) use phase_invert::PhaseInvertEffect;
 pub(crate) use phaser::PhaserEffect;
 pub(crate) use reverb::ReverbEffect;
 pub(crate) use ring_modulator::RingModulatorEffect;
@@ -60,6 +64,8 @@ pub enum BuiltInEffect {
     Phaser(PhaserEffect),
     RingModulator(RingModulatorEffect),
     NoiseGate(NoiseGateEffect),
+    PhaseInvert(PhaseInvertEffect),
+    ChannelEq(ChannelEqEffect),
 }
 
 impl BuiltInEffect {
@@ -159,6 +165,13 @@ impl BuiltInEffect {
                 *range_db,
                 sample_rate,
             )),
+            TrackEffectConfig::PhaseInvert {
+                invert_left,
+                invert_right,
+            } => BuiltInEffect::PhaseInvert(PhaseInvertEffect::new(*invert_left, *invert_right)),
+            TrackEffectConfig::ChannelEq { bands } => {
+                BuiltInEffect::ChannelEq(ChannelEqEffect::new(bands.clone(), sample_rate))
+            }
             TrackEffectConfig::Clap { .. } => return None,
         })
     }
@@ -231,6 +244,13 @@ impl BuiltInEffect {
                 release_ms: e.release_ms,
                 range_db: e.range_db,
             },
+            BuiltInEffect::PhaseInvert(e) => TrackEffectConfig::PhaseInvert {
+                invert_left: e.invert_left,
+                invert_right: e.invert_right,
+            },
+            BuiltInEffect::ChannelEq(e) => TrackEffectConfig::ChannelEq {
+                bands: e.bands.clone(),
+            },
         }
     }
 
@@ -249,6 +269,8 @@ impl BuiltInEffect {
             BuiltInEffect::Phaser(_) => "Phaser",
             BuiltInEffect::RingModulator(_) => "Ring Mod",
             BuiltInEffect::NoiseGate(_) => "Noise Gate",
+            BuiltInEffect::PhaseInvert(_) => "Phase Invert",
+            BuiltInEffect::ChannelEq(_) => "Channel EQ",
         }
     }
 
@@ -269,6 +291,8 @@ impl BuiltInEffect {
             BuiltInEffect::Phaser(e) => e.process(l, r),
             BuiltInEffect::RingModulator(e) => e.process(l, r),
             BuiltInEffect::NoiseGate(e) => e.process(l, r),
+            BuiltInEffect::PhaseInvert(e) => e.process(l, r),
+            BuiltInEffect::ChannelEq(e) => e.process(l, r),
         }
     }
 }
