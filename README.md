@@ -14,8 +14,11 @@ Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three bu
 - **Audio tracks** — record live input straight to a WAV file and drop it on the timeline as a clip, or import an existing WAV the same way.
 - **MIDI import** — load a standard `.mid` file into a track's piano roll.
 - **Song persistence** — save/load the whole song (tracks, regions, sample paths, loaded effect paths and parameter values) to/from a JSON file via the File menu.
-- **WAV export** — bounce the song to a file for a configurable number of loops; export uses the exact same sequencing/mixing code as live playback (dry only — CLAP effects aren't included in the bounce).
-- **Effect chains, master bus and per track** — mix built-in DSP (delay, reverb, compressor, limiter, channel EQ, and more) with hosted CLAP plugins in any order, on the master bus or on any track. New songs start with a default Limiter loaded on the master bus, the way Logic ships an Adaptive Limiter on master by default. CLAP hosting has host-side parameter editing (a generic "Params" window driven by the plugin's declared CLAP parameters) but no plugin GUI, no host-side automation, and no unload mid-session once a plugin is loaded.
+- **WAV export** — bounce the song to a file for a configurable number of loops; export uses the exact same sequencing/mixing code as live playback (dry only — effects, sends, and automation aren't included in the bounce, only each track's Volume/Pan and the raw synth/sample/step sequencing).
+- **Effect chains, master bus, per track and per send** — mix built-in DSP (delay, reverb, compressor, limiter, channel EQ, and more) with hosted CLAP plugins in any order, on the master bus, any track, or any send bus. New songs start with a default Limiter loaded on the master bus, the way Logic ships an Adaptive Limiter on master by default. CLAP hosting has host-side parameter editing (a generic "Params" window driven by the plugin's declared CLAP parameters) but no plugin GUI and no unload mid-session once a plugin is loaded.
+- **Send buses** — aux buses with their own FX chain; each track gets a per-send level knob (post-fader) on its Mixer channel strip.
+- **Region fades and automation** — drag a Region's corner handles in the Playlist for a fade in/out; every Region also carries its own automation lanes (volume/pan/send-level/effect-param "rides," multi-point, edited under the Piano Roll/Beats grid) scoped to that Region's own track.
+- **Metering** — peak/RMS bar meters and BS.1770-4 LUFS (momentary/short-term/integrated) on every Mixer channel strip and the master strip.
 
 ## Building
 
@@ -69,9 +72,10 @@ Unit tests cover synth/DSP math and the WAV exporter, but can't prove the live a
 - `src/main.rs` — egui/eframe UI. Owns the `Song` behind an `Arc<Mutex<Song>>`, shared with the audio thread. Also has the File menu (Load/Save/Save As/Export), the channel rack, piano roll and step-grid canvases, and the per-engine/per-effect parameter windows.
 - `src/model.rs` — pure data model: `Song` → `Track` → `Region` → `RegionContent` (`Lane` steps or `Note`s). No audio, no UI. Also owns JSON save/load (`serde`/`serde_json`).
 - `src/factory_presets.rs` — the built-in `SynthPreset` catalog shipped with the app, several patches per synth engine.
-- `src/audio.rs` — the real-time engine: cpal stream setup, the step/tick clock and per-track synth voice pools (one per engine, plus a sample-playback pool), master-bus and per-track effect chain processing (CLAP and built-in), and the offline WAV exporter.
+- `src/audio.rs` — the real-time engine: cpal stream setup, the step/tick clock and per-track synth voice pools (one per engine, plus a sample-playback pool), master-bus/per-track/per-send effect chain processing (CLAP and built-in), region fade/automation evaluation, and the offline WAV exporter.
 - `src/builtin_fx/` — DSP for the built-in (non-CLAP) effects, one file per effect: delay, bitcrusher, distortion, reverb, chorus, filter, tremolo, compressor, flanger, phaser, ring modulator, noise gate, phase invert, channel EQ, limiter.
 - `src/plugin_host.rs` — CLAP plugin hosting (loading, activating, querying audio-port channel counts and plugin parameters, running audio through a loaded effect).
+- `src/metering.rs` — peak/RMS/LUFS metering for the Mixer's channel strips.
 - `src/sample.rs` — WAV decoding and resampling for one-shot sample playback.
 - `src/wavetable.rs` — wavetable data and sampling for the `Wave` synth engine.
 - `src/midi_import.rs` — standard MIDI file (`.mid`) import into piano-roll notes.
