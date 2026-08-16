@@ -17,14 +17,15 @@ impl NoiseGateChannel {
     fn process(
         &mut self,
         buf: &mut [f32],
+        key: Option<&[f32]>,
         threshold_db: f32,
         closed_gain: f32,
         attack_coeff: f32,
         release_coeff: f32,
     ) {
-        for sample in buf.iter_mut() {
+        for (i, sample) in buf.iter_mut().enumerate() {
             let input = *sample;
-            let rectified = input.abs();
+            let rectified = key.map_or(input.abs(), |key| key[i].abs());
             let env_coeff = if rectified > self.envelope {
                 attack_coeff
             } else {
@@ -58,6 +59,10 @@ pub(crate) struct NoiseGateEffect {
     pub attack_ms: f32,
     pub release_ms: f32,
     pub range_db: f32,
+    /// See `TrackEffectConfig::NoiseGate`'s `sidechain_source` doc. Set from that field by
+    /// `BuiltInEffect::from_config`, edited live via the FX chain UI's sidechain picker (same as
+    /// this struct's other `pub` fields), and read back by `BuiltInEffect::to_config`.
+    pub sidechain_source: Option<usize>,
     left: NoiseGateChannel,
     right: NoiseGateChannel,
     sample_rate: f32,
@@ -76,6 +81,7 @@ impl NoiseGateEffect {
             attack_ms,
             release_ms,
             range_db,
+            sidechain_source: None,
             left: NoiseGateChannel::new(),
             right: NoiseGateChannel::new(),
             sample_rate,
@@ -87,13 +93,41 @@ impl NoiseGateEffect {
     }
 
     pub(super) fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
+        self.process_with_sidechain(l, r, None);
+    }
+
+    /// Same as `process`, but the gate opens/closes off `sidechain`'s envelope (a key input)
+    /// rather than `l`/`r`'s own — e.g. gating a pad open only while a rhythm track is playing.
+    /// `None` behaves exactly like `process`.
+    pub(super) fn process_with_sidechain(
+        &mut self,
+        l: &mut [f32],
+        r: &mut [f32],
+        sidechain: Option<(&[f32], &[f32])>,
+    ) {
         let attack_coeff = Self::time_coeff(self.attack_ms, self.sample_rate);
         let release_coeff = Self::time_coeff(self.release_ms, self.sample_rate);
         let closed_gain = 10f32.powf(self.range_db / 20.0);
-        self.left
-            .process(l, self.threshold_db, closed_gain, attack_coeff, release_coeff);
-        self.right
-            .process(r, self.threshold_db, closed_gain, attack_coeff, release_coeff);
+        let (key_l, key_r) = match sidechain {
+            Some((key_l, key_r)) => (Some(key_l), Some(key_r)),
+            None => (None, None),
+        };
+        self.left.process(
+            l,
+            key_l,
+            self.threshold_db,
+            closed_gain,
+            attack_coeff,
+            release_coeff,
+        );
+        self.right.process(
+            r,
+            key_r,
+            self.threshold_db,
+            closed_gain,
+            attack_coeff,
+            release_coeff,
+        );
     }
 }
 
@@ -122,6 +156,23 @@ mod tests {
             loud_l[3000] > 0.45,
             "expected the gate to pass a signal above threshold mostly unchanged, got {}",
             loud_l[3000]
+        );
+    }
+
+    #[test]
+    fn sidechain_key_opens_the_gate_for_a_quiet_main_signal() {
+        let sample_rate = 44100.0;
+        let mut gate = NoiseGateEffect::new(-20.0, 1.0, 20.0, -60.0, sample_rate);
+        // Below threshold on its own (mirrors the `quiet_gate` case above), but a loud key signal
+        // should hold the gate open anyway, proving it follows the key, not `l`/`r`.
+        let mut l = vec![0.01f32; 4000];
+        let mut r = l.clone();
+        let key = vec![0.5f32; 4000];
+        gate.process_with_sidechain(&mut l, &mut r, Some((&key, &key)));
+        assert!(
+            l[3000] > 0.009,
+            "expected a loud sidechain key to hold the gate open for a quiet main signal, got {}",
+            l[3000]
         );
     }
 }

@@ -516,6 +516,16 @@ enum FxSlotKind {
     BuiltIn(&'static str),
 }
 
+/// Set by a track row's Freeze/Unfreeze/Bounce button; applied by the caller once `song.tracks`'
+/// mutable-iterator borrow from the row loop has ended — same "signal during the loop, apply
+/// after" pattern `track_to_remove` already uses, since `freeze_track`/`bounce_track_in_place`
+/// need `&mut Song` as a whole, not just the one `&mut Track` a row has borrowed.
+enum TrackFreezeAction {
+    Freeze,
+    Unfreeze,
+    Bounce,
+}
+
 struct SimpleDawApp {
     engine: anyhow::Result<AudioEngine>,
     song: Arc<Mutex<Song>>,
@@ -962,6 +972,7 @@ fn channel_rack_contents_ui(
     song: &mut Song,
     engine_config: Option<(f64, u32, u32)>,
     track_to_remove: &mut Option<usize>,
+    freeze_requested: &mut Option<(usize, TrackFreezeAction)>,
     rack: &mut ChannelRackUi,
 ) {
     let sample_rate = engine_config.map(|(sr, _, _)| sr as u32);
@@ -1029,6 +1040,7 @@ fn channel_rack_contents_ui(
     });
     ui.separator();
 
+    let track_names: Vec<String> = song.tracks.iter().map(|t| t.name.clone()).collect();
     egui::ScrollArea::vertical().show(ui, |ui| {
         for (track_index, track) in song.tracks.iter_mut().enumerate() {
             let mut fx = TrackFxUi {
@@ -1041,6 +1053,7 @@ fn channel_rack_contents_ui(
                 guis: &mut rack.track_effect_guis[track_index],
                 engine_config,
                 known_plugins: &song.plugins,
+                track_names: &track_names,
                 editor: &mut *rack.effect_editor,
                 synth_editor: &mut *rack.synth_editor,
                 remove_requested: &mut *track_to_remove,
@@ -1056,6 +1069,7 @@ fn channel_rack_contents_ui(
                 rack.selected_input_device,
                 sample_rate,
                 bpm,
+                freeze_requested,
             );
             ui.add_space(4.0);
         }
@@ -1123,6 +1137,7 @@ fn mixer_contents_ui(
     });
     ui.separator();
 
+    let track_names: Vec<String> = song.tracks.iter().map(|t| t.name.clone()).collect();
     egui::ScrollArea::horizontal().show(ui, |ui| {
         ui.horizontal_top(|ui| {
             for (track_index, track) in song.tracks.iter_mut().enumerate() {
@@ -1142,6 +1157,7 @@ fn mixer_contents_ui(
                     guis: &mut mixer.track_effect_guis[track_index],
                     engine_config,
                     known_plugins: &song.plugins,
+                    track_names: &track_names,
                     editor: &mut *mixer.effect_editor,
                     synth_editor: &mut unused_synth_editor,
                     remove_requested: &mut unused_remove_requested,
@@ -1175,6 +1191,7 @@ fn mixer_contents_ui(
                 guis: mixer.master_effect_guis,
                 engine_config,
                 known_plugins: &song.plugins,
+                track_names: &track_names,
                 editor: &mut *mixer.effect_editor,
                 synth_editor: &mut unused_synth_editor,
                 remove_requested: &mut unused_remove_requested,
@@ -1202,6 +1219,7 @@ fn mixer_contents_ui(
                     guis: &mut mixer.send_effect_guis[send_index],
                     engine_config,
                     known_plugins: &song.plugins,
+                    track_names: &track_names,
                     editor: &mut *mixer.effect_editor,
                     synth_editor: &mut unused_synth_editor,
                     remove_requested: &mut unused_remove_requested,
@@ -1249,6 +1267,7 @@ fn mixer_contents_ui(
                     guis: &mut mixer.submix_effect_guis[submix_index],
                     engine_config,
                     known_plugins: &song.plugins,
+                    track_names: &track_names,
                     editor: &mut *mixer.effect_editor,
                     synth_editor: &mut unused_synth_editor,
                     remove_requested: &mut unused_remove_requested,
@@ -1596,6 +1615,9 @@ fn mixer_submix_strip_ui(
                 ui.menu_button("FX", |ui| {
                     fx_chain_ui(ui, fx);
                 });
+
+                ui.add(egui::Slider::new(&mut submix.pan, -1.0..=1.0).show_value(false))
+                    .on_hover_text(format!("Pan: {}", pan_label(submix.pan)));
 
                 ui.horizontal(|ui| {
                     let mute_color = if submix.muted {
@@ -5022,6 +5044,129 @@ fn finish_recording(
     (true, format!("Recorded {}", path.display()))
 }
 
+/// Writes a track's baked-down render (`audio::render_track_to_buffer`'s output) to a stereo WAV
+/// file, the freeze/bounce-in-place counterpart of `write_recording_wav` — same "own cache
+/// directory, timestamped filename" convention, kept separate (`frozen/` vs `recordings/`) since
+/// the two aren't the same kind of asset. Written stereo (unlike a recorded take's mono WAV) for
+/// full fidelity on disk even though `SampleBuffer::load_wav_resampled` downmixes to mono on load
+/// same as it already does for any imported stereo sample — see `render_track_to_buffer`'s doc.
+fn write_frozen_track_wav(
+    track_index: usize,
+    l: &[f32],
+    r: &[f32],
+    sample_rate: u32,
+) -> Result<std::path::PathBuf, String> {
+    let dir = Path::new("frozen");
+    std::fs::create_dir_all(dir).map_err(|err| format!("{err:#}"))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // A nanosecond timestamp alone isn't guaranteed unique under heavy parallelism (e.g. multiple
+    // tests freezing the same track index in the same process) — an atomic counter closes that gap.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("track{track_index}_{timestamp}_{sequence}.wav"));
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&path, spec).map_err(|err| format!("{err:#}"))?;
+    for (&l, &r) in l.iter().zip(r) {
+        writer
+            .write_sample((l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .map_err(|err| format!("{err:#}"))?;
+        writer
+            .write_sample((r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .map_err(|err| format!("{err:#}"))?;
+    }
+    writer.finalize().map_err(|err| format!("{err:#}"))?;
+    Ok(path)
+}
+
+/// Bakes `track_index`'s current live content (notes/steps/audio clips, run through its own
+/// effect chain — see `audio::render_track_to_buffer`) to a WAV file and points `Track::frozen_clip`
+/// at it, setting `Track::frozen`. Deletes the previous freeze's file first, if any, so repeated
+/// freeze/unfreeze cycles don't leak files into `frozen/`. `engine_sample_rate` is `None` only if
+/// the playback engine failed to start, in which case the clip is left unloaded (same tolerance
+/// `finish_recording` already has).
+fn freeze_track(
+    song: &mut Song,
+    track_index: usize,
+    render_sample_rate: u32,
+    engine_sample_rate: Option<u32>,
+) -> (bool, String) {
+    let Some((l, r)) = audio::render_track_to_buffer(song, track_index, render_sample_rate) else {
+        return (false, "Nothing to freeze".to_string());
+    };
+    let path = match write_frozen_track_wav(track_index, &l, &r, render_sample_rate) {
+        Ok(path) => path,
+        Err(err) => return (false, err),
+    };
+    let Some(track) = song.tracks.get_mut(track_index) else {
+        return (false, "Track no longer exists".to_string());
+    };
+    if let Some(old_clip) = track.frozen_clip.take() {
+        std::fs::remove_file(&old_clip.file_path).ok();
+    }
+    let mut clip = AudioClip::new(0, path.to_string_lossy().to_string());
+    if let Some(rate) = engine_sample_rate {
+        clip.load(rate);
+    }
+    track.frozen = true;
+    track.frozen_clip = Some(clip);
+    (true, format!("Froze {}", path.display()))
+}
+
+/// Reverts `track_index` to live synthesis, deleting the frozen WAV file `freeze_track` wrote.
+fn unfreeze_track(song: &mut Song, track_index: usize) {
+    let Some(track) = song.tracks.get_mut(track_index) else {
+        return;
+    };
+    if let Some(clip) = track.frozen_clip.take() {
+        std::fs::remove_file(&clip.file_path).ok();
+    }
+    track.frozen = false;
+}
+
+/// Destructively replaces `track_index`'s notes/steps/audio-clips/take-folders/effects with one
+/// baked `AudioClip` (via the same `render_track_to_buffer`/`write_frozen_track_wav` primitives
+/// `freeze_track` uses) and converts it to an audio track — the permanent counterpart of freeze.
+/// Unfreezes first if the track was already frozen, so the bake reflects its live content, not a
+/// stale previous freeze.
+fn bounce_track_in_place(
+    song: &mut Song,
+    track_index: usize,
+    render_sample_rate: u32,
+    engine_sample_rate: Option<u32>,
+) -> (bool, String) {
+    if song.tracks.get(track_index).is_some_and(|t| t.frozen) {
+        unfreeze_track(song, track_index);
+    }
+    let Some((l, r)) = audio::render_track_to_buffer(song, track_index, render_sample_rate) else {
+        return (false, "Nothing to bounce".to_string());
+    };
+    let path = match write_frozen_track_wav(track_index, &l, &r, render_sample_rate) {
+        Ok(path) => path,
+        Err(err) => return (false, err),
+    };
+    let Some(track) = song.tracks.get_mut(track_index) else {
+        return (false, "Track no longer exists".to_string());
+    };
+    let mut clip = AudioClip::new(0, path.to_string_lossy().to_string());
+    if let Some(rate) = engine_sample_rate {
+        clip.load(rate);
+    }
+    track.kind = TrackKind::Audio;
+    track.regions.clear();
+    track.audio_clips = vec![clip];
+    track.take_folders.clear();
+    track.effects.clear();
+    (true, format!("Bounced {} to audio", path.display()))
+}
+
 /// Snapshots one live effect chain (the master bus, or a single track) back into its
 /// `TrackEffectConfig` list form for persisting to a song file — the shared body behind
 /// `sync_song_effects`'s master and per-track cases, which differ only in which chain/paths
@@ -5034,11 +5179,13 @@ fn chain_to_config(chain: &[Option<EffectInstance>], paths: &[String]) -> Vec<Tr
             Some(EffectInstance::Clap(effect)) => TrackEffectConfig::Clap {
                 path: paths.get(slot_index).cloned().unwrap_or_default(),
                 params: effect.param_snapshot(),
+                sidechain_source: effect.sidechain_source,
             },
             Some(EffectInstance::BuiltIn(effect)) => effect.to_config(),
             None => TrackEffectConfig::Clap {
                 path: paths.get(slot_index).cloned().unwrap_or_default(),
                 params: Vec::new(),
+                sidechain_source: None,
             },
         })
         .collect()
@@ -5139,7 +5286,7 @@ fn build_effect_chain(
     let mut chain: Vec<Option<EffectInstance>> = Vec::with_capacity(specs.len());
     for spec in specs {
         match spec {
-            TrackEffectConfig::Clap { path, params } => {
+            TrackEffectConfig::Clap { path, params, sidechain_source } => {
                 paths.push(path.clone());
                 if path.trim().is_empty() {
                     instances.push(None);
@@ -5148,7 +5295,8 @@ fn build_effect_chain(
                     messages.push(None);
                 } else {
                     match load_effect(&path, &params, engine_config) {
-                        Ok((instance, effect, gui)) => {
+                        Ok((instance, mut effect, gui)) => {
+                            effect.sidechain_source = sidechain_source;
                             instances.push(Some(instance));
                             guis.push(Some(gui));
                             chain.push(Some(EffectInstance::Clap(effect)));
@@ -6395,6 +6543,8 @@ impl eframe::App for SimpleDawApp {
                     // `TrackFxUi` needs somewhere to point since it's shared with tracks.
                     let mut unused_synth_editor: Option<usize> = None;
                     let mut unused_remove_requested: Option<usize> = None;
+                    let track_names: Vec<String> =
+                        song.tracks.iter().map(|t| t.name.clone()).collect();
                     let mut master_fx = TrackFxUi {
                         track_index: 0,
                         chain_kind: FxChainKind::Master,
@@ -6405,6 +6555,7 @@ impl eframe::App for SimpleDawApp {
                         guis: &mut self.master_effect_guis,
                         engine_config,
                         known_plugins: &song.plugins,
+                        track_names: &track_names,
                         editor: &mut self.effect_editor,
                         synth_editor: &mut unused_synth_editor,
                         remove_requested: &mut unused_remove_requested,
@@ -6893,6 +7044,7 @@ impl eframe::App for SimpleDawApp {
         });
 
         let mut track_to_remove: Option<usize> = None;
+        let mut freeze_requested: Option<(usize, TrackFreezeAction)> = None;
 
         let channel_rack_frame = || {
             egui::Frame::new()
@@ -6934,6 +7086,7 @@ impl eframe::App for SimpleDawApp {
                                 song,
                                 engine_config,
                                 &mut track_to_remove,
+                                &mut freeze_requested,
                                 &mut rack,
                             );
                         });
@@ -6956,6 +7109,7 @@ impl eframe::App for SimpleDawApp {
                         song,
                         engine_config,
                         &mut track_to_remove,
+                        &mut freeze_requested,
                         &mut rack,
                     );
                 });
@@ -7003,6 +7157,48 @@ impl eframe::App for SimpleDawApp {
                 Some(t) if t > index => Some(t - 1),
                 other => other,
             };
+        }
+
+        if let Some((track_index, action)) = freeze_requested {
+            let engine_sample_rate = engine_config.map(|(sr, _, _)| sr as u32);
+            let render_sample_rate = engine_sample_rate.unwrap_or(48_000);
+            let (ok, message) = match action {
+                TrackFreezeAction::Freeze => {
+                    freeze_track(song, track_index, render_sample_rate, engine_sample_rate)
+                }
+                TrackFreezeAction::Unfreeze => {
+                    unfreeze_track(song, track_index);
+                    (true, "Unfroze track".to_string())
+                }
+                TrackFreezeAction::Bounce => {
+                    let result = bounce_track_in_place(
+                        song,
+                        track_index,
+                        render_sample_rate,
+                        engine_sample_rate,
+                    );
+                    // `bounce_track_in_place` cleared `track.effects` in the model (its processing
+                    // is already baked into the new clip) — the *runtime* chain still holds the
+                    // old plugin instances until resynced, which would otherwise double-process
+                    // the now-already-wet bounced audio.
+                    if result.0 {
+                        apply_chain_specs_at(
+                            track_index,
+                            Vec::new(),
+                            engine_config,
+                            &self.track_effect_slots,
+                            &mut self.track_effect_paths,
+                            &mut self.track_effect_instances,
+                            &mut self.track_effect_guis,
+                            &mut self.track_effect_messages,
+                        );
+                    }
+                    result
+                }
+            };
+            if !ok {
+                eprintln!("freeze/bounce failed for track {track_index}: {message}");
+            }
         }
 
         if self.mixer_open {
@@ -7249,6 +7445,10 @@ struct TrackFxUi<'a> {
     /// both as a picker next to each CLAP slot's path field, and as one-click entries in
     /// "+ Add Effect" — so paths don't need retyping.
     known_plugins: &'a [ProjectPlugin],
+    /// Every track's name, in `Song::tracks` order — offered as sidechain key-source choices for
+    /// a CLAP/Compressor/NoiseGate slot's sidechain picker (see `fx_chain_ui`), regardless of
+    /// which chain (a track's, a send's, a submix's, or the master's) is being edited.
+    track_names: &'a [String],
     editor: &'a mut Option<EffectEditorTarget>,
     /// Set by channel_rack_row_ui's "🎹" button to open that track's synth-settings window.
     /// Unused (and meaningless) for the master bus, which has no synth.
@@ -7302,6 +7502,7 @@ fn channel_rack_row_ui(
     selected_input_device: &mut Option<String>,
     sample_rate: Option<u32>,
     bpm: f32,
+    freeze_requested: &mut Option<(usize, TrackFreezeAction)>,
 ) {
     let is_piano_roll = track.kind == TrackKind::PianoRoll;
     let is_step_grid = track.kind == TrackKind::StepGrid;
@@ -7374,6 +7575,36 @@ fn channel_rack_row_ui(
 
                 ui.add(egui::Slider::new(&mut track.pan, -1.0..=1.0).show_value(false))
                     .on_hover_text(format!("Pan: {}", pan_label(track.pan)));
+
+                let freeze_color =
+                    if track.frozen { egui::Color32::from_rgb(120, 200, 240) } else { egui::Color32::from_gray(150) };
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("❄").color(freeze_color))
+                            .small()
+                            .min_size(egui::vec2(20.0, 20.0)),
+                    )
+                    .on_hover_text(if track.frozen {
+                        "Unfreeze: resume live synthesis/effects"
+                    } else {
+                        "Freeze: bake this track's notes/steps/audio + effects to audio, to save CPU"
+                    })
+                    .clicked()
+                {
+                    *freeze_requested = Some((
+                        track_index,
+                        if track.frozen { TrackFreezeAction::Unfreeze } else { TrackFreezeAction::Freeze },
+                    ));
+                }
+                if ui
+                    .small_button("⤓")
+                    .on_hover_text(
+                        "Bounce in place: permanently replace this track's content with baked audio",
+                    )
+                    .clicked()
+                {
+                    *freeze_requested = Some((track_index, TrackFreezeAction::Bounce));
+                }
 
                 if !is_audio {
                     if ui.small_button("🎹").on_hover_text("Synth").clicked() {
@@ -7919,6 +8150,28 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
                 FxSlotKind::BuiltIn(label) => {
                     ui.label(label);
                 }
+            }
+            // Sidechain key-source picker — only rendered for a slot kind that actually carries a
+            // `sidechain_source` (a loaded CLAP plugin, Compressor, or NoiseGate; see
+            // `plugin_host::EffectInstance::sidechain_source_mut`). Reads/writes the live runtime
+            // effect directly, same as every other per-effect parameter in this UI.
+            if let Ok(mut slots) = fx.slots.lock()
+                && let Some(chain) = slots.get_mut(fx.track_index)
+                && let Some(Some(instance)) = chain.get_mut(slot_index)
+                && let Some(source) = instance.sidechain_source_mut()
+            {
+                let selected_label = source
+                    .and_then(|index| fx.track_names.get(index))
+                    .map(String::as_str)
+                    .unwrap_or("None");
+                egui::ComboBox::from_id_salt(("sidechain_source", fx.track_index, slot_index))
+                    .selected_text(format!("SC: {selected_label}"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(source, None, "None");
+                        for (index, name) in fx.track_names.iter().enumerate() {
+                            ui.selectable_value(source, Some(index), name);
+                        }
+                    });
             }
             if ui.small_button("Params").clicked() {
                 *fx.editor = Some(fx_editor_target(fx, slot_index));
@@ -11451,6 +11704,93 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sustained_note_track(name: &str, midi_channel: u8) -> Track {
+        let mut track = Track::new_piano_roll(name, midi_channel);
+        track.synth.attack_seconds = 0.0;
+        track.synth.decay_seconds = 0.0;
+        track.synth.sustain_level = 1.0;
+        track.regions.push(model::Region {
+            name: "Hit".to_string(),
+            start_tick: 0,
+            content_length_steps: 4,
+            loop_length_steps: 4,
+            content: RegionContent::PianoRoll(vec![model::Note {
+                id: 0,
+                pitch: 60,
+                start_tick: 0,
+                length_ticks: 4 * model::TICKS_PER_STEP,
+                velocity: 127,
+            }]),
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            automation: Vec::new(),
+        });
+        track
+    }
+
+    #[test]
+    fn freeze_track_bakes_content_and_silences_live_triggering() {
+        let mut song = Song::demo();
+        song.tracks.push(sustained_note_track("Lead", 1));
+        let track_index = song.tracks.len() - 1;
+
+        let (ok, message) = freeze_track(&mut song, track_index, 48_000, Some(48_000));
+        assert!(ok, "message: {message}");
+        assert!(song.tracks[track_index].frozen);
+        let clip = song.tracks[track_index]
+            .frozen_clip
+            .as_ref()
+            .expect("freeze should populate frozen_clip");
+        assert!(clip.buffer.is_some(), "frozen clip should have loaded its baked audio");
+        assert!(
+            !song.tracks[track_index].regions.is_empty(),
+            "freeze must not touch the track's original regions — only bounce-in-place does"
+        );
+
+        std::fs::remove_file(&clip.file_path).ok();
+    }
+
+    #[test]
+    fn unfreeze_track_clears_frozen_state_and_deletes_its_file() {
+        let mut song = Song::demo();
+        song.tracks.push(sustained_note_track("Lead", 1));
+        let track_index = song.tracks.len() - 1;
+        let (ok, _) = freeze_track(&mut song, track_index, 48_000, Some(48_000));
+        assert!(ok);
+        let file_path = song.tracks[track_index].frozen_clip.as_ref().unwrap().file_path.clone();
+        assert!(std::path::Path::new(&file_path).exists());
+
+        unfreeze_track(&mut song, track_index);
+
+        assert!(!song.tracks[track_index].frozen);
+        assert!(song.tracks[track_index].frozen_clip.is_none());
+        assert!(
+            !std::path::Path::new(&file_path).exists(),
+            "unfreeze should delete the frozen WAV file it owns"
+        );
+    }
+
+    #[test]
+    fn bounce_track_in_place_replaces_content_with_one_baked_clip() {
+        let mut song = Song::demo();
+        song.tracks.push(sustained_note_track("Lead", 1));
+        let track_index = song.tracks.len() - 1;
+
+        let (ok, message) =
+            bounce_track_in_place(&mut song, track_index, 48_000, Some(48_000));
+        assert!(ok, "message: {message}");
+
+        let track = &song.tracks[track_index];
+        assert_eq!(track.kind, TrackKind::Audio);
+        assert!(track.regions.is_empty(), "bounce should clear the original MIDI content");
+        assert!(track.effects.is_empty(), "bounce should clear the chain now baked into the clip");
+        assert_eq!(track.audio_clips.len(), 1);
+        assert!(track.audio_clips[0].buffer.is_some());
+        assert!(!track.frozen, "bounce is permanent, not a reversible freeze");
+
+        std::fs::remove_file(&track.audio_clips[0].file_path).ok();
+    }
 
     #[test]
     fn finish_recording_rejects_an_empty_capture() {

@@ -16,15 +16,16 @@ impl CompressorChannel {
     fn process(
         &mut self,
         buf: &mut [f32],
+        key: Option<&[f32]>,
         ratio: f32,
         threshold: f32,
         makeup: f32,
         attack_coeff: f32,
         release_coeff: f32,
     ) {
-        for sample in buf.iter_mut() {
+        for (i, sample) in buf.iter_mut().enumerate() {
             let input = *sample;
-            let rectified = input.abs();
+            let rectified = key.map_or(input.abs(), |key| key[i].abs());
             let coeff = if rectified > self.envelope {
                 attack_coeff
             } else {
@@ -51,6 +52,10 @@ pub(crate) struct CompressorEffect {
     pub attack_ms: f32,
     pub release_ms: f32,
     pub makeup_db: f32,
+    /// See `TrackEffectConfig::Compressor`'s `sidechain_source` doc. Set from that field by
+    /// `BuiltInEffect::from_config`, edited live via the FX chain UI's sidechain picker (same as
+    /// this struct's other `pub` fields), and read back by `BuiltInEffect::to_config`.
+    pub sidechain_source: Option<usize>,
     left: CompressorChannel,
     right: CompressorChannel,
     sample_rate: f32,
@@ -71,6 +76,7 @@ impl CompressorEffect {
             attack_ms,
             release_ms,
             makeup_db,
+            sidechain_source: None,
             left: CompressorChannel::new(),
             right: CompressorChannel::new(),
             sample_rate,
@@ -82,15 +88,32 @@ impl CompressorEffect {
     }
 
     pub(super) fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
+        self.process_with_sidechain(l, r, None);
+    }
+
+    /// Same as `process`, but drives the envelope follower from `sidechain`'s rectified signal
+    /// (a key input, e.g. another track routed in for ducking) instead of `l`/`r`'s own — the
+    /// gain computed off that key is still applied to `l`/`r` themselves. `None` behaves exactly
+    /// like `process` (envelope follows the compressor's own input, as before sidechain existed).
+    pub(super) fn process_with_sidechain(
+        &mut self,
+        l: &mut [f32],
+        r: &mut [f32],
+        sidechain: Option<(&[f32], &[f32])>,
+    ) {
         let ratio = self.ratio.max(1.0);
         let threshold = self.threshold_db;
         let makeup = 10f32.powf(self.makeup_db / 20.0);
         let attack_coeff = Self::time_coeff(self.attack_ms, self.sample_rate);
         let release_coeff = Self::time_coeff(self.release_ms, self.sample_rate);
+        let (key_l, key_r) = match sidechain {
+            Some((key_l, key_r)) => (Some(key_l), Some(key_r)),
+            None => (None, None),
+        };
         self.left
-            .process(l, ratio, threshold, makeup, attack_coeff, release_coeff);
+            .process(l, key_l, ratio, threshold, makeup, attack_coeff, release_coeff);
         self.right
-            .process(r, ratio, threshold, makeup, attack_coeff, release_coeff);
+            .process(r, key_r, ratio, threshold, makeup, attack_coeff, release_coeff);
     }
 }
 
@@ -113,5 +136,25 @@ mod tests {
             "expected the compressor to reduce gain above threshold, got {settled} from input 0.5"
         );
         assert!(r[3000] < 0.5);
+    }
+
+    #[test]
+    fn sidechain_key_drives_the_envelope_instead_of_the_main_signal() {
+        let sample_rate = 44100.0;
+        let mut compressor = CompressorEffect::new(-18.0, 4.0, 1.0, 50.0, 0.0, sample_rate);
+        // The main signal alone is a quiet, steady tone well below the -18dB threshold — with no
+        // sidechain, it would pass through untouched (mirroring the settled-gain assertion above).
+        // A loud key signal should still duck it, proving the envelope follows the key, not `l`/`r`.
+        let mut l = vec![0.05f32; 4000];
+        let mut r = vec![0.05f32; 4000];
+        let key_l = vec![0.9f32; 4000];
+        let key_r = vec![0.9f32; 4000];
+        compressor.process_with_sidechain(&mut l, &mut r, Some((&key_l, &key_r)));
+        let settled = l[3000];
+        assert!(
+            settled < 0.05,
+            "expected a loud sidechain key to duck a quiet main signal, got {settled} from input 0.05"
+        );
+        assert!(r[3000] < 0.05);
     }
 }

@@ -8,6 +8,7 @@ use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
 use clack_extensions::gui::{
     GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui,
 };
+use clack_extensions::latency::PluginLatency;
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_host::events::event_types::ParamValueEvent;
 use clack_host::prelude::*;
@@ -39,6 +40,23 @@ pub struct LoadedEffect {
     pub processor: PluginAudioProcessor<DawHost>,
     pub input_channels: u32,
     pub output_channels: u32,
+    /// Whether the plugin declared a second input port (the CLAP convention for a sidechain key
+    /// input — see the `audio-ports` extension's port-count query, distinct from `input_channels`
+    /// which only describes the *main* port's channel count). When true, `process_effect` wires a
+    /// caller-supplied key signal into that second port; when false, a supplied key signal is
+    /// simply ignored, since the plugin never declared anywhere to put it.
+    pub has_sidechain_input: bool,
+    /// This plugin's self-reported processing latency in samples, queried once at load time via
+    /// the CLAP `latency` extension (0 if the plugin doesn't implement it). Never re-queried after
+    /// load — this host doesn't implement `HostLatencyImpl`'s "latency changed" callback, matching
+    /// `DawHost`'s existing "no host-side automation, no restart/reactivation" MVP scope. Used for
+    /// automatic plugin delay compensation — see `chain_latency_samples`.
+    pub latency_samples: u32,
+    /// Index into `Song::tracks` of this plugin's sidechain key source, mirroring
+    /// `TrackEffectConfig::Clap::sidechain_source` — set from that field when the plugin is
+    /// loaded, edited live from the FX chain UI same as any other parameter, and snapshotted back
+    /// into `TrackEffectConfig` at save time. `None` means no sidechain routing.
+    pub sidechain_source: Option<usize>,
     pub params: Vec<PluginParamInfo>,
     /// Current value for each entry in `params` (same index). This app is the only writer of a
     /// plugin's parameters (no plugin GUI, no host-side automation), so tracking values here
@@ -161,6 +179,42 @@ impl PluginGuiHandle {
 pub enum EffectInstance {
     Clap(LoadedEffect),
     BuiltIn(BuiltInEffect),
+}
+
+impl EffectInstance {
+    /// This slot's configured sidechain key source (a `Song::tracks` index) — see
+    /// `LoadedEffect::sidechain_source`/`BuiltInEffect::sidechain_source`. `None` for a built-in
+    /// effect kind that has nowhere to use a key signal.
+    pub fn sidechain_source(&self) -> Option<usize> {
+        match self {
+            EffectInstance::Clap(effect) => effect.sidechain_source,
+            EffectInstance::BuiltIn(effect) => effect.sidechain_source(),
+        }
+    }
+
+    /// Mutable access to `sidechain_source`, for the FX chain UI's sidechain-source picker.
+    /// `None` for a built-in effect kind that doesn't carry a `sidechain_source` field at all.
+    pub fn sidechain_source_mut(&mut self) -> Option<&mut Option<usize>> {
+        match self {
+            EffectInstance::Clap(effect) => Some(&mut effect.sidechain_source),
+            EffectInstance::BuiltIn(effect) => effect.sidechain_source_mut(),
+        }
+    }
+}
+
+/// Total latency (in samples) a chain adds to whatever signal passes through it — the sum of
+/// every loaded CLAP stage's own `LoadedEffect::latency_samples`. A `None` slot (nothing loaded
+/// yet) and every built-in effect (all real-time, zero-lookahead algorithms in this codebase)
+/// contribute 0. Used for automatic plugin delay compensation, computed fresh each buffer/chunk
+/// from whichever chains are currently loaded — see `audio::pdc_delay_samples_for_track`.
+pub fn chain_latency_samples(chain: &[Option<EffectInstance>]) -> u32 {
+    chain
+        .iter()
+        .map(|slot| match slot {
+            Some(EffectInstance::Clap(effect)) => effect.latency_samples,
+            _ => 0,
+        })
+        .sum()
 }
 
 /// One effect chain per track, indexed the same as `Song::tracks`; each chain is indexed the same
@@ -286,6 +340,27 @@ fn query_channel_count(instance: &mut PluginInstance<DawHost>, is_input: bool) -
         .unwrap_or(2)
 }
 
+/// Whether the plugin declared a second input port, the CLAP convention for an optional sidechain
+/// key input. Plugins without the `audio-ports` extension, or with only one input port, report
+/// `false` — the common case for the overwhelming majority of effects.
+fn has_sidechain_input_port(instance: &mut PluginInstance<DawHost>) -> bool {
+    let mut handle = instance.plugin_handle();
+    let Some(audio_ports) = handle.get_extension::<PluginAudioPorts>() else {
+        return false;
+    };
+    audio_ports.count(&mut handle, true) >= 2
+}
+
+/// Queries the plugin's self-reported processing latency (CLAP `latency` extension), 0 if it
+/// doesn't implement the extension.
+fn query_latency(instance: &mut PluginInstance<DawHost>) -> u32 {
+    let mut handle = instance.plugin_handle();
+    let Some(latency) = handle.get_extension::<PluginLatency>() else {
+        return 0;
+    };
+    latency.get(&mut handle)
+}
+
 /// Enumerates the plugin's parameters (if it implements the `params` extension), for display in
 /// a generic parameter-editing panel. Returns an empty list for plugins with no parameters or no
 /// `params` support.
@@ -369,6 +444,8 @@ pub fn load_and_activate(
 
     let input_channels = query_channel_count(&mut instance, true).clamp(1, 2);
     let output_channels = query_channel_count(&mut instance, false).clamp(1, 2);
+    let has_sidechain_input = has_sidechain_input_port(&mut instance);
+    let latency_samples = query_latency(&mut instance);
     let params = query_params(&mut instance);
     let current_values = params.iter().map(|p| p.default_value).collect();
     let gui = query_gui_extension(&mut instance);
@@ -390,6 +467,9 @@ pub fn load_and_activate(
             processor: processor.into(),
             input_channels,
             output_channels,
+            has_sidechain_input,
+            latency_samples,
+            sidechain_source: None,
             params,
             current_values,
             dirty: false,
@@ -431,7 +511,7 @@ pub fn load_offline_chain(specs: &[TrackEffectConfig], sample_rate: f64, block_s
     let mut instances = Vec::with_capacity(specs.len());
     for spec in specs {
         match spec {
-            TrackEffectConfig::Clap { path, params } => {
+            TrackEffectConfig::Clap { path, params, sidechain_source } => {
                 if path.trim().is_empty() {
                     chain.push(None);
                     instances.push(None);
@@ -442,6 +522,7 @@ pub fn load_offline_chain(specs: &[TrackEffectConfig], sample_rate: f64, block_s
                         for (id, value) in params {
                             effect.set_param_by_id(*id, *value);
                         }
+                        effect.sidechain_source = *sidechain_source;
                         chain.push(Some(EffectInstance::Clap(effect)));
                         instances.push(Some(instance));
                     }
@@ -636,6 +717,10 @@ pub fn plugin_gui_poll_closed(
 pub struct EffectScratch {
     in_l: Vec<f32>,
     in_r: Vec<f32>,
+    /// Sidechain key signal, copied in only when the effect declared a second input port and a
+    /// caller supplied a key signal — see `process_effect`.
+    sc_l: Vec<f32>,
+    sc_r: Vec<f32>,
     out_l: Vec<f32>,
     out_r: Vec<f32>,
     input_ports: AudioPorts,
@@ -648,9 +733,12 @@ impl EffectScratch {
         Self {
             in_l: Vec::new(),
             in_r: Vec::new(),
+            sc_l: Vec::new(),
+            sc_r: Vec::new(),
             out_l: Vec::new(),
             out_r: Vec::new(),
-            input_ports: AudioPorts::with_capacity(2, 1),
+            // 2 ports of capacity: the main input port, plus an optional sidechain port.
+            input_ports: AudioPorts::with_capacity(4, 2),
             output_ports: AudioPorts::with_capacity(2, 1),
         }
     }
@@ -660,6 +748,8 @@ impl EffectScratch {
     pub fn reserve(&mut self, frames: usize) {
         self.in_l.reserve(frames);
         self.in_r.reserve(frames);
+        self.sc_l.reserve(frames);
+        self.sc_r.reserve(frames);
         self.out_l.reserve(frames);
         self.out_r.reserve(frames);
     }
@@ -670,9 +760,12 @@ impl EffectScratch {
 /// downmix (`(l+r)/2`) as its single input — that's the plugin's own declared I/O shape, not a
 /// choice this function makes about the chain; a mono-output plugin's single channel is likewise
 /// duplicated to both output channels, treated as center-panned. Also delivers any pending
-/// `set_param` changes as part of this block's `process()` call. Returns `false` (leaving
-/// `out_l`/`out_r` untouched) if the plugin isn't ready to process, so callers can fall back to
-/// the dry signal.
+/// `set_param` changes as part of this block's `process()` call. `sidechain`, when supplied and
+/// the plugin declared a second input port (`LoadedEffect::has_sidechain_input`), feeds that key
+/// signal into the plugin's sidechain port; ignored otherwise (a supplied key signal for a plugin
+/// with nowhere to put it is silently dropped, same tolerance already applied to a redirected
+/// automation target on a track/slot that doesn't exist). Returns `false` (leaving `out_l`/`out_r`
+/// untouched) if the plugin isn't ready to process, so callers can fall back to the dry signal.
 pub fn process_effect(
     effect: &mut LoadedEffect,
     input_l: &[f32],
@@ -680,6 +773,7 @@ pub fn process_effect(
     out_l: &mut [f32],
     out_r: &mut [f32],
     scratch: &mut EffectScratch,
+    sidechain: Option<(&[f32], &[f32])>,
 ) -> bool {
     let frames = input_l.len();
     scratch.in_l.resize(frames, 0.0);
@@ -691,6 +785,13 @@ pub fn process_effect(
         for i in 0..frames {
             scratch.in_l[i] = 0.5 * (input_l[i] + input_r[i]);
         }
+    }
+    let use_sidechain = effect.has_sidechain_input && sidechain.is_some();
+    if let Some((key_l, key_r)) = sidechain.filter(|_| use_sidechain) {
+        scratch.sc_l.resize(frames, 0.0);
+        scratch.sc_r.resize(frames, 0.0);
+        scratch.sc_l.copy_from_slice(key_l);
+        scratch.sc_r.copy_from_slice(key_r);
     }
     scratch.out_l.resize(frames, 0.0);
     scratch.out_r.resize(frames, 0.0);
@@ -715,10 +816,19 @@ pub fn process_effect(
     if effect.input_channels > 1 {
         input_channels.push(InputChannel::variable(&mut scratch.in_r));
     }
-    let input_audio = scratch.input_ports.with_input_buffers([AudioPortBuffer {
+    let mut input_ports = vec![AudioPortBuffer {
         latency: 0,
         channels: AudioPortBufferType::f32_input_only(input_channels.into_iter()),
-    }]);
+    }];
+    if use_sidechain {
+        let sidechain_channels =
+            vec![InputChannel::variable(&mut scratch.sc_l), InputChannel::variable(&mut scratch.sc_r)];
+        input_ports.push(AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_input_only(sidechain_channels.into_iter()),
+        });
+    }
+    let input_audio = scratch.input_ports.with_input_buffers(input_ports);
 
     let mut output_channels = vec![scratch.out_l.as_mut_slice()];
     if effect.output_channels > 1 {
@@ -765,6 +875,15 @@ pub fn process_effect(
 /// can't read and write the same buffer. Returns whether at least one stage actually processed, so
 /// callers can cheaply skip the processed output and add the dry signal straight in when a
 /// track's chain is empty or every CLAP plugin in it is unloaded.
+///
+/// `all_track_dry` is every track's own pre-effects, pre-volume/pan synthesized signal for this
+/// same block, indexed the same as `Song::tracks` (so `all_track_dry[i]` is track `i`'s own dry
+/// signal, regardless of which chain — a track's, a send's, a submix's, or the master's — is
+/// being processed here). A slot whose own `sidechain_source` (`EffectInstance::sidechain_source`)
+/// names a valid track index gets that track's dry signal as its key input; `None`, or an index
+/// past the end of `all_track_dry`, means no sidechain for that slot. Only `EffectInstance::Clap`
+/// (when the plugin itself declared a sidechain port) and the built-in Compressor/NoiseGate honor
+/// a resolved key signal; every other slot kind ignores its own `sidechain_source`.
 #[allow(clippy::too_many_arguments)]
 pub fn process_effect_chain(
     chain: &mut [Option<EffectInstance>],
@@ -775,6 +894,7 @@ pub fn process_effect_chain(
     scratch: &mut [EffectScratch],
     run_l: &mut Vec<f32>,
     run_r: &mut Vec<f32>,
+    all_track_dry: &[(&[f32], &[f32])],
 ) -> bool {
     let frames = input_l.len();
     run_l.resize(frames, 0.0);
@@ -786,16 +906,20 @@ pub fn process_effect_chain(
 
     let mut any_used = false;
     for (slot, effect_scratch) in chain.iter_mut().zip(scratch.iter_mut()) {
+        let sidechain = slot
+            .as_ref()
+            .and_then(EffectInstance::sidechain_source)
+            .and_then(|index| all_track_dry.get(index).copied());
         match slot {
             Some(EffectInstance::Clap(effect)) => {
-                if process_effect(effect, run_l, run_r, out_l, out_r, effect_scratch) {
+                if process_effect(effect, run_l, run_r, out_l, out_r, effect_scratch, sidechain) {
                     any_used = true;
                     run_l.copy_from_slice(out_l);
                     run_r.copy_from_slice(out_r);
                 }
             }
             Some(EffectInstance::BuiltIn(effect)) => {
-                effect.process(run_l, run_r);
+                effect.process_with_sidechain(run_l, run_r, sidechain);
                 out_l.copy_from_slice(run_l);
                 out_r.copy_from_slice(run_r);
                 any_used = true;

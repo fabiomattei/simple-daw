@@ -1024,6 +1024,13 @@ pub enum TrackEffectConfig {
         path: String,
         #[serde(default)]
         params: Vec<(u32, f64)>,
+        /// Index into `Song.tracks` of a track whose own pre-effects signal feeds this plugin's
+        /// sidechain key input — only takes effect if the loaded plugin actually declared a
+        /// second input port (`plugin_host::LoadedEffect::has_sidechain_input`); otherwise
+        /// silently ignored, same tolerance as a redirected automation target pointing at a track
+        /// that doesn't exist. `None` (the default) means no sidechain routing.
+        #[serde(default)]
+        sidechain_source: Option<usize>,
     },
     /// A feedback delay line ("echo"). `feedback` is how much of the delayed signal feeds back
     /// into itself (0..1, higher means more repeats); `mix` is the dry/wet blend (0 = dry, 1 =
@@ -1102,6 +1109,10 @@ pub enum TrackEffectConfig {
         release_ms: f32,
         #[serde(default = "default_compressor_makeup_db")]
         makeup_db: f32,
+        /// See `TrackEffectConfig::Clap`'s `sidechain_source` doc — same meaning, here driving
+        /// the built-in compressor's envelope follower instead of a CLAP plugin's own port.
+        #[serde(default)]
+        sidechain_source: Option<usize>,
     },
     /// A short LFO-modulated delay with feedback ("flanger") — like `Chorus` but with a shorter
     /// delay range and a feedback path, giving it a more resonant, metallic sweep.
@@ -1144,6 +1155,10 @@ pub enum TrackEffectConfig {
         release_ms: f32,
         #[serde(default = "default_noise_gate_range_db")]
         range_db: f32,
+        /// See `TrackEffectConfig::Clap`'s `sidechain_source` doc — same meaning, here driving
+        /// the built-in gate's envelope follower instead of a CLAP plugin's own port.
+        #[serde(default)]
+        sidechain_source: Option<usize>,
     },
     /// Flips signal polarity, independently per channel — for stereo phase troubleshooting (e.g.
     /// correcting an out-of-phase mic pair), not tone shaping, so it has no dry/wet mix.
@@ -1457,6 +1472,7 @@ impl TrackEffectConfig {
             attack_ms: default_compressor_attack_ms(),
             release_ms: default_compressor_release_ms(),
             makeup_db: default_compressor_makeup_db(),
+            sidechain_source: None,
         }
     }
     /// Default parameter values used when a user picks "Flanger" from the "+ Add Effect" menu.
@@ -1491,6 +1507,7 @@ impl TrackEffectConfig {
             attack_ms: default_noise_gate_attack_ms(),
             release_ms: default_noise_gate_release_ms(),
             range_db: default_noise_gate_range_db(),
+            sidechain_source: None,
         }
     }
     /// Default parameter values used when a user picks "Phase Invert" from the "+ Add Effect" menu.
@@ -1937,6 +1954,20 @@ pub struct Track {
     /// saved before this field existed still load with none.
     #[serde(default)]
     pub automation: Vec<AutomationLane>,
+    /// Whether this track is currently frozen: its own live synthesis (notes/steps/audio clips)
+    /// and insert-effect chain (`effects`) are bypassed in the real-time engine in favor of
+    /// playing back `frozen_clip`'s already-baked audio — volume/pan/mute/solo/sends/output stay
+    /// live even while frozen, since those apply *after* a track's own chain either way. See
+    /// `audio::render_track_to_buffer`. `#[serde(default)]` so song files saved before freeze
+    /// existed still load unfrozen.
+    #[serde(default)]
+    pub frozen: bool,
+    /// The baked audio a frozen track plays instead of live synthesis — an ordinary `AudioClip`
+    /// (same file-backed reload-on-load machinery every other clip uses), spanning this track's
+    /// whole arrangement from tick 0 as of the moment it was frozen. `None` whenever `frozen` is
+    /// false. `#[serde(default)]` for the same reason as `frozen`.
+    #[serde(default)]
+    pub frozen_clip: Option<AudioClip>,
 }
 
 /// See `Track::output`. `Submix(index)` indexes into `Song.submixes`; kept valid by
@@ -1973,6 +2004,8 @@ impl Track {
             send_levels: Vec::new(),
             output: TrackOutput::Master,
             automation: Vec::new(),
+            frozen: false,
+            frozen_clip: None,
         }
     }
 
@@ -1999,6 +2032,8 @@ impl Track {
             send_levels: Vec::new(),
             output: TrackOutput::Master,
             automation: Vec::new(),
+            frozen: false,
+            frozen_clip: None,
         }
     }
 
@@ -2025,6 +2060,8 @@ impl Track {
             send_levels: Vec::new(),
             output: TrackOutput::Master,
             automation: Vec::new(),
+            frozen: false,
+            frozen_clip: None,
         }
     }
 
@@ -2210,6 +2247,10 @@ pub struct SubmixBus {
     pub effects: Vec<TrackEffectConfig>,
     #[serde(default = "default_track_volume")]
     pub volume: f32,
+    /// Equal-power pan, same law and range as `Track::pan` — applied after this submix's own
+    /// chain+volume, the same point a track's own pan pot sits (see `equal_power_pan_gains`).
+    #[serde(default)]
+    pub pan: f32,
     #[serde(default)]
     pub muted: bool,
     #[serde(default)]
@@ -2452,6 +2493,7 @@ impl Song {
             name: name.into(),
             effects: Vec::new(),
             volume: 1.0,
+            pan: 0.0,
             muted: false,
             solo: false,
         });
@@ -2534,6 +2576,7 @@ impl Song {
             song.master_effects = vec![TrackEffectConfig::Clap {
                 path: old_master_effect_path,
                 params: old_master_effect_params,
+                sidechain_source: None,
             }];
         }
         if let Some(rate) = sample_rate {
@@ -2708,6 +2751,8 @@ fn legacy_to_patterns_era(legacy: LegacySong) -> PatternsEraSong {
             send_levels: Vec::new(),
             output: TrackOutput::Master,
             automation: Vec::new(),
+            frozen: false,
+            frozen_clip: None,
         });
     }
 
@@ -3338,10 +3383,12 @@ mod tests {
         song.master_effects = vec![TrackEffectConfig::Clap {
             path: "/usr/lib64/clap/ZamDelay.clap".to_string(),
             params: vec![(0, 0.5), (2, 1.0)],
+            sidechain_source: None,
         }];
         song.tracks[1].effects = vec![TrackEffectConfig::Clap {
             path: "/usr/lib64/clap/ZamGate.clap".to_string(),
             params: vec![(1, 0.25)],
+            sidechain_source: None,
         }];
         song.tracks[1].volume = 0.6;
         song.tracks[1].input_gain = 1.4;
@@ -3353,7 +3400,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         match &loaded.master_effects[..] {
-            [TrackEffectConfig::Clap { path, params }] => {
+            [TrackEffectConfig::Clap { path, params, .. }] => {
                 assert_eq!(path, "/usr/lib64/clap/ZamDelay.clap");
                 assert_eq!(params, &vec![(0, 0.5), (2, 1.0)]);
             }
@@ -3361,7 +3408,7 @@ mod tests {
         }
         assert_eq!(loaded.tracks[1].effects.len(), 1);
         match &loaded.tracks[1].effects[0] {
-            TrackEffectConfig::Clap { path, params } => {
+            TrackEffectConfig::Clap { path, params, .. } => {
                 assert_eq!(path, "/usr/lib64/clap/ZamGate.clap");
                 assert_eq!(params, &vec![(1, 0.25)]);
             }
@@ -3384,6 +3431,7 @@ mod tests {
             TrackEffectConfig::Clap {
                 path: "/usr/lib64/clap/ZamGate.clap".to_string(),
                 params: vec![(1, 0.25)],
+                sidechain_source: None,
             },
             TrackEffectConfig::Delay {
                 time_ms: 450.0,
@@ -3463,6 +3511,7 @@ mod tests {
                 attack_ms: 5.0,
                 release_ms: 150.0,
                 makeup_db: 2.0,
+                sidechain_source: None,
             },
         ];
 
@@ -3515,6 +3564,7 @@ mod tests {
                 attack_ms,
                 release_ms,
                 makeup_db,
+                ..
             } => {
                 assert_eq!(*threshold_db, -12.0);
                 assert_eq!(*ratio, 3.0);
@@ -3551,6 +3601,7 @@ mod tests {
                 attack_ms: 3.0,
                 release_ms: 200.0,
                 range_db: -70.0,
+                sidechain_source: None,
             },
         ];
 
@@ -3604,6 +3655,7 @@ mod tests {
                 attack_ms,
                 release_ms,
                 range_db,
+                ..
             } => {
                 assert_eq!(*threshold_db, -30.0);
                 assert_eq!(*attack_ms, 3.0);
@@ -3820,9 +3872,10 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         match &loaded.master_effects[..] {
-            [TrackEffectConfig::Clap { path, params }] => {
+            [TrackEffectConfig::Clap { path, params, sidechain_source }] => {
                 assert_eq!(path, "/usr/lib64/clap/ZamDelay.clap");
                 assert_eq!(params, &vec![(0, 0.5)]);
+                assert_eq!(*sidechain_source, None);
             }
             other => panic!("expected a single master Clap effect, got {other:?}"),
         }

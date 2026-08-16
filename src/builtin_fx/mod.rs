@@ -121,14 +121,19 @@ impl BuiltInEffect {
                 attack_ms,
                 release_ms,
                 makeup_db,
-            } => BuiltInEffect::Compressor(CompressorEffect::new(
-                *threshold_db,
-                *ratio,
-                *attack_ms,
-                *release_ms,
-                *makeup_db,
-                sample_rate,
-            )),
+                sidechain_source,
+            } => {
+                let mut effect = CompressorEffect::new(
+                    *threshold_db,
+                    *ratio,
+                    *attack_ms,
+                    *release_ms,
+                    *makeup_db,
+                    sample_rate,
+                );
+                effect.sidechain_source = *sidechain_source;
+                BuiltInEffect::Compressor(effect)
+            }
             TrackEffectConfig::Flanger {
                 rate_hz,
                 depth_ms,
@@ -161,13 +166,13 @@ impl BuiltInEffect {
                 attack_ms,
                 release_ms,
                 range_db,
-            } => BuiltInEffect::NoiseGate(NoiseGateEffect::new(
-                *threshold_db,
-                *attack_ms,
-                *release_ms,
-                *range_db,
-                sample_rate,
-            )),
+                sidechain_source,
+            } => {
+                let mut effect =
+                    NoiseGateEffect::new(*threshold_db, *attack_ms, *release_ms, *range_db, sample_rate);
+                effect.sidechain_source = *sidechain_source;
+                BuiltInEffect::NoiseGate(effect)
+            }
             TrackEffectConfig::PhaseInvert {
                 invert_left,
                 invert_right,
@@ -234,6 +239,7 @@ impl BuiltInEffect {
                 attack_ms: e.attack_ms,
                 release_ms: e.release_ms,
                 makeup_db: e.makeup_db,
+                sidechain_source: e.sidechain_source,
             },
             BuiltInEffect::Flanger(e) => TrackEffectConfig::Flanger {
                 rate_hz: e.rate_hz,
@@ -256,6 +262,7 @@ impl BuiltInEffect {
                 attack_ms: e.attack_ms,
                 release_ms: e.release_ms,
                 range_db: e.range_db,
+                sidechain_source: e.sidechain_source,
             },
             BuiltInEffect::PhaseInvert(e) => TrackEffectConfig::PhaseInvert {
                 invert_left: e.invert_left,
@@ -387,8 +394,16 @@ impl BuiltInEffect {
 
     /// Runs this effect over one stereo audio block, in place — each channel processed
     /// independently through its own internal state (see this module's doc for the dual-mono
-    /// pattern every effect follows).
-    pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
+    /// pattern every effect follows). `sidechain`, a caller-supplied key signal (e.g. another
+    /// track routed in for ducking), drives the envelope follower instead of `l`/`r`'s own —
+    /// honored only by `Compressor` and `NoiseGate`, the two effect kinds whose gain is
+    /// envelope-driven; every other effect kind ignores `sidechain`.
+    pub fn process_with_sidechain(
+        &mut self,
+        l: &mut [f32],
+        r: &mut [f32],
+        sidechain: Option<(&[f32], &[f32])>,
+    ) {
         match self {
             BuiltInEffect::Delay(e) => e.process(l, r),
             BuiltInEffect::Bitcrusher(e) => e.process(l, r),
@@ -397,14 +412,35 @@ impl BuiltInEffect {
             BuiltInEffect::Chorus(e) => e.process(l, r),
             BuiltInEffect::Filter(e) => e.process(l, r),
             BuiltInEffect::Tremolo(e) => e.process(l, r),
-            BuiltInEffect::Compressor(e) => e.process(l, r),
+            BuiltInEffect::Compressor(e) => e.process_with_sidechain(l, r, sidechain),
             BuiltInEffect::Flanger(e) => e.process(l, r),
             BuiltInEffect::Phaser(e) => e.process(l, r),
             BuiltInEffect::RingModulator(e) => e.process(l, r),
-            BuiltInEffect::NoiseGate(e) => e.process(l, r),
+            BuiltInEffect::NoiseGate(e) => e.process_with_sidechain(l, r, sidechain),
             BuiltInEffect::PhaseInvert(e) => e.process(l, r),
             BuiltInEffect::ChannelEq(e) => e.process(l, r),
             BuiltInEffect::Limiter(e) => e.process(l, r),
+        }
+    }
+
+    /// This slot's configured sidechain key source (a `Song::tracks` index), for the two effect
+    /// kinds whose gain is envelope-driven — `None` for every other kind, which has nowhere to
+    /// use a key signal even if one were routed to it.
+    pub fn sidechain_source(&self) -> Option<usize> {
+        match self {
+            BuiltInEffect::Compressor(e) => e.sidechain_source,
+            BuiltInEffect::NoiseGate(e) => e.sidechain_source,
+            _ => None,
+        }
+    }
+
+    /// Mutable access to `sidechain_source`, for the FX chain UI's sidechain-source picker.
+    /// `None` for every effect kind that doesn't carry a `sidechain_source` field at all.
+    pub fn sidechain_source_mut(&mut self) -> Option<&mut Option<usize>> {
+        match self {
+            BuiltInEffect::Compressor(e) => Some(&mut e.sidechain_source),
+            BuiltInEffect::NoiseGate(e) => Some(&mut e.sidechain_source),
+            _ => None,
         }
     }
 }
