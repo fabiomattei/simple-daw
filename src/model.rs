@@ -927,6 +927,159 @@ impl Region {
     }
 }
 
+/// One clip slot's content in the Session View grid (see `Track::session_clips`) — an
+/// independently launchable/stoppable loop, not pinned to any absolute song tick the way a
+/// `Region`/`AudioClip` on the Playlist is. Reuses `RegionContent` for step-grid/piano-roll
+/// material rather than duplicating `Lane`/`Note` storage a second time (the same content,
+/// replayed a different way). The `Audio` variant wraps a whole `AudioClip` but its `start_tick`
+/// is meaningless here (always `0`, see `SessionClip::from_audio_clip`) since a session clip's
+/// timeline position is decided at launch time, not authored.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SessionClipContent {
+    Region {
+        content: RegionContent,
+        /// Mirrors `Region::content_length_steps`.
+        content_length_steps: usize,
+        /// Mirrors `Region::loop_length_steps` — the slot's loop length in steps.
+        loop_length_steps: usize,
+    },
+    Audio(AudioClip),
+}
+
+/// What a Session View slot does on its own, with no user input, once it's played through
+/// `FollowActionConfig::times` times — Ableton's "follow action" concept. Every variant except
+/// `Other` resolves relative to the clip's own row within its track (see
+/// `session::follow_action_target`); `Other` names an absolute row index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FollowAction {
+    /// Keep looping indefinitely — the default, identical to Session View's behavior before
+    /// follow actions existed.
+    None,
+    Stop,
+    /// Restart this same slot from the top (resets its own loop count).
+    Again,
+    Previous,
+    Next,
+    First,
+    Last,
+    /// A random row on the same track (uniformly, including possibly this same row again).
+    Any,
+    /// An absolute row index on the same track.
+    Other(usize),
+}
+
+/// A Session View slot's follow action — see `FollowAction`. Ableton's model: two independent
+/// candidate actions, picked by weighted random choice each time the follow action fires (not
+/// picked once and fixed), after the clip has played through `times` times.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FollowActionConfig {
+    pub times: u32,
+    pub action_a: FollowAction,
+    pub chance_a: f32,
+    pub action_b: FollowAction,
+    pub chance_b: f32,
+}
+
+impl Default for FollowActionConfig {
+    /// "No follow action": plays once through `times` (`1`) and then just keeps looping, same as
+    /// every `SessionClip` behaved before this field existed.
+    fn default() -> Self {
+        Self {
+            times: 1,
+            action_a: FollowAction::None,
+            chance_a: 1.0,
+            action_b: FollowAction::None,
+            chance_b: 0.0,
+        }
+    }
+}
+
+/// One slot in the Session View grid (see `Track::session_clips`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionClip {
+    pub name: String,
+    pub content: SessionClipContent,
+    /// See `FollowAction`. `#[serde(default)]` so session clips saved before follow actions
+    /// existed still load with none (unchanged "loop forever" behavior).
+    #[serde(default)]
+    pub follow_action: FollowActionConfig,
+    /// When true, launching this clip doesn't restart its own playhead at tick `0` — it continues
+    /// from wherever the track's previously-playing slot's phase was (see
+    /// `audio::Sequencer::trigger_session_clips`'s legato handling), for a seamless handoff between
+    /// same-length variations. Still waits for the normal launch-quantize boundary like any other
+    /// launch; only the starting phase changes. `#[serde(default)]` so session clips saved before
+    /// legato existed still load with it off (unchanged restart-at-0 behavior).
+    #[serde(default)]
+    pub legato: bool,
+}
+
+impl SessionClip {
+    /// Copies `region`'s content into a new session clip — Session View's v1 authoring path is
+    /// assigning already-authored Playlist content into a slot, not composing fresh content in
+    /// place (see `session_view_ui::handle_session_interaction`'s "Assign from Playlist" menu).
+    pub fn from_region(region: &Region) -> Self {
+        Self {
+            name: region.name.clone(),
+            content: SessionClipContent::Region {
+                content: region.content.clone(),
+                content_length_steps: region.content_length_steps,
+                loop_length_steps: region.loop_length_steps,
+            },
+            follow_action: FollowActionConfig::default(),
+            legato: false,
+        }
+    }
+
+    /// Copies `clip`'s content into a new session clip, same idea as `from_region`. `start_tick`
+    /// is reset to `0` — meaningless for session playback, see `SessionClipContent::Audio`'s doc
+    /// comment.
+    pub fn from_audio_clip(clip: &AudioClip) -> Self {
+        let mut clip = clip.clone();
+        clip.start_tick = 0;
+        Self {
+            name: clip.file_path.clone(),
+            content: SessionClipContent::Audio(clip),
+            follow_action: FollowActionConfig::default(),
+            legato: false,
+        }
+    }
+
+    /// This clip's loop length in ticks — the audio engine's session playhead wraps modulo this.
+    /// The `Audio` variant loops its whole `effective_length_ticks` (no separate loop-range trim
+    /// in v1 — see `SessionClipContent::Audio`'s doc comment). `ticks_per_second` is the caller's
+    /// job to supply, same reasoning as `AudioClip::full_length_ticks`, to avoid this module
+    /// depending on `audio.rs`.
+    pub fn loop_length_ticks(&self, ticks_per_second: f64) -> usize {
+        match &self.content {
+            SessionClipContent::Region { loop_length_steps, .. } => {
+                loop_length_steps * TICKS_PER_STEP
+            }
+            SessionClipContent::Audio(clip) => clip.effective_length_ticks(ticks_per_second),
+        }
+    }
+}
+
+/// A pending user click on a Session View slot, communicated from the UI thread to the audio
+/// thread through the same per-callback `Song` snapshot everything else here rides on (see
+/// `audio::build_playback_stream`'s snapshot-clone). Not song data — never persisted (see
+/// `Track::session_launch_requests`). `generation` is bumped on every click; the audio thread's
+/// own long-lived `Sequencer` state (untouched by the snapshot clone) remembers the last
+/// generation it's seen per slot and only acts when this one has moved on, since a cloned
+/// snapshot has no other way to signal "this changed since last buffer."
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionLaunchRequest {
+    pub generation: u64,
+    pub intent: LaunchIntent,
+}
+
+/// See `SessionLaunchRequest`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LaunchIntent {
+    #[default]
+    Play,
+    Stop,
+}
+
 /// Adds a new note, clearing any existing note on the same pitch that it
 /// would overlap (two notes overlapping at the same pitch is ambiguous for
 /// playback — which one's on?). Returns the new note's id.
@@ -1968,6 +2121,17 @@ pub struct Track {
     /// false. `#[serde(default)]` for the same reason as `frozen`.
     #[serde(default)]
     pub frozen_clip: Option<AudioClip>,
+    /// Session View clip slots — see `SessionClip`. Slot index is aligned across every track
+    /// (slot 0 in every track's own `Vec` is the grid's visual row 0); a track with fewer slots
+    /// than another simply has empty rows past its own length. `#[serde(default)]` so song files
+    /// saved before Session View existed still load with none.
+    #[serde(default)]
+    pub session_clips: Vec<Option<SessionClip>>,
+    /// Pending Session View launch/stop clicks, index-aligned with `session_clips` — see
+    /// `SessionLaunchRequest`. Transient UI state, not song data: `#[serde(skip)]` so it's never
+    /// written to a song file and always starts empty on load.
+    #[serde(skip)]
+    pub session_launch_requests: Vec<SessionLaunchRequest>,
 }
 
 /// See `Track::output`. `Submix(index)` indexes into `Song.submixes`; kept valid by
@@ -2006,6 +2170,8 @@ impl Track {
             automation: Vec::new(),
             frozen: false,
             frozen_clip: None,
+            session_clips: Vec::new(),
+            session_launch_requests: Vec::new(),
         }
     }
 
@@ -2034,6 +2200,8 @@ impl Track {
             automation: Vec::new(),
             frozen: false,
             frozen_clip: None,
+            session_clips: Vec::new(),
+            session_launch_requests: Vec::new(),
         }
     }
 
@@ -2062,6 +2230,8 @@ impl Track {
             automation: Vec::new(),
             frozen: false,
             frozen_clip: None,
+            session_clips: Vec::new(),
+            session_launch_requests: Vec::new(),
         }
     }
 
@@ -2614,6 +2784,17 @@ impl Song {
                     }
                 }
             }
+            for slot in track.session_clips.iter_mut().flatten() {
+                if let SessionClipContent::Region { content: RegionContent::StepGrid(lanes), .. } =
+                    &mut slot.content
+                {
+                    for lane in lanes {
+                        if !lane.sample_path.trim().is_empty() {
+                            lane.load_sample(sample_rate);
+                        }
+                    }
+                }
+            }
         }
         for track in &mut self.tracks {
             for clip in &mut track.audio_clips {
@@ -2623,6 +2804,13 @@ impl Song {
             }
             for folder in &mut track.take_folders {
                 folder.load_all(sample_rate);
+            }
+            for slot in track.session_clips.iter_mut().flatten() {
+                if let SessionClipContent::Audio(clip) = &mut slot.content
+                    && !clip.file_path.trim().is_empty()
+                {
+                    clip.load(sample_rate);
+                }
             }
         }
     }
@@ -2767,6 +2955,8 @@ fn legacy_to_patterns_era(legacy: LegacySong) -> PatternsEraSong {
             automation: Vec::new(),
             frozen: false,
             frozen_clip: None,
+            session_clips: Vec::new(),
+            session_launch_requests: Vec::new(),
         });
     }
 
@@ -3818,6 +4008,135 @@ mod tests {
         assert!(loaded.tracks[0].effects.is_empty());
         assert_eq!(loaded.tracks[0].volume, 1.0);
         assert!(loaded.tracks[0].automation.is_empty());
+    }
+
+    #[test]
+    fn load_from_file_defaults_session_clips_for_pre_existing_song_files() {
+        // A song file saved before Session View existed has no "session_clips" key at all.
+        let json = r#"{
+            "name": "Old Song",
+            "bpm": 120.0,
+            "next_note_id": 0,
+            "tracks": [
+                {
+                    "name": "Drums",
+                    "midi_channel": 10,
+                    "muted": false,
+                    "default_note_length_ticks": 96,
+                    "pattern": { "name": "Drums 1", "length_steps": 16, "content": { "StepGrid": [] } }
+                }
+            ]
+        }"#;
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-legacy-session-clips-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(loaded.tracks[0].session_clips.is_empty());
+        assert!(loaded.tracks[0].session_launch_requests.is_empty());
+    }
+
+    #[test]
+    fn session_clip_round_trips_through_save_and_load() {
+        let mut song = Song::demo();
+        let region = song.tracks[0].regions[0].clone();
+        song.tracks[0].session_clips.push(Some(SessionClip::from_region(&region)));
+
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-session-clip-round-trip-{}.json",
+            std::process::id()
+        ));
+        song.save_to_file(&path).unwrap();
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let slot = loaded.tracks[0].session_clips[0]
+            .as_ref()
+            .expect("session clip should round-trip");
+        assert_eq!(slot.name, region.name);
+        match &slot.content {
+            SessionClipContent::Region { content_length_steps, loop_length_steps, .. } => {
+                assert_eq!(*content_length_steps, region.content_length_steps);
+                assert_eq!(*loop_length_steps, region.loop_length_steps);
+            }
+            SessionClipContent::Audio(_) => panic!("expected Region content"),
+        }
+        // Transient click state never round-trips.
+        assert!(loaded.tracks[0].session_launch_requests.is_empty());
+    }
+
+    #[test]
+    fn session_clip_follow_action_and_legato_round_trip() {
+        let mut song = Song::demo();
+        let region = song.tracks[0].regions[0].clone();
+        let mut clip = SessionClip::from_region(&region);
+        clip.legato = true;
+        clip.follow_action = FollowActionConfig {
+            times: 3,
+            action_a: FollowAction::Next,
+            chance_a: 0.75,
+            action_b: FollowAction::Other(2),
+            chance_b: 0.25,
+        };
+        song.tracks[0].session_clips.push(Some(clip));
+
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-follow-action-round-trip-{}.json",
+            std::process::id()
+        ));
+        song.save_to_file(&path).unwrap();
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let slot = loaded.tracks[0].session_clips[0].as_ref().unwrap();
+        assert!(slot.legato);
+        assert_eq!(slot.follow_action.times, 3);
+        assert_eq!(slot.follow_action.action_a, FollowAction::Next);
+        assert_eq!(slot.follow_action.chance_a, 0.75);
+        assert_eq!(slot.follow_action.action_b, FollowAction::Other(2));
+        assert_eq!(slot.follow_action.chance_b, 0.25);
+    }
+
+    #[test]
+    fn session_clip_defaults_follow_action_and_legato_for_pre_existing_song_files() {
+        // A song file saved before follow actions/legato existed: its one session clip has no
+        // "follow_action"/"legato" keys at all.
+        let json = r#"{
+            "name": "Old Session Song",
+            "bpm": 120.0,
+            "next_note_id": 0,
+            "tracks": [
+                {
+                    "name": "Drums",
+                    "midi_channel": 10,
+                    "muted": false,
+                    "kind": "StepGrid",
+                    "default_note_length_ticks": 96,
+                    "session_clips": [
+                        {
+                            "name": "Slot",
+                            "content": { "Region": { "content": { "StepGrid": [] }, "content_length_steps": 4, "loop_length_steps": 4 } }
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-legacy-follow-action-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let slot = loaded.tracks[0].session_clips[0].as_ref().unwrap();
+        assert!(!slot.legato);
+        assert_eq!(slot.follow_action, FollowActionConfig::default());
     }
 
     #[test]

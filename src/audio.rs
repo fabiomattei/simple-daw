@@ -7,15 +7,16 @@ use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, Stream, StreamConf
 
 use crate::metering::{LoudnessMeter, MeterHandles};
 use crate::model::{
-    AutomationLane, AutomationTarget, EffectParamKey, FilterRouting, FilterSlope, FilterType, Lane, LfoTarget,
-    ModSlot, ModSource, ModTarget, RegionContent, Song, StepData, SynthEngine, SynthParams,
-    SynthWaveform, TICKS_PER_STEP, Track, TrackKind, TrackOutput, TrineParams, WaveModSlot,
-    WaveModSource, WaveModTarget, WaveParams,
+    AutomationLane, AutomationTarget, EffectParamKey, FilterRouting, FilterSlope, FilterType, FollowAction,
+    Lane, LfoTarget, ModSlot, ModSource, ModTarget, Note, RegionContent, SessionClip, SessionClipContent,
+    Song, StepData, SynthEngine, SynthParams, SynthWaveform, TICKS_PER_STEP, Track, TrackKind, TrackOutput,
+    TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams,
 };
 use crate::plugin_host::{
     self, MasterEffectSlots, SendEffectSlots, SubmixEffectSlots, TrackEffectSlots,
 };
 use crate::sample::SampleBuffer;
+use crate::session::{self, SlotState};
 use crate::wavetable::{self, WaveWarpMode, WavetableId};
 
 /// 16th-note grid: 4 steps per beat.
@@ -87,16 +88,48 @@ pub struct Transport {
     playing: Arc<AtomicBool>,
     current_tick: Arc<AtomicUsize>,
     metronome_enabled: Arc<AtomicBool>,
+    /// Whether the transport is currently playing the Session View grid instead of the Playlist
+    /// arrangement — a mode switch, never both at once (see `Sequencer::process`'s `session_mode`
+    /// parameter). Transport state, not song data, same category as `playing`/`metronome_enabled`.
+    session_mode: Arc<AtomicBool>,
+    /// How many ticks a Session View slot launch/stop click snaps forward to (see
+    /// `session::next_quantize_boundary`) — `0` means "launch immediately, no quantization." Set
+    /// by the UI from the current song's own `Song::steps_per_bar` (main.rs's quantize picker), not
+    /// computed here, since only the UI has a `Song` to read a time signature from at click time.
+    session_quantize_ticks: Arc<AtomicUsize>,
 }
 
 impl Transport {
-    /// A stopped, metronome-off transport at tick 0.
+    /// A stopped, metronome-off, arrangement-mode transport at tick 0.
     pub fn new() -> Self {
         Self {
             playing: Arc::new(AtomicBool::new(false)),
             current_tick: Arc::new(AtomicUsize::new(0)),
             metronome_enabled: Arc::new(AtomicBool::new(false)),
+            session_mode: Arc::new(AtomicBool::new(false)),
+            session_quantize_ticks: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Whether the transport is currently playing Session View clips instead of the Playlist
+    /// arrangement.
+    pub fn is_session_mode(&self) -> bool {
+        self.session_mode.load(Ordering::Relaxed)
+    }
+
+    /// Switches between Session View and Playlist-arrangement playback.
+    pub fn set_session_mode(&self, session_mode: bool) {
+        self.session_mode.store(session_mode, Ordering::Relaxed);
+    }
+
+    /// See `Transport::session_quantize_ticks`.
+    pub fn session_quantize_ticks(&self) -> usize {
+        self.session_quantize_ticks.load(Ordering::Relaxed)
+    }
+
+    /// See `Transport::session_quantize_ticks`.
+    pub fn set_session_quantize_ticks(&self, ticks: usize) {
+        self.session_quantize_ticks.store(ticks, Ordering::Relaxed);
     }
 
     /// Whether the sequencer is currently running.
@@ -176,6 +209,7 @@ impl AudioEngine {
     /// to the device's own default rate if `None`, or if the device doesn't actually support the
     /// requested rate — see `list_output_sample_rates` for a picker that only ever offers rates
     /// that don't need this fallback).
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         song: Arc<Mutex<Song>>,
         transport: Transport,
@@ -186,6 +220,7 @@ impl AudioEngine {
         track_meters: MeterHandles,
         master_meter: MeterHandles,
         submix_meters: MeterHandles,
+        session_slots: SessionSlotHandles,
         device_name: Option<&str>,
         sample_rate: Option<u32>,
     ) -> Result<Self> {
@@ -246,6 +281,7 @@ impl AudioEngine {
                 track_meters,
                 master_meter,
                 submix_meters,
+                session_slots,
                 max_frames as usize,
             )?,
             SampleFormat::I16 => build_playback_stream::<i16>(
@@ -260,6 +296,7 @@ impl AudioEngine {
                 track_meters,
                 master_meter,
                 submix_meters,
+                session_slots,
                 max_frames as usize,
             )?,
             SampleFormat::U16 => build_playback_stream::<u16>(
@@ -274,6 +311,7 @@ impl AudioEngine {
                 track_meters,
                 master_meter,
                 submix_meters,
+                session_slots,
                 max_frames as usize,
             )?,
             other => bail!("unsupported output sample format: {other:?}"),
@@ -1929,6 +1967,10 @@ struct SampleVoice {
     gain: f32,
     fade_in_frames: usize,
     fade_out_frames: usize,
+    /// When set, `next_sample` wraps `position` back to `start_position` instead of going silent
+    /// past `end_position` — used only for Session View audio clips (`Sequencer::process`'s
+    /// `trigger_session_clips`), which loop indefinitely until stopped rather than playing once.
+    looping: bool,
 }
 
 impl SampleVoice {
@@ -1937,14 +1979,15 @@ impl SampleVoice {
     /// `trigger_clip`).
     fn trigger(&mut self, buffer: Arc<SampleBuffer>, velocity: u8) {
         let gain = (velocity as f32 / 127.0).clamp(0.0, 1.0);
-        self.trigger_clip(buffer, gain, 0, usize::MAX, 0, 0);
+        self.trigger_clip(buffer, gain, 0, usize::MAX, 0, 0, false);
     }
 
     /// Same as `trigger`, but for `AudioClip` playback (see `model::AudioClip`): a continuous gain
     /// instead of a 0..127 velocity byte, plus a trim window (`start_frame..end_frame`, clamped to
     /// the buffer's own length) and fade-in/out ramp lengths in frames — both converted from the
     /// clip's tick-domain fields by the caller (`Sequencer::process`), since only that call site
-    /// knows the tempo in effect at the clip's start tick.
+    /// knows the tempo in effect at the clip's start tick. `looping` — see `SampleVoice::looping`.
+    #[allow(clippy::too_many_arguments)]
     fn trigger_clip(
         &mut self,
         buffer: Arc<SampleBuffer>,
@@ -1953,6 +1996,7 @@ impl SampleVoice {
         end_frame: usize,
         fade_in_frames: usize,
         fade_out_frames: usize,
+        looping: bool,
     ) {
         let len = buffer.mono.len();
         self.start_position = start_frame.min(len);
@@ -1962,12 +2006,17 @@ impl SampleVoice {
         self.gain = gain;
         self.fade_in_frames = fade_in_frames;
         self.fade_out_frames = fade_out_frames;
+        self.looping = looping;
     }
 
     fn next_sample(&mut self) -> f32 {
         if self.position >= self.end_position {
-            self.buffer = None;
-            return 0.0;
+            if self.looping && self.end_position > self.start_position {
+                self.position = self.start_position;
+            } else {
+                self.buffer = None;
+                return 0.0;
+            }
         }
         let Some(buffer) = &self.buffer else {
             return 0.0;
@@ -2097,6 +2146,19 @@ pub(crate) fn arrangement_length_ticks(song: &Song) -> usize {
         .max(1)
 }
 
+/// Session View clip-slot playback state, published once per audio callback (see
+/// `build_playback_stream`) for the UI thread to poll each frame — the `Sequencer::session_slots`
+/// counterpart of `metering::MeterHandles`, same "audio thread owns and publishes, UI thread reads
+/// a cheap clone" split, since the live queued/playing/stopped state genuinely only exists on the
+/// audio thread (see `model::SessionLaunchRequest`'s doc comment). Outer index is track, inner is
+/// slot, same shape as `Sequencer::session_slots` itself.
+pub type SessionSlotHandles = Arc<Mutex<Vec<Vec<SlotState>>>>;
+
+/// A fresh, empty `SessionSlotHandles` — mirrors `metering::new_track_meter_handles`.
+pub fn new_session_slot_handles() -> SessionSlotHandles {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
 struct Sequencer {
     sample_rate: f32,
     track_voices: Vec<TrackVoices>,
@@ -2116,6 +2178,23 @@ struct Sequencer {
     metronome_click_pos: usize,
     metronome_click_len: usize,
     metronome_click_freq: f32,
+    /// Session View clip-slot playback state, owned here rather than in `Song` since it must
+    /// survive across the per-callback `Song` snapshot clone (see `model::SessionLaunchRequest`'s
+    /// doc comment). Outer index is track, inner is slot — resized to match
+    /// `Track::session_clips` each `trigger_session_clips` call, the same per-callback resize
+    /// pattern `track_voices` already uses.
+    session_slots: Vec<Vec<SlotState>>,
+    /// The last-seen `SessionLaunchRequest::generation` per track/slot, index-aligned with
+    /// `session_slots` — see `model::SessionLaunchRequest`'s doc comment on the edge-triggered
+    /// click protocol this implements.
+    session_last_seen_generation: Vec<Vec<u64>>,
+    /// Which `TrackVoices::sample_voices` index is currently looping a slot's `SessionClipContent::
+    /// Audio` playback, index-aligned with `session_slots` — `None` for an empty/non-audio slot or
+    /// one that isn't playing. Unlike step-grid/piano-roll content (which never needs cancelling —
+    /// a triggered synth voice or one-shot sample just rings out on its own), a looping
+    /// `SampleVoice` never stops itself, so `trigger_session_clips` needs this handle to hard-cut
+    /// it the moment a slot's state reaches `SlotState::Stopped`.
+    session_audio_voice: Vec<Vec<Option<usize>>>,
 }
 
 /// One beat's worth of ticks (see `STEPS_PER_BEAT`/`TICKS_PER_STEP`) — the metronome clicks once
@@ -2138,6 +2217,9 @@ impl Sequencer {
             metronome_click_pos: 0,
             metronome_click_len: 0,
             metronome_click_freq: 0.0,
+            session_slots: Vec::new(),
+            session_last_seen_generation: Vec::new(),
+            session_audio_voice: Vec::new(),
         }
     }
 
@@ -2185,6 +2267,7 @@ impl Sequencer {
     /// `track_out_r[i]` (both resized to match `snapshot.tracks`). Track count can change between
     /// calls (e.g. after loading a different song) — `track_voices` is resized to match,
     /// discarding in-flight voices for any removed track.
+    #[allow(clippy::too_many_arguments)]
     fn process(
         &mut self,
         snapshot: &Song,
@@ -2193,12 +2276,22 @@ impl Sequencer {
         track_out_r: &mut Vec<Vec<f32>>,
         metronome_enabled: bool,
         metronome_out: &mut Vec<f32>,
+        session_mode: bool,
+        session_quantize_ticks: usize,
     ) {
         while self.track_voices.len() < snapshot.tracks.len() {
             self.track_voices.push(TrackVoices::new());
         }
         self.track_voices.truncate(snapshot.tracks.len());
         self.track_fade_gain.resize(snapshot.tracks.len(), 1.0);
+        if session_mode {
+            // The region-fade reset below only runs on the Playlist-arrangement path (it lives
+            // inside the region loop `trigger_session_clips` replaces) — Session View has no
+            // fades in v1, so reset explicitly here instead, once per buffer rather than per
+            // tick, to avoid a stale fade value left over from a previous Arrangement-mode
+            // session bleeding into Session playback.
+            self.track_fade_gain.fill(1.0);
+        }
 
         track_out_l.resize_with(snapshot.tracks.len(), Vec::new);
         track_out_r.resize_with(snapshot.tracks.len(), Vec::new);
@@ -2246,6 +2339,12 @@ impl Sequencer {
                 if metronome_enabled && self.tick_index % METRONOME_BEAT_TICKS == 0 {
                     self.trigger_metronome_click(self.tick_index == 0);
                 }
+                if session_mode {
+                    // Session View is a mode switch, not an overlay (see `Transport::session_mode`'s
+                    // doc comment): while active, none of the Playlist arrangement's regions/audio
+                    // clips/take folders below trigger — only Session View's own clip slots do.
+                    self.trigger_session_clips(snapshot, session_quantize_ticks, &track_silent);
+                } else {
                 // A track's regions are independently positioned and may overlap in time with
                 // each other (unusual, but not prevented) — every region active at this tick on
                 // this track contributes; tracks with nothing placed at this tick stay silent.
@@ -2283,83 +2382,7 @@ impl Sequencer {
                             RegionContent::StepGrid(lanes) => {
                                 for lane in lanes {
                                     if let Some(step) = step_triggering_at(lane, region_local_tick) {
-                                        let velocity = &step.velocity;
-                                        if let Some(sample) = &lane.sample {
-                                            tv.sample_voices[tv.next_sample_voice]
-                                                .trigger(sample.clone(), *velocity);
-                                            tv.next_sample_voice =
-                                                (tv.next_sample_voice + 1) % SAMPLE_VOICE_COUNT;
-                                        } else {
-                                            let freq = pitch_to_freq(lane.pitch);
-                                            // A lane with its own synth (see
-                                            // `Lane::synth_override`) renders with that instead
-                                            // of the track's — lets a step-grid track mix synth
-                                            // patches per lane (kick on one, hi-hat on another).
-                                            let (engine, synth, trine, wave) = if lane.synth_override
-                                            {
-                                                (
-                                                    lane.synth_engine,
-                                                    &lane.synth,
-                                                    &lane.trine,
-                                                    &lane.wave,
-                                                )
-                                            } else {
-                                                (
-                                                    track.synth_engine,
-                                                    &track.synth,
-                                                    &track.trine,
-                                                    &track.wave,
-                                                )
-                                            };
-                                            // Step-grid hits have no explicit length, unlike a
-                                            // piano-roll note — treat "attack + decay" as the
-                                            // gate time, so Release begins right as Decay would
-                                            // otherwise have finished settling at the sustain level.
-                                            match engine {
-                                                SynthEngine::Simple => {
-                                                    let gate_seconds = synth.attack_seconds
-                                                        + synth.decay_seconds;
-                                                    tv.voices[tv.next_voice].trigger(
-                                                        freq,
-                                                        *velocity,
-                                                        self.sample_rate,
-                                                        gate_seconds,
-                                                        synth,
-                                                        // Step-grid hits never glide — see
-                                                        // `SynthParams::glide_seconds`.
-                                                        None,
-                                                    );
-                                                    tv.next_voice =
-                                                        (tv.next_voice + 1) % VOICE_COUNT;
-                                                }
-                                                SynthEngine::Trine => {
-                                                    let gate_seconds = trine.env3_attack_seconds
-                                                        + trine.env3_decay_seconds;
-                                                    tv.trine_voices[tv.next_trine_voice].trigger(
-                                                        freq,
-                                                        *velocity,
-                                                        self.sample_rate,
-                                                        gate_seconds,
-                                                        trine,
-                                                    );
-                                                    tv.next_trine_voice =
-                                                        (tv.next_trine_voice + 1) % VOICE_COUNT;
-                                                }
-                                                SynthEngine::Wave => {
-                                                    let gate_seconds = wave.amp_attack_seconds
-                                                        + wave.amp_decay_seconds;
-                                                    tv.wave_voices[tv.next_wave_voice].trigger(
-                                                        freq,
-                                                        *velocity,
-                                                        self.sample_rate,
-                                                        gate_seconds,
-                                                        wave,
-                                                    );
-                                                    tv.next_wave_voice =
-                                                        (tv.next_wave_voice + 1) % VOICE_COUNT;
-                                                }
-                                            }
-                                        }
+                                        trigger_lane_step(tv, track, lane, step, self.sample_rate);
                                     }
                                 }
                             }
@@ -2368,57 +2391,13 @@ impl Sequencer {
                                     if note.start_tick != region_local_tick {
                                         continue;
                                     }
-                                    let freq = pitch_to_freq(note.pitch);
-                                    // The note's own length is its gate time: it holds through
-                                    // Attack/Decay/Sustain for exactly this long before Release begins.
-                                    let gate_seconds = ((note.length_ticks as f64
-                                        * samples_per_tick
-                                        / self.sample_rate as f64)
-                                        as f32)
-                                        .max(MIN_NOTE_GATE_SECONDS);
-                                    match track.synth_engine {
-                                        SynthEngine::Simple => {
-                                            let glide_from = if track.synth.glide_seconds > 0.0 {
-                                                tv.last_freq
-                                            } else {
-                                                None
-                                            };
-                                            tv.voices[tv.next_voice].trigger(
-                                                freq,
-                                                note.velocity,
-                                                self.sample_rate,
-                                                gate_seconds,
-                                                &track.synth,
-                                                glide_from,
-                                            );
-                                            tv.next_voice = (tv.next_voice + 1) % VOICE_COUNT;
-                                        }
-                                        SynthEngine::Trine => {
-                                            // Glide isn't part of the Trine engine in this pass.
-                                            tv.trine_voices[tv.next_trine_voice].trigger(
-                                                freq,
-                                                note.velocity,
-                                                self.sample_rate,
-                                                gate_seconds,
-                                                &track.trine,
-                                            );
-                                            tv.next_trine_voice =
-                                                (tv.next_trine_voice + 1) % VOICE_COUNT;
-                                        }
-                                        SynthEngine::Wave => {
-                                            // Glide isn't part of the Wave engine in this pass.
-                                            tv.wave_voices[tv.next_wave_voice].trigger(
-                                                freq,
-                                                note.velocity,
-                                                self.sample_rate,
-                                                gate_seconds,
-                                                &track.wave,
-                                            );
-                                            tv.next_wave_voice =
-                                                (tv.next_wave_voice + 1) % VOICE_COUNT;
-                                        }
-                                    }
-                                    tv.last_freq = Some(freq);
+                                    trigger_piano_roll_note(
+                                        tv,
+                                        track,
+                                        note,
+                                        self.sample_rate,
+                                        samples_per_tick,
+                                    );
                                 }
                             }
                         }
@@ -2462,6 +2441,7 @@ impl Sequencer {
                             end_frame,
                             fade_in_frames,
                             fade_out_frames,
+                            false,
                         );
                         tv.next_sample_voice = (tv.next_sample_voice + 1) % SAMPLE_VOICE_COUNT;
                         continue;
@@ -2496,6 +2476,7 @@ impl Sequencer {
                             end_frame,
                             fade_in_frames,
                             fade_out_frames,
+                            false,
                         );
                         tv.next_sample_voice = (tv.next_sample_voice + 1) % SAMPLE_VOICE_COUNT;
                     }
@@ -2535,10 +2516,12 @@ impl Sequencer {
                                 end_frame,
                                 crossfade_frames,
                                 crossfade_frames,
+                                false,
                             );
                             tv.next_sample_voice = (tv.next_sample_voice + 1) % SAMPLE_VOICE_COUNT;
                         }
                     }
+                }
                 }
                 // The tempo *at the tick that just fired* (not the one it's about to advance to)
                 // governs how long that tick lasts — otherwise the single tick immediately before
@@ -2587,6 +2570,289 @@ impl Sequencer {
             metronome_out[sample_index] = self.next_metronome_click_sample();
         }
     }
+
+    /// Session View's per-tick trigger step — the mode-switch counterpart of the region/audio-clip
+    /// loops `process` runs when `session_mode` is false (see `Transport::session_mode`'s doc
+    /// comment). Called once per fired tick, for every track's every clip slot: folds in any new
+    /// `Track::session_launch_requests` click, advances that slot's `session::SlotState`, and
+    /// triggers its content into the same `TrackVoices` pool arrangement playback would use — safe
+    /// to share since the two never run within the same `process` call.
+    ///
+    /// Session View plays at most one clip per track at a time (see `stop_other_session_slots`),
+    /// so within one track's own slots this runs in two passes: the first (mirroring the original,
+    /// pre-follow-action shape of this function) advances every slot and triggers ordinary
+    /// content, collecting any slot whose loop just completed into `pending_follow_actions`; the
+    /// second resolves and immediately triggers those — a follow action fires at the exact tick a
+    /// clip's loop count is satisfied, not queued to a future launch-quantize boundary the way a
+    /// manual click is.
+    fn trigger_session_clips(
+        &mut self,
+        snapshot: &Song,
+        session_quantize_ticks: usize,
+        track_silent: &impl Fn(&Track) -> bool,
+    ) {
+        while self.session_slots.len() < snapshot.tracks.len() {
+            self.session_slots.push(Vec::new());
+            self.session_last_seen_generation.push(Vec::new());
+            self.session_audio_voice.push(Vec::new());
+        }
+        self.session_slots.truncate(snapshot.tracks.len());
+        self.session_last_seen_generation.truncate(snapshot.tracks.len());
+        self.session_audio_voice.truncate(snapshot.tracks.len());
+
+        let tick_now = self.tick_index;
+        let ticks_per_second = ticks_per_second(snapshot.bpm_at(tick_now));
+        let samples_per_tick = samples_per_tick_at(self.sample_rate as f64, snapshot.bpm_at(tick_now));
+
+        for (track_index, track) in snapshot.tracks.iter().enumerate() {
+            self.session_slots[track_index].resize(track.session_clips.len(), SlotState::default());
+            self.session_last_seen_generation[track_index].resize(track.session_clips.len(), 0);
+            self.session_audio_voice[track_index].resize(track.session_clips.len(), None);
+
+            if track_silent(track) {
+                continue;
+            }
+
+            let slot_count = track.session_clips.len();
+            let mut pending_follow_actions: Vec<(usize, FollowAction, u32)> = Vec::new();
+
+            for (slot_index, maybe_clip) in track.session_clips.iter().enumerate() {
+                let Some(clip) = maybe_clip else { continue };
+
+                let mut state = self.session_slots[track_index][slot_index];
+                if let Some(request) = track.session_launch_requests.get(slot_index) {
+                    let seen = &mut self.session_last_seen_generation[track_index][slot_index];
+                    if request.generation != *seen {
+                        *seen = request.generation;
+                        state = session::apply_launch_request(
+                            state,
+                            request.intent,
+                            tick_now,
+                            session_quantize_ticks,
+                        );
+                    }
+                }
+
+                let loop_length_ticks = clip.loop_length_ticks(ticks_per_second);
+                let before = state;
+                let mut after = session::advance_slot(state, tick_now, loop_length_ticks);
+
+                if session::just_started_playing(before, after) {
+                    // Legato: continue whatever phase a sibling on this same track was already
+                    // at, instead of restarting at local_tick 0 — read before the exclusivity
+                    // stop below wipes that sibling's state. Still waits for the normal
+                    // launch-quantize boundary (already resolved by `advance_slot` above); only
+                    // the starting phase changes, matching Ableton's own Legato.
+                    if clip.legato
+                        && let Some(sibling_local_tick) =
+                            self.playing_sibling_local_tick(track_index, slot_index)
+                    {
+                        after = SlotState::Playing {
+                            local_tick: sibling_local_tick % loop_length_ticks.max(1),
+                            loop_count: 0,
+                        };
+                    }
+                    self.stop_other_session_slots(track_index, slot_index);
+                }
+                self.session_slots[track_index][slot_index] = after;
+
+                if matches!(after, SlotState::Stopped)
+                    && !matches!(before, SlotState::Stopped | SlotState::Queued { .. })
+                {
+                    self.stop_session_slot_audio(track_index, slot_index);
+                }
+
+                let local_tick = match after {
+                    SlotState::Playing { local_tick, .. } => local_tick,
+                    SlotState::QueuedStop { local_tick, .. } => local_tick,
+                    SlotState::Stopped | SlotState::Queued { .. } => continue,
+                };
+                self.trigger_session_slot_content(
+                    track,
+                    track_index,
+                    slot_index,
+                    clip,
+                    local_tick,
+                    session::just_started_playing(before, after),
+                    ticks_per_second,
+                    samples_per_tick,
+                );
+
+                if let SlotState::Playing { loop_count, .. } = after
+                    && session::just_completed_a_loop(before, after)
+                {
+                    let seed = follow_action_seed(tick_now, track_index, slot_index, loop_count);
+                    if let Some(action) =
+                        session::resolve_follow_action(loop_count, &clip.follow_action, seed)
+                        && action != FollowAction::None
+                    {
+                        pending_follow_actions.push((slot_index, action, loop_count));
+                    }
+                }
+            }
+
+            for (slot_index, action, loop_count) in pending_follow_actions {
+                let seed = follow_action_seed(tick_now, track_index, slot_index, loop_count) ^ 0x5EED;
+                let target_index = session::follow_action_target(action, slot_index, slot_count, seed);
+                self.stop_session_slot_audio(track_index, slot_index);
+                self.session_slots[track_index][slot_index] = SlotState::Stopped;
+
+                let Some(target_index) = target_index else { continue };
+                let Some(target_clip) = &track.session_clips[target_index] else { continue };
+                self.session_slots[track_index][target_index] =
+                    SlotState::Playing { local_tick: 0, loop_count: 0 };
+                self.trigger_session_slot_content(
+                    track,
+                    track_index,
+                    target_index,
+                    target_clip,
+                    0,
+                    true,
+                    ticks_per_second,
+                    samples_per_tick,
+                );
+            }
+        }
+    }
+
+    /// The `local_tick` of whatever other slot on `track_index` is currently `Playing`/
+    /// `QueuedStop`, if any — see `trigger_session_clips`'s legato handling. Since Session View
+    /// plays at most one clip per track (`stop_other_session_slots`), there's at most one such
+    /// sibling to find.
+    fn playing_sibling_local_tick(&self, track_index: usize, exclude_slot_index: usize) -> Option<usize> {
+        self.session_slots[track_index]
+            .iter()
+            .enumerate()
+            .find_map(|(idx, state)| {
+                if idx == exclude_slot_index {
+                    return None;
+                }
+                match state {
+                    SlotState::Playing { local_tick, .. } | SlotState::QueuedStop { local_tick, .. } => {
+                        Some(*local_tick)
+                    }
+                    _ => None,
+                }
+            })
+    }
+
+    /// Stops every slot on `track_index` other than `keep_slot_index` — Session View plays at
+    /// most one clip per track at a time, so launching one always stops whatever else was
+    /// playing (or queued) on the same track, the same exclusive-per-track model Ableton's
+    /// Session View uses. Hard-cuts any looping audio voice those slots were using, same cleanup
+    /// `trigger_session_clips`'s ordinary manual-stop path already does.
+    fn stop_other_session_slots(&mut self, track_index: usize, keep_slot_index: usize) {
+        for idx in 0..self.session_slots[track_index].len() {
+            if idx == keep_slot_index {
+                continue;
+            }
+            if !matches!(self.session_slots[track_index][idx], SlotState::Stopped) {
+                self.session_slots[track_index][idx] = SlotState::Stopped;
+            }
+            self.stop_session_slot_audio(track_index, idx);
+        }
+    }
+
+    /// Hard-cuts the looping `SampleVoice` (if any) `track_index`/`slot_index` was using — a
+    /// looping voice never stops itself (see `SampleVoice::looping`), so every path that fully
+    /// stops a slot (a manual stop, exclusivity, a `Stop`/empty-target follow action) needs to
+    /// call this. A no-op for a slot with no audio voice (empty, or step-grid/piano-roll content,
+    /// which never needs cancelling — see `trigger_session_clips`'s doc comment on that).
+    fn stop_session_slot_audio(&mut self, track_index: usize, slot_index: usize) {
+        if let Some(voice_index) = self.session_audio_voice[track_index][slot_index].take() {
+            self.track_voices[track_index].sample_voices[voice_index].buffer = None;
+        }
+    }
+
+    /// Triggers `clip`'s content for `track_index`/`slot_index` at `local_tick`. Step-grid/
+    /// piano-roll content is checked every call (driven purely by matching `local_tick` against
+    /// grid/note positions, same as the arrangement region loop); `SessionClipContent::Audio`
+    /// only triggers when `fresh_start` is true — a `SampleVoice` sets up once and then loops on
+    /// its own (`SampleVoice::looping`), so it's only ever (re)triggered at the moment a slot
+    /// starts, not every tick it continues playing. `local_tick` shifts an `Audio` clip's start
+    /// position forward by that many ticks' worth of frames (a no-op when `local_tick == 0`, the
+    /// ordinary case) — what legato/follow-action restarts need to join an already-playing phase;
+    /// see `trigger_session_clips`'s doc comment on why every subsequent loop then also starts
+    /// from that same shifted point rather than the clip's true frame `0` (a documented
+    /// simplification, not a bug).
+    ///
+    /// Shared by `trigger_session_clips`'s ordinary per-tick pass and its follow-action second
+    /// pass so content sitting exactly at `local_tick == 0` isn't silently missed the way it
+    /// would be if the second pass only set state and waited for the next tick's ordinary pass to
+    /// reach it (`advance_slot` will have already moved `local_tick` past `0` by then).
+    #[allow(clippy::too_many_arguments)]
+    fn trigger_session_slot_content(
+        &mut self,
+        track: &Track,
+        track_index: usize,
+        slot_index: usize,
+        clip: &SessionClip,
+        local_tick: usize,
+        fresh_start: bool,
+        ticks_per_second: f64,
+        samples_per_tick: f64,
+    ) {
+        match &clip.content {
+            SessionClipContent::Region { content, .. } => {
+                let tv = &mut self.track_voices[track_index];
+                match content {
+                    RegionContent::StepGrid(lanes) => {
+                        for lane in lanes {
+                            if let Some(step) = step_triggering_at(lane, local_tick) {
+                                trigger_lane_step(tv, track, lane, step, self.sample_rate);
+                            }
+                        }
+                    }
+                    RegionContent::PianoRoll(notes) => {
+                        for note in notes {
+                            if note.start_tick != local_tick {
+                                continue;
+                            }
+                            trigger_piano_roll_note(tv, track, note, self.sample_rate, samples_per_tick);
+                        }
+                    }
+                }
+            }
+            SessionClipContent::Audio(audio_clip) => {
+                if !fresh_start {
+                    return;
+                }
+                let Some(buffer) = &audio_clip.buffer else { return };
+                let frames_per_tick = buffer.sample_rate as f64 / ticks_per_second;
+                let length_frames = (audio_clip.effective_length_ticks(ticks_per_second) as f64
+                    * frames_per_tick)
+                    .round() as usize;
+                let end_frame = audio_clip.source_start_frame.saturating_add(length_frames);
+                let phase_frames = (local_tick as f64 * frames_per_tick).round() as usize;
+                let start_frame = audio_clip.source_start_frame.saturating_add(phase_frames).min(end_frame);
+                let fade_in_frames = (audio_clip.fade_in_ticks as f64 * frames_per_tick).round() as usize;
+                let fade_out_frames = (audio_clip.fade_out_ticks as f64 * frames_per_tick).round() as usize;
+                let tv = &mut self.track_voices[track_index];
+                let voice_index = tv.next_sample_voice;
+                tv.sample_voices[voice_index].trigger_clip(
+                    buffer.clone(),
+                    audio_clip.gain,
+                    start_frame,
+                    end_frame,
+                    fade_in_frames,
+                    fade_out_frames,
+                    true,
+                );
+                tv.next_sample_voice = (voice_index + 1) % SAMPLE_VOICE_COUNT;
+                self.session_audio_voice[track_index][slot_index] = Some(voice_index);
+            }
+        }
+    }
+}
+
+/// A varying seed for `session::resolve_follow_action`/`session::follow_action_target`'s
+/// dependency-free hash — mixes the tick a loop completed with the track/slot/loop-count so two
+/// different slots (or the same slot on a later loop) don't roll the same "random" outcome.
+fn follow_action_seed(tick_now: usize, track_index: usize, slot_index: usize, loop_count: u32) -> u64 {
+    (tick_now as u64)
+        ^ ((track_index as u64) << 40)
+        ^ ((slot_index as u64) << 24)
+        ^ ((loop_count as u64) << 8)
 }
 
 /// Samples per sequencer tick at `sample_rate`/`bpm` — the shared clock-rate formula every
@@ -2630,6 +2896,103 @@ fn step_triggering_at(lane: &Lane, region_local_tick: usize) -> Option<StepData>
         let target_tick = (step_index * TICKS_PER_STEP) as i64 + step.timing_offset_ticks as i64;
         (target_tick == region_local_tick as i64).then_some(step)
     })
+}
+
+/// Triggers `lane`'s synth/sample voice for `step` (already looked up via `step_triggering_at`)
+/// into `tv` — the step-grid trigger-dispatch body shared by `Sequencer::process`'s arrangement
+/// region loop and its Session View clip loop (`trigger_session_clips`), so a synth-engine change
+/// only ever needs updating in one place.
+fn trigger_lane_step(tv: &mut TrackVoices, track: &Track, lane: &Lane, step: StepData, sample_rate: f32) {
+    let velocity = step.velocity;
+    if let Some(sample) = &lane.sample {
+        tv.sample_voices[tv.next_sample_voice].trigger(sample.clone(), velocity);
+        tv.next_sample_voice = (tv.next_sample_voice + 1) % SAMPLE_VOICE_COUNT;
+        return;
+    }
+    let freq = pitch_to_freq(lane.pitch);
+    // A lane with its own synth (see `Lane::synth_override`) renders with that instead of the
+    // track's — lets a step-grid track mix synth patches per lane (kick on one, hi-hat on
+    // another).
+    let (engine, synth, trine, wave) = if lane.synth_override {
+        (lane.synth_engine, &lane.synth, &lane.trine, &lane.wave)
+    } else {
+        (track.synth_engine, &track.synth, &track.trine, &track.wave)
+    };
+    // Step-grid hits have no explicit length, unlike a piano-roll note — treat "attack + decay"
+    // as the gate time, so Release begins right as Decay would otherwise have finished settling
+    // at the sustain level.
+    match engine {
+        SynthEngine::Simple => {
+            let gate_seconds = synth.attack_seconds + synth.decay_seconds;
+            // Step-grid hits never glide — see `SynthParams::glide_seconds`.
+            tv.voices[tv.next_voice].trigger(freq, velocity, sample_rate, gate_seconds, synth, None);
+            tv.next_voice = (tv.next_voice + 1) % VOICE_COUNT;
+        }
+        SynthEngine::Trine => {
+            let gate_seconds = trine.env3_attack_seconds + trine.env3_decay_seconds;
+            tv.trine_voices[tv.next_trine_voice].trigger(freq, velocity, sample_rate, gate_seconds, trine);
+            tv.next_trine_voice = (tv.next_trine_voice + 1) % VOICE_COUNT;
+        }
+        SynthEngine::Wave => {
+            let gate_seconds = wave.amp_attack_seconds + wave.amp_decay_seconds;
+            tv.wave_voices[tv.next_wave_voice].trigger(freq, velocity, sample_rate, gate_seconds, wave);
+            tv.next_wave_voice = (tv.next_wave_voice + 1) % VOICE_COUNT;
+        }
+    }
+}
+
+/// Triggers `track`'s synth voice for `note` into `tv` — the piano-roll trigger-dispatch body
+/// shared by `Sequencer::process`'s arrangement region loop and its Session View clip loop
+/// (`trigger_session_clips`), same reasoning as `trigger_lane_step`.
+fn trigger_piano_roll_note(
+    tv: &mut TrackVoices,
+    track: &Track,
+    note: &Note,
+    sample_rate: f32,
+    samples_per_tick: f64,
+) {
+    let freq = pitch_to_freq(note.pitch);
+    // The note's own length is its gate time: it holds through Attack/Decay/Sustain for exactly
+    // this long before Release begins.
+    let gate_seconds = ((note.length_ticks as f64 * samples_per_tick / sample_rate as f64) as f32)
+        .max(MIN_NOTE_GATE_SECONDS);
+    match track.synth_engine {
+        SynthEngine::Simple => {
+            let glide_from = if track.synth.glide_seconds > 0.0 { tv.last_freq } else { None };
+            tv.voices[tv.next_voice].trigger(
+                freq,
+                note.velocity,
+                sample_rate,
+                gate_seconds,
+                &track.synth,
+                glide_from,
+            );
+            tv.next_voice = (tv.next_voice + 1) % VOICE_COUNT;
+        }
+        SynthEngine::Trine => {
+            // Glide isn't part of the Trine engine in this pass.
+            tv.trine_voices[tv.next_trine_voice].trigger(
+                freq,
+                note.velocity,
+                sample_rate,
+                gate_seconds,
+                &track.trine,
+            );
+            tv.next_trine_voice = (tv.next_trine_voice + 1) % VOICE_COUNT;
+        }
+        SynthEngine::Wave => {
+            // Glide isn't part of the Wave engine in this pass.
+            tv.wave_voices[tv.next_wave_voice].trigger(
+                freq,
+                note.velocity,
+                sample_rate,
+                gate_seconds,
+                &track.wave,
+            );
+            tv.next_wave_voice = (tv.next_wave_voice + 1) % VOICE_COUNT;
+        }
+    }
+    tv.last_freq = Some(freq);
 }
 
 /// Equal-power left/right gains for a `Track::pan` value (-1.0 hard left, 0.0 center, 1.0 hard
@@ -2962,6 +3325,7 @@ fn build_playback_stream<T>(
     track_meters: MeterHandles,
     master_meter: MeterHandles,
     submix_meters: MeterHandles,
+    session_slots: SessionSlotHandles,
     max_frames: usize,
 ) -> Result<Stream>
 where
@@ -3166,10 +3530,18 @@ where
                     &mut track_dry_r,
                     transport.is_metronome_enabled(),
                     &mut metronome_dry,
+                    transport.is_session_mode(),
+                    transport.session_quantize_ticks(),
                 );
                 transport
                     .current_tick
                     .store(sequencer.current_tick(), Ordering::Relaxed);
+                // See `SessionSlotHandles`'s doc comment — published every buffer so the UI thread
+                // can show live queued/playing/stopped state, the same "audio thread publishes, UI
+                // thread reads a cheap clone" split `track_meters` already uses just below.
+                if let Ok(mut published_session_slots) = session_slots.lock() {
+                    published_session_slots.clone_from(&sequencer.session_slots);
+                }
 
                 // Resolved once per buffer from the tempo at its first tick — unlike
                 // `Sequencer::process`'s own per-tick-boundary resolution above, a `tempo_map`
@@ -3732,6 +4104,11 @@ pub fn render_track_to_buffer(
         &mut track_dry_r,
         false,
         &mut metronome_dry,
+        // The offline bounce always renders the Playlist arrangement, never a live Session View
+        // performance (which has no persisted timeline to render) — see `render_song_to_wav`'s
+        // doc comment.
+        false,
+        0,
     );
 
     let mut chain = plugin_host::load_offline_chain(
@@ -3821,6 +4198,11 @@ pub fn render_song_to_wav(
         &mut track_dry_r,
         false,
         &mut metronome_dry,
+        // The offline bounce always renders the Playlist arrangement, never a live Session View
+        // performance (which has no persisted timeline to render) — see `render_song_to_wav`'s
+        // doc comment.
+        false,
+        0,
     );
 
     let buffer_l = vec![0.0f32; total_samples];
@@ -4874,7 +5256,7 @@ mod tests {
         });
         let mut voice = SampleVoice::default();
         // Trim to frames 1..4 (values 2.0, 3.0, 4.0), no fades.
-        voice.trigger_clip(buffer, 1.0, 1, 4, 0, 0);
+        voice.trigger_clip(buffer, 1.0, 1, 4, 0, 0, false);
 
         assert_eq!(voice.next_sample(), 2.0);
         assert_eq!(voice.next_sample(), 3.0);
@@ -4887,6 +5269,22 @@ mod tests {
     }
 
     #[test]
+    fn trigger_clip_with_looping_wraps_back_to_start_instead_of_stopping() {
+        let buffer = Arc::new(SampleBuffer {
+            sample_rate: 48_000,
+            mono: vec![1.0, 2.0, 3.0],
+        });
+        let mut voice = SampleVoice::default();
+        voice.trigger_clip(buffer, 1.0, 0, 3, 0, 0, true);
+
+        assert_eq!(voice.next_sample(), 1.0);
+        assert_eq!(voice.next_sample(), 2.0);
+        assert_eq!(voice.next_sample(), 3.0);
+        assert_eq!(voice.next_sample(), 1.0, "should wrap back to the start, not go silent");
+        assert_eq!(voice.next_sample(), 2.0);
+    }
+
+    #[test]
     fn trigger_clip_ramps_fade_in_and_fade_out_linearly() {
         let buffer = Arc::new(SampleBuffer {
             sample_rate: 48_000,
@@ -4894,7 +5292,7 @@ mod tests {
         });
         let mut voice = SampleVoice::default();
         // 8-frame clip, 2-frame fade-in, 2-frame fade-out.
-        voice.trigger_clip(buffer, 1.0, 0, 8, 2, 2);
+        voice.trigger_clip(buffer, 1.0, 0, 8, 2, 2, false);
 
         let samples: Vec<f32> = (0..8).map(|_| voice.next_sample()).collect();
         // Fade-in ramps over frames 0..2 (elapsed frames played so far); fade-out ramps over the
@@ -5562,6 +5960,8 @@ mod tests {
             &mut track_out_r,
             false,
             &mut metronome_out,
+            false,
+            0,
         );
 
         let samples_per_tick = (sample_rate as f64 * 60.0
@@ -5609,6 +6009,8 @@ mod tests {
             &mut track_out_r,
             false,
             &mut metronome_out,
+            false,
+            0,
         );
 
         let expected_onset = (tempo_change_tick as f64
@@ -5761,6 +6163,8 @@ mod tests {
             &mut track_out_r,
             false,
             &mut metronome_out,
+            false,
+            0,
         );
 
         assert!(
@@ -5802,7 +6206,9 @@ mod tests {
         let mut track_out_l = Vec::new();
         let mut track_out_r = Vec::new();
         let mut metronome_out = Vec::new();
-        sequencer.process(&song, 4096, &mut track_out_l, &mut track_out_r, false, &mut metronome_out);
+        sequencer.process(
+            &song, 4096, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, false, 0,
+        );
 
         assert!(
             track_out_l[0].iter().all(|&s| s == 0.0),
@@ -5842,7 +6248,9 @@ mod tests {
         let mut track_out_l = Vec::new();
         let mut track_out_r = Vec::new();
         let mut metronome_out = Vec::new();
-        sequencer.process(&song, 4096, &mut track_out_l, &mut track_out_r, false, &mut metronome_out);
+        sequencer.process(
+            &song, 4096, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, false, 0,
+        );
 
         assert!(
             track_out_l[0].iter().any(|&s| s != 0.0),
@@ -5952,6 +6360,283 @@ mod tests {
         assert!(
             samples[0..1000].iter().any(|&s| s != 0),
             "the clip should be audible right at its start tick"
+        );
+    }
+
+    #[test]
+    fn session_mode_triggers_a_launched_step_grid_slot_and_ignores_the_playlist() {
+        let mut track = crate::model::Track::new_step_grid("Drums", 1);
+        // A Playlist region that would trigger a note at tick 0 in Arrangement mode — proves
+        // Session View's mode switch actually suppresses it (see `Transport::session_mode`'s doc
+        // comment: never both at once).
+        track.regions.push(one_note_region(0, 4, 4, 0, TICKS_PER_STEP));
+        let mut lane = crate::model::Lane::new("Kick", 60, 4);
+        lane.set_step(0, 127);
+        track.session_clips.push(Some(crate::model::SessionClip {
+            name: "Slot".to_string(),
+            content: crate::model::SessionClipContent::Region {
+                content: RegionContent::StepGrid(vec![lane]),
+                content_length_steps: 4,
+                loop_length_steps: 4,
+            },
+            follow_action: crate::model::FollowActionConfig::default(),
+            legato: false,
+        }));
+        track.session_launch_requests.push(crate::model::SessionLaunchRequest {
+            generation: 1,
+            intent: crate::model::LaunchIntent::Play,
+        });
+
+        let song = crate::model::Song {
+            name: "session view test".to_string(),
+            bpm: 120.0,
+            tempo_map: Vec::new(),
+            tracks: vec![track],
+            next_note_id: 0,
+            master_effects: Vec::new(),
+            plugins: Vec::new(),
+            synth_presets: Vec::new(),
+            time_signature_numerator: 4,
+            time_signature_denominator: 4,
+            sends: Vec::new(),
+            submixes: Vec::new(),
+        };
+
+        let mut sequencer = Sequencer::new(48_000.0);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        sequencer.process(
+            &song,
+            4096,
+            &mut track_out_l,
+            &mut track_out_r,
+            false,
+            &mut metronome_out,
+            true, // session_mode
+            0,    // no quantization: launches immediately
+        );
+
+        assert!(
+            track_out_l[0].iter().any(|&s| s != 0.0),
+            "the launched step-grid session slot should be audible"
+        );
+    }
+
+    #[test]
+    fn session_mode_looping_audio_clip_stops_hard_when_the_slot_is_stopped() {
+        let sample_rate = 48_000u32;
+        // A short clip so it wraps (loops) several times within one process() call.
+        let buffer = Arc::new(SampleBuffer { sample_rate, mono: vec![0.5; 480] });
+        let mut audio_clip = crate::model::AudioClip::new(0, "unused.wav");
+        audio_clip.buffer = Some(buffer);
+
+        let mut track = crate::model::Track::new_audio("Loop", 1);
+        track.session_clips.push(Some(crate::model::SessionClip {
+            name: "Loop Slot".to_string(),
+            content: crate::model::SessionClipContent::Audio(audio_clip),
+            follow_action: crate::model::FollowActionConfig::default(),
+            legato: false,
+        }));
+        track.session_launch_requests.push(crate::model::SessionLaunchRequest {
+            generation: 1,
+            intent: crate::model::LaunchIntent::Play,
+        });
+
+        let song = crate::model::Song {
+            name: "session view loop test".to_string(),
+            bpm: 120.0,
+            tempo_map: Vec::new(),
+            tracks: vec![track],
+            next_note_id: 0,
+            master_effects: Vec::new(),
+            plugins: Vec::new(),
+            synth_presets: Vec::new(),
+            time_signature_numerator: 4,
+            time_signature_denominator: 4,
+            sends: Vec::new(),
+            submixes: Vec::new(),
+        };
+
+        let mut sequencer = Sequencer::new(sample_rate as f32);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        // 4000 frames is well past the 480-frame clip's own length, so this only passes if the
+        // clip actually looped (see `SampleVoice::looping`) instead of going silent after once.
+        sequencer.process(
+            &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+        );
+        assert!(
+            track_out_l[0][3000..4000].iter().any(|&s| s != 0.0),
+            "the clip should still be looping well past its own natural length"
+        );
+
+        let mut song_after_stop = song.clone();
+        song_after_stop.tracks[0].session_launch_requests[0].generation = 2;
+        song_after_stop.tracks[0].session_launch_requests[0].intent = crate::model::LaunchIntent::Stop;
+        sequencer.process(
+            &song_after_stop,
+            4000,
+            &mut track_out_l,
+            &mut track_out_r,
+            false,
+            &mut metronome_out,
+            true,
+            0,
+        );
+        assert!(
+            track_out_l[0][3000..4000].iter().all(|&s| s == 0.0),
+            "stopping the slot should hard-cut the looping voice, not let it keep looping"
+        );
+    }
+
+    fn step_grid_session_track(name: &str) -> crate::model::Track {
+        crate::model::Track::new_step_grid(name, 1)
+    }
+
+    fn one_step_lane(pitch: u8) -> crate::model::Lane {
+        let mut lane = crate::model::Lane::new("Kick", pitch, 1);
+        lane.set_step(0, 127);
+        lane
+    }
+
+    fn session_song(track: crate::model::Track) -> crate::model::Song {
+        crate::model::Song {
+            name: "session follow-action test".to_string(),
+            bpm: 120.0,
+            tempo_map: Vec::new(),
+            tracks: vec![track],
+            next_note_id: 0,
+            master_effects: Vec::new(),
+            plugins: Vec::new(),
+            synth_presets: Vec::new(),
+            time_signature_numerator: 4,
+            time_signature_denominator: 4,
+            sends: Vec::new(),
+            submixes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_mode_follow_action_next_advances_to_the_next_slot_and_stops_the_source() {
+        let mut track = step_grid_session_track("Drums");
+        track.session_clips.push(Some(crate::model::SessionClip {
+            name: "Slot 0".to_string(),
+            content: crate::model::SessionClipContent::Region {
+                content: RegionContent::StepGrid(vec![one_step_lane(60)]),
+                content_length_steps: 1,
+                loop_length_steps: 1,
+            },
+            follow_action: crate::model::FollowActionConfig {
+                times: 1,
+                action_a: FollowAction::Next,
+                chance_a: 1.0,
+                action_b: FollowAction::None,
+                chance_b: 0.0,
+            },
+            legato: false,
+        }));
+        track.session_clips.push(Some(crate::model::SessionClip {
+            name: "Slot 1".to_string(),
+            content: crate::model::SessionClipContent::Region {
+                content: RegionContent::StepGrid(vec![one_step_lane(62)]),
+                content_length_steps: 4,
+                loop_length_steps: 4,
+            },
+            follow_action: crate::model::FollowActionConfig::default(),
+            legato: false,
+        }));
+        track.session_launch_requests.push(crate::model::SessionLaunchRequest {
+            generation: 1,
+            intent: crate::model::LaunchIntent::Play,
+        });
+
+        let song = session_song(track);
+        let mut sequencer = Sequencer::new(48_000.0);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        // Slot 0's whole loop is 1 step (TICKS_PER_STEP ticks) — comfortably less than one
+        // second of audio at any reasonable tempo, so this covers several loops.
+        sequencer.process(
+            &song, 48_000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+        );
+
+        assert_eq!(
+            sequencer.session_slots[0][0],
+            SlotState::Stopped,
+            "the source slot should have stopped once its follow action fired"
+        );
+        assert!(
+            matches!(sequencer.session_slots[0][1], SlotState::Playing { .. }),
+            "Next should have launched slot 1, got {:?}",
+            sequencer.session_slots[0][1]
+        );
+    }
+
+    #[test]
+    fn session_mode_legato_launch_continues_the_outgoing_slots_phase() {
+        let mut track = step_grid_session_track("Drums");
+        for pitch in [60, 62] {
+            track.session_clips.push(Some(crate::model::SessionClip {
+                name: format!("Slot {pitch}"),
+                content: crate::model::SessionClipContent::Region {
+                    content: RegionContent::StepGrid(vec![one_step_lane(pitch)]),
+                    content_length_steps: 16,
+                    loop_length_steps: 16,
+                },
+                follow_action: crate::model::FollowActionConfig::default(),
+                legato: true,
+            }));
+        }
+        track.session_launch_requests.push(crate::model::SessionLaunchRequest {
+            generation: 1,
+            intent: crate::model::LaunchIntent::Play,
+        });
+
+        let song = session_song(track);
+        let mut sequencer = Sequencer::new(48_000.0);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        // A handful of ticks' worth of samples — enough for slot 0 to be clearly mid-loop, well
+        // short of its own 16-step length.
+        sequencer.process(
+            &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+        );
+        let SlotState::Playing { local_tick: slot_0_local_tick, .. } = sequencer.session_slots[0][0] else {
+            panic!("slot 0 should be playing by now: {:?}", sequencer.session_slots[0][0]);
+        };
+        assert!(slot_0_local_tick > 0, "slot 0 should be mid-loop, not just starting");
+
+        let mut song_launch_slot_1 = song.clone();
+        song_launch_slot_1.tracks[0].session_launch_requests.push(crate::model::SessionLaunchRequest {
+            generation: 1,
+            intent: crate::model::LaunchIntent::Play,
+        });
+        sequencer.process(
+            &song_launch_slot_1,
+            1,
+            &mut track_out_l,
+            &mut track_out_r,
+            false,
+            &mut metronome_out,
+            true,
+            0,
+        );
+
+        assert_eq!(
+            sequencer.session_slots[0][0],
+            SlotState::Stopped,
+            "legato still stops whatever else was playing on the same track"
+        );
+        let SlotState::Playing { local_tick: slot_1_local_tick, .. } = sequencer.session_slots[0][1] else {
+            panic!("slot 1 should be playing: {:?}", sequencer.session_slots[0][1]);
+        };
+        assert!(
+            slot_1_local_tick > 0,
+            "legato should have continued slot 0's phase instead of restarting at 0, got {slot_1_local_tick}"
         );
     }
 

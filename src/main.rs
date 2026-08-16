@@ -12,6 +12,8 @@ mod model;
 mod pitch;
 mod plugin_host;
 mod sample;
+mod session;
+mod session_view_ui;
 mod stretch;
 mod tempo;
 mod tempo_detection;
@@ -87,10 +89,12 @@ const PLAYLIST_LANE_HEIGHT: f32 = 26.0;
 /// down the left side, FL Studio–style, that stay put while the timeline canvas scrolls under them.
 const PLAYLIST_HEADER_WIDTH: f32 = 120.0;
 
-/// FL Studio–style accent green: playback, active steps/LEDs, the piano-roll playhead.
-const FL_ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(139, 198, 63);
-/// FL Studio–style accent orange: warnings, recording, clipping.
-const FL_ACCENT_ORANGE: egui::Color32 = egui::Color32::from_rgb(242, 169, 59);
+/// FL Studio–style accent green: playback, active steps/LEDs, the piano-roll playhead. `pub(crate)`
+/// so `session_view_ui` can reuse it for a playing Session View slot, the same "active" meaning.
+pub(crate) const FL_ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(139, 198, 63);
+/// FL Studio–style accent orange: warnings, recording, clipping. `pub(crate)` so `session_view_ui`
+/// can reuse it for a queued Session View slot.
+pub(crate) const FL_ACCENT_ORANGE: egui::Color32 = egui::Color32::from_rgb(242, 169, 59);
 /// Playlist block fill for a `TakeFolder` — distinct from a plain `AudioClip`'s `track_color` fill
 /// so a recording that can be re-comped is visually distinguishable at a glance from an import.
 const TAKE_FOLDER_COLOR: egui::Color32 = egui::Color32::from_rgb(196, 152, 219);
@@ -619,6 +623,18 @@ struct SimpleDawApp {
     track_meters: MeterHandles,
     master_meter: MeterHandles,
     submix_meters: MeterHandles,
+    /// Live Session View clip-slot playback state (queued/playing/stopped), published by the audio
+    /// thread once per callback — see `audio::SessionSlotHandles`'s doc comment. Self-managing
+    /// (the audio thread resizes it to match `Song::tracks`/`Track::session_clips` itself), unlike
+    /// `track_meters`, so there's no `resize_session_slots` counterpart to call on track add/remove.
+    session_slots: audio::SessionSlotHandles,
+    /// Session View's launch-quantize setting (e.g. "1 Bar") — live UI state, not song data, read
+    /// each frame to compute `Transport::session_quantize_ticks` from the current song's own
+    /// `Song::steps_per_bar`. See `session_view_ui::SessionQuantize`.
+    session_quantize: session_view_ui::SessionQuantize,
+    /// Which Session View slot's Follow Action editor window is open, if any: `(track_index,
+    /// slot_index)` — same `Option<(usize, usize)>`-keyed-window idiom as `take_folder_editor`.
+    follow_action_editor: Option<(usize, usize)>,
     /// Which effect's parameter-editor window (if any) is currently open.
     effect_editor: Option<EffectEditorTarget>,
     /// Which slot's embedded plugin GUI (if any) currently owns the one reserved panel inside the
@@ -708,6 +724,11 @@ struct SimpleDawApp {
     /// Whether the Playlist (arrangement timeline) window is open — toggled from the toolbar,
     /// always detached like the Piano Roll/Beats windows (no docked mode).
     playlist_open: bool,
+    /// Whether Session View (the clip-launching grid) is showing in the central area instead of
+    /// the Playlist — toggled from the toolbar, mutually exclusive with `playlist_open` (both want
+    /// the same central area; unlike Playlist vs. Mixer, which dock to different regions and can
+    /// coexist). See `session_view_ui::session_view_contents_ui`.
+    session_view_open: bool,
     /// Whether the Mixer (classic vertical channel-strip view — one strip per track plus a Master
     /// strip) is visible at all, toggled from the toolbar. Same dock/detach split as the Channel
     /// Rack (see `mixer_detached`), but unlike the Channel Rack it can be hidden entirely, since
@@ -803,6 +824,7 @@ impl SimpleDawApp {
         let track_meters = metering::new_track_meter_handles(track_count);
         let master_meter = metering::new_master_meter_handles();
         let submix_meters = metering::new_track_meter_handles(submix_count);
+        let session_slots = audio::new_session_slot_handles();
         let engine = AudioEngine::start(
             song.clone(),
             transport.clone(),
@@ -813,6 +835,7 @@ impl SimpleDawApp {
             track_meters.clone(),
             master_meter.clone(),
             submix_meters.clone(),
+            session_slots.clone(),
             None,
             None,
         );
@@ -890,6 +913,9 @@ impl SimpleDawApp {
             track_meters,
             master_meter,
             submix_meters,
+            session_slots,
+            session_quantize: session_view_ui::SessionQuantize::default(),
+            follow_action_editor: None,
             effect_editor: None,
             active_embedded_gui: None,
             synth_editor: None,
@@ -915,6 +941,7 @@ impl SimpleDawApp {
             beats_region: None,
             channel_rack_detached: false,
             playlist_open: true,
+            session_view_open: false,
             mixer_open: false,
             mixer_detached: false,
             playlist_zoom: 1.0,
@@ -6385,6 +6412,22 @@ impl eframe::App for SimpleDawApp {
                                 .clicked()
                             {
                                 self.playlist_open = !self.playlist_open;
+                                if self.playlist_open {
+                                    self.session_view_open = false;
+                                }
+                            }
+                            // Session View and the Playlist both dock into the central area (see
+                            // `session_view_open`'s doc comment) — clicking one closes the other,
+                            // the same "one central-area view at a time" idea Ableton's own
+                            // Session/Arrangement tab switcher uses.
+                            if ui
+                                .selectable_label(self.session_view_open, "🎛 Session")
+                                .clicked()
+                            {
+                                self.session_view_open = !self.session_view_open;
+                                if self.session_view_open {
+                                    self.playlist_open = false;
+                                }
                             }
                             if ui.selectable_label(self.mixer_open, "🎚 Mixer").clicked() {
                                 self.mixer_open = !self.mixer_open;
@@ -6497,6 +6540,7 @@ impl eframe::App for SimpleDawApp {
                                     self.track_meters.clone(),
                                     self.master_meter.clone(),
                                     self.submix_meters.clone(),
+                                    self.session_slots.clone(),
                                     self.selected_output_device.as_deref(),
                                     self.selected_output_sample_rate,
                                 ) {
@@ -7766,6 +7810,20 @@ impl eframe::App for SimpleDawApp {
                         &mut self.take_folder_editor,
                         &mut self.flex_editor,
                         &mut editor_targets,
+                    );
+                });
+        } else if self.session_view_open {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(30, 30, 30))
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    session_view_ui::session_view_contents_ui(
+                        ui,
+                        song,
+                        &self.transport,
+                        &self.session_slots,
+                        &mut self.session_quantize,
+                        &mut self.follow_action_editor,
                     );
                 });
         }
