@@ -10,12 +10,11 @@
 <div class="layout">
   <nav class="sidebar">
     <a class="brand" href="index.html">simple-daw</a>
-    <a href="index.html" class="active">Overview &amp; Setup</a>
-    <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a>
-    <a href="synth-engines.html">Synth Engines</a>
-    <a href="effects.html">Effects</a>
-    <a href="audio-and-io.html">Audio, MIDI &amp; Files</a>
-    <a href="ai-control.html">AI Control (MCP)</a>
+    <a href="index.html" class="active">Docs Home</a>
+    <div class="section-label">User Manual</div>
+    <a href="user-manual/index.html">Manual Home</a>
+    <div class="section-label">Technical Docs</div>
+    <a href="technical/index.html">Technical Overview</a>
   </nav>
   <main>
     <h1>simple-daw</h1>
@@ -23,62 +22,36 @@
       not a general-purpose DAW.</p>
 
     <p>Its scope is narrow and on purpose: a step sequencer, a piano roll, three built-in synth
-      engines, sample playback, a Logic/Ableton-style Playlist timeline, WAV bounce, MIDI import,
-      JSON song persistence, and CLAP effect hosting. This site walks through how to use each part
-      of the app.</p>
+      engines, sample playback and non-destructive audio-clip editing, a Logic/Ableton-style
+      Playlist timeline, WAV bounce, MIDI import, JSON song persistence, CLAP effect hosting, and
+      a set of composition tools (quantize/humanize/groove, tempo mapping). This documentation is
+      split into two tracks depending on what you're trying to do.</p>
+
+    <div class="hub-grid">
+      <a class="hub-card" href="user-manual/index.html">
+        <h3>User Manual</h3>
+        <p>Learn to use the app, start to finish — installing it, building your first track,
+          every window and editing surface, and a handful of full case studies. Start here if
+          you want to make music with it.</p>
+      </a>
+      <a class="hub-card technical" href="technical/index.html">
+        <h3>Technical Documentation</h3>
+        <p>The data model and engine architecture — how a song is represented, how it's played
+          back in real time, and how the pieces fit together. Start here if you're reading or
+          modifying the source.</p>
+      </a>
+    </div>
 
     <h2>Prerequisites</h2>
     <ul>
       <li>A Rust toolchain, installed via <a href="https://rustup.rs/">rustup</a>.</li>
       <li>On Linux: ALSA development headers for cpal's audio backend
         (<code>alsa-lib-devel</code> on Fedora, <code>libasound2-dev</code> on Debian/Ubuntu).</li>
-      <li>Optional: a <code>.clap</code> plugin on disk if you want to try CLAP effect hosting —
-        none ship with the repo. See <a href="effects.html">Effects</a>.</li>
     </ul>
 
     <h2>Build &amp; run</h2>
     <pre><code>cargo build       # debug build
 cargo run         # launch the GUI app</code></pre>
-
-    <h2>Tests</h2>
-    <pre><code>cargo test              # unit tests: audio DSP math, model editing logic, WAV export
-cargo test &lt;test_name&gt;  # run a single test</code></pre>
-    <div class="note">
-      Unit tests cover synth/DSP math and the WAV exporter, but can't prove the live audio path
-      actually produces sound. There's no automated harness for that — audio-affecting changes
-      should be verified by running the app and listening.
-    </div>
-
-    <h2>Where to go next</h2>
-    <div class="card-grid">
-      <a class="card" href="tracks-and-playlist.html">
-        <h4>Tracks &amp; Playlist</h4>
-        <p>Channel Rack, arranging Regions on the Playlist, the step-grid Beats window, and the
-          Piano Roll.</p>
-      </a>
-      <a class="card" href="synth-engines.html">
-        <h4>Synth Engines</h4>
-        <p>Simple, Trine and Wave — how they differ, and working with presets.</p>
-      </a>
-      <a class="card" href="effects.html">
-        <h4>Effects</h4>
-        <p>Built-in effect chains, the master bus, and hosting CLAP plugins.</p>
-      </a>
-      <a class="card" href="audio-and-io.html">
-        <h4>Audio, MIDI &amp; Files</h4>
-        <p>Sample playback, recording/importing audio, MIDI import, saving songs, and WAV export.</p>
-      </a>
-      <a class="card" href="ai-control.html">
-        <h4>AI Control (MCP)</h4>
-        <p>Let an LLM drive a running instance — add tracks, program beats, apply presets, play.</p>
-      </a>
-    </div>
-
-    <h2>Project layout</h2>
-    <p>For contributors: the crate is a flat set of top-level <code>src/*.rs</code> files, each one
-      responsibility (data model, audio engine, UI, built-in effect DSP, CLAP hosting, sample
-      loading, wavetables, MIDI import). See the repository's own
-      <code>CLAUDE.md</code> for the full architecture notes.</p>
 
     <footer>simple-daw documentation</footer>
   </main>

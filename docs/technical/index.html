@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Technical Documentation — simple-daw</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">Technical Docs</div>
+    <a href="index.html" class="active">Overview</a>
+    <a href="data-model.html">Data Model</a>
+    <a href="architecture.html">Engine Architecture</a>
+  </nav>
+  <main>
+    <h1>Technical Documentation</h1>
+    <p class="lead">How the song is represented and how it's turned into sound — for anyone
+      reading or modifying the source, not just using the app.</p>
+
+    <p>Looking to learn the app itself instead? See the
+      <a href="../user-manual/index.html">User Manual</a>.</p>
+
+    <h2>Project layout</h2>
+    <p>The crate is a flat set of top-level <code>src/*.rs</code> files, each one responsibility
+      (data model, audio engine, UI, built-in effect DSP, CLAP hosting, sample loading,
+      wavetables, MIDI import, groove/tempo/pitch/stretch DSP). The repository's own
+      <code>CLAUDE.md</code> is the canonical, most detailed architecture reference — the two
+      pages here are a narrower, doc-site-formatted view of the same ground, focused on the parts
+      most useful to get oriented in the codebase.</p>
+
+    <div class="card-grid">
+      <a class="card" href="data-model.html">
+        <h4>Data Model</h4>
+        <p><code>src/model.rs</code> — <code>Song</code> → <code>Track</code> →
+          <code>Region</code>/<code>AudioClip</code>, and every field that hangs off them.</p>
+      </a>
+      <a class="card" href="architecture.html">
+        <h4>Engine Architecture</h4>
+        <p>The real-time audio thread, voice pools, the stereo signal path, the mixer bus graph,
+          automation evaluation, and the tempo/groove/stretch subsystems.</p>
+      </a>
+    </div>
+
+    <h2>Commands</h2>
+    <pre><code>cargo build              # debug build
+cargo run                # launch the GUI app
+cargo test                # unit tests: audio DSP math, model editing logic, WAV export
+cargo test &lt;test_name&gt;     # run a single test (matches by substring)
+cargo clippy --all-targets # lint, including test code</code></pre>
+    <div class="note">
+      Unit tests cover synth/DSP math and the WAV exporter, but there's no automated harness for
+      the live audio path — verify audio-affecting changes by running the app manually
+      (<code>cargo run</code>).
+    </div>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

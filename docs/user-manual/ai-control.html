@@ -3,22 +3,28 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Control (MCP) — simple-daw</title>
-<link rel="stylesheet" href="style.css">
+<title>AI Control (MCP) — simple-daw User Manual</title>
+<link rel="stylesheet" href="../style.css">
 </head>
 <body>
 <div class="layout">
   <nav class="sidebar">
-    <a class="brand" href="index.html">simple-daw</a>
-    <a href="index.html">Overview &amp; Setup</a>
-    <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a>
-    <a href="synth-engines.html">Synth Engines</a>
-    <a href="effects.html">Effects</a>
-    <a href="audio-and-io.html">Audio, MIDI &amp; Files</a>
-    <a href="ai-control.html" class="active">AI Control (MCP)</a>
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">User Manual</div>
+    <a href="index.html">Manual Home</a>
+    <a href="getting-started.html">1. Getting Started</a>
+    <a href="tracks-and-playlist.html">2. Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">3. Synth Engines</a>
+    <a href="editing-audio.html">4. Editing Audio</a>
+    <a href="groove-and-tempo.html">5. Groove &amp; Tempo</a>
+    <a href="mixing-and-effects.html">6. Mixing &amp; Effects</a>
+    <a href="audio-and-io.html">7. Files, MIDI &amp; Export</a>
+    <a href="ai-control.html" class="active">8. AI Control (MCP)</a>
+    <a href="case-studies.html">9. Case Studies</a>
   </nav>
   <main>
-    <h1>AI Control (MCP)</h1>
+    <h1>8. AI Control (MCP)</h1>
     <p class="lead">Let an LLM (Claude Desktop, Claude Code, or any other MCP-capable client) drive
       a running <strong>simple-daw</strong> instance directly — add tracks, program a beat, tweak
       a synth patch, hit play — through a small local companion process.</p>
@@ -106,8 +112,8 @@
         <tr><td><code>get_playback_state</code></td><td>Whether the song is playing, the playhead position, bpm, song name.</td></tr>
         <tr><td><code>save_song</code></td><td>Save the song to a JSON file at the given path.</td></tr>
         <tr><td><code>load_song</code></td><td>Load a song from a JSON file, replacing the currently open one.</td></tr>
-        <tr><td><code>export_wav</code></td><td>Bounce the song to a WAV file (dry mix, no CLAP effects — same scope cut as
-          <a href="audio-and-io.html">manual export</a>).</td></tr>
+        <tr><td><code>export_wav</code></td><td>Bounce the song to a WAV file — same
+          <a href="audio-and-io.html">export path</a> as the File menu's Export dialog.</td></tr>
       </tbody>
     </table>
 
@@ -115,7 +121,7 @@
     <div class="note warn">
       <ul>
         <li>No tool yet for loading or configuring CLAP effects — that's still UI-only (see
-          <a href="effects.html">Effects</a>).</li>
+          <a href="mixing-and-effects.html">Mixing &amp; Effects</a>).</li>
         <li><code>load_song</code>/<code>save_song</code> mirror the File menu's Load/Save, but
           there's no MCP equivalent of Save As — it always writes to the given path.</li>
         <li>Audio-track clips (recording/importing WAV) aren't exposed as tools yet; use the app's

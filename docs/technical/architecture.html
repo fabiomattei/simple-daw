@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Engine Architecture — simple-daw Technical Docs</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">Technical Docs</div>
+    <a href="index.html">Overview</a>
+    <a href="data-model.html">Data Model</a>
+    <a href="architecture.html" class="active">Engine Architecture</a>
+  </nav>
+  <main>
+    <h1>Engine Architecture</h1>
+    <p class="lead">How the data described in <a href="data-model.html">Data Model</a> gets turned
+      into sound, and how the UI and the real-time audio thread share it.</p>
+
+    <h2>Data model vs. real-time engine</h2>
+    <p><code>src/main.rs</code> (egui/eframe UI) owns the live <code>Song</code> behind
+      <code>Arc&lt;Mutex&lt;Song&gt;&gt;</code>, shared with the real-time audio thread — UI edits
+      and audio playback both read/write through that same lock. <code>src/audio.rs</code> is the
+      real-time engine: cpal stream setup, the step/tick clock, per-track voice pools, and the
+      offline WAV exporter (<code>render_song_to_wav</code>), which reuses the exact same
+      <code>Sequencer::process</code> synthesis path as live playback but runs its own separate
+      wet mixdown (<code>mix_song_to_wav_buffer</code>) — deliberately not shared with
+      <code>build_playback_stream</code>'s live mixdown, so nothing in the bounce can regress
+      real-time playback.</p>
+
+    <h2>Voice pools</h2>
+    <p>Each track gets four always-allocated voice pools in <code>TrackVoices</code>: <code>voices</code>
+      (Simple engine), <code>trine_voices</code> (Trine), <code>wave_voices</code> (Wave), and
+      <code>sample_voices</code> (one-shot WAV playback). A track's <code>synth_engine</code>
+      selects which pool its notes/steps trigger; idle pools just contribute silence.
+      <code>src/factory_presets.rs</code> holds the built-in preset catalog for all three engines.</p>
+
+    <h2>Stereo signal path (dual-mono)</h2>
+    <p>The engine is genuinely stereo end to end, built from independent per-channel state rather
+      than panning a mono sum:</p>
+    <ul>
+      <li>Every voice type's <code>next_sample()</code> returns <code>(left, right)</code>.
+        Simple/Wave spread unison voices across the stereo field via <code>unison_width</code>;
+        Trine has no unison, so its width instead comes from running its <em>entire</em> chain
+        (oscillators, FM, ring mod, both filters) twice with independently-seeded analog drift.</li>
+      <li><code>Track::pan</code> (equal-power) is applied once, after a track's effects chain.</li>
+      <li><code>src/plugin_host.rs</code>'s <code>process_effect_chain</code> carries real L/R
+        between chain stages; a stage only loses width if that specific plugin declares mono I/O.</li>
+      <li><code>src/builtin_fx/</code> implements every built-in effect as dual-mono: independent
+        per-channel state, sharing only immutable parameters and sample rate.</li>
+    </ul>
+
+    <h2>Effects and plugin hosting</h2>
+    <p><code>src/builtin_fx/</code> is the native effect DSP, one file per effect, aggregated in
+      <code>mod.rs</code> as the <code>BuiltInEffect</code> enum. <code>src/plugin_host.rs</code>
+      hosts CLAP plugins — loading, activating, querying ports/parameters, running audio, host-side
+      parameter editing, no unload mid-session. A loaded plugin's GUI can be embedded (drawn into
+      a host-owned native container view, <code>src/gui_embed/</code>, per-platform Cocoa/Win32/X11
+      — no Wayland) or floating, tried in that order by <code>plugin_host::open_plugin_gui</code>;
+      only the macOS embedding backend has actually been run.</p>
+    <p>The master bus has its own chain (<code>Song::master_effects</code>, via
+      <code>plugin_host::process_effect_chain</code>), mixing CLAP and built-in effects exactly
+      like a track's chain — <code>MasterEffectSlots</code> is a type alias for
+      <code>TrackEffectSlots</code> pinned to one row.</p>
+
+    <h2>Mixer bus graph</h2>
+    <table>
+      <thead><tr><th>Bus</th><th>Own fader/pan?</th><th>Own chain?</th><th>Automatable?</th></tr></thead>
+      <tbody>
+        <tr><td>Track</td><td>Yes (volume + pan)</td><td>Yes</td><td>Volume/Pan/SendLevel/EffectParam</td></tr>
+        <tr><td>Send bus</td><td>No — only each track's own send-level knob</td><td>Yes</td><td>SendEffectParam (chain only)</td></tr>
+        <tr><td>Submix bus</td><td>Volume only, no pan</td><td>Yes</td><td>None</td></tr>
+        <tr><td>Master bus</td><td>Implicit (final stage)</td><td>Yes</td><td>MasterEffectParam</td></tr>
+      </tbody>
+    </table>
+    <p>A track's post-fader/pan signal sums into its chosen submix's own accumulator (or straight
+      into master if <code>TrackOutput::Master</code>); each submix then runs its own chain and
+      <code>volume</code> before summing into master. Sends tap the same post-fader/pan point in
+      parallel, in <code>build_playback_stream</code>'s mixdown — the same point
+      <code>LoudnessMeter</code> reads from (<code>src/metering.rs</code>). Mute/solo are enforced
+      earlier, at synthesis time in <code>Sequencer::process</code>'s <code>track_silent</code> —
+      soloing/muting a submix acts like soloing/muting every member track at once.</p>
+    <p><code>render_song_to_wav</code> (the offline bounce) runs every send's and submix's own
+      chain too, via a temporary <code>plugin_host::OfflineEffectChain</code> loaded fresh for the
+      bounce's own sample rate — a separate mixdown path from live playback's, not
+      <code>build_playback_stream</code> itself. The bounce does <em>not</em>, however, consult
+      track/submix mute or solo — every track always renders there.</p>
+
+    <h3>Sidechain routing</h3>
+    <p><code>TrackEffectConfig::Clap</code>/<code>Compressor</code>/<code>NoiseGate</code> each
+      carry a <code>sidechain_source: Option&lt;usize&gt;</code> — an index into
+      <code>Song.tracks</code> whose pre-effects signal is threaded alongside the normal signal
+      (<code>all_track_dry</code>) so that slot's envelope follower (or, for CLAP, its second
+      input port) reads a different track's level. Silently ignored if the target doesn't declare
+      a second input. The CLAP sidechain path is implemented but not verified against a real
+      sidechain-capable plugin.</p>
+
+    <h3>Freeze / bounce-in-place</h3>
+    <p><code>Track::frozen</code>/<code>frozen_clip</code> reuse <code>AudioClip</code> rather than
+      introduce new runtime state: freezing renders the track's live output (including its own
+      chain) to a clip, then plays that back with the chain bypassed. Unfreezing needs
+      <code>apply_chain_specs_at</code> to resync the live chain state before it's active again.</p>
+
+    <h3>Plugin delay compensation</h3>
+    <p>A per-track <code>DelayLine</code> compensates for a latent effect (a look-ahead limiter, or
+      a CLAP plugin that reports nonzero latency) so every other track still lines up in time.
+      Live playback recomputes compensation as chains change; the offline bounce computes it once
+      up front. Sends and master are excluded from compensation. CLAP latency querying is
+      implemented but unverified against a real plugin that reports it.</p>
+
+    <h2>Region fades and automation ("rides")</h2>
+    <p><code>Region::fade_gain_at</code> is applied per-tick inside <code>Sequencer::process</code>
+      (<code>Sequencer::track_fade_gain</code>) since it has to scale already-triggered, freely-
+      ringing voices. An <code>AutomationLane</code> lives on either <code>Region::automation</code>
+      (region-local ticks, only while that region is active) or <code>Track::automation</code>
+      (absolute song ticks, always in effect) — where both target the same parameter at the same
+      tick, the region's own lane wins, resolved by <code>audio::collect_automation</code> applying
+      track-wide lanes first, then the active region's.</p>
+    <p>Automation is evaluated sample-accurately, not once per buffer: <code>collect_automation</code>
+      resolves every track's active lanes into per-target <code>LaneRef</code>s once per buffer,
+      then the mixdown calls <code>LaneRef::value_at</code> per output sample for
+      Volume/Pan/SendLevel targets, while <code>process_chain_with_automation</code> sub-chunks the
+      buffer at every breakpoint inside it for EffectParam targets — a breakpoint-rate
+      approximation shared by CLAP and built-in effects (not literal per-sample plugin-event
+      timing). Built-in param automation goes through
+      <code>builtin_fx::automatable_params_for_config</code>/<code>set_automatable_param</code>;
+      CLAP param automation reuses <code>LoadedEffect::set_param_by_id</code>.</p>
+
+    <h2>Audio clips: trim, fades, Take Folders, Flex Time/Pitch</h2>
+    <p>Unlike a <code>Region</code>'s per-tick fade, an <code>AudioClip</code>'s fade ramps
+      per-sample inside <code>SampleVoice</code> — <code>trigger_clip</code> windows playback to
+      <code>source_start_frame..end_frame</code> and carries <code>fade_in_frames</code>/
+      <code>fade_out_frames</code>, computed from the clip's tick-domain fields at the tempo in
+      effect at its trigger tick.</p>
+    <p>Take Folder playback is a second trigger loop in <code>Sequencer::process</code>, right next
+      to the plain-<code>AudioClip</code> one: each comp segment triggers a <code>SampleVoice</code>
+      windowed into its own take's buffer exactly like a trimmed clip, with a fixed 5ms
+      auto-crossfade (<code>TAKE_FOLDER_CROSSFADE_SECONDS</code>) at every segment boundary.</p>
+    <p><code>src/stretch.rs</code> (WSOLA time-stretch) and <code>src/pitch.rs</code> (pitch
+      detection/shifting) are pure, hand-rolled DSP baked into the decoded buffer once at load time
+      (<code>AudioClip::load</code>) rather than done live — the same "print once, play back
+      through the ordinary path" approach <code>transient_detection::detect_non_silent_segments</code>'s
+      Strip Silence already uses, so <code>SampleVoice</code>, trim/fades, and the offline bounce
+      need zero changes to support either feature. Pitch-shifting resamples a segment by the target
+      ratio first, then WSOLA-stretches it back to the original length. Functionally verified
+      (target duration/frequency hit, silence stays silent, no NaNs) but not verified by ear.</p>
+
+    <h2>Groove: quantize, humanize, groove templates</h2>
+    <p><code>src/groove.rs</code> is pure data mutation — no audio, no UI — over a region's
+      <code>Vec&lt;Note&gt;</code> and a lane's <code>Vec&lt;Option&lt;StepData&gt;&gt;</code>, both
+      sharing one <code>GROOVE_TEMPLATES</code> catalog (Straight, Swing 8th Light/Heavy, Swing
+      16th Light, MPC Push, MPC Lay-back) so the two editors never drift apart. Humanize's jitter
+      is a small dependency-free integer hash (<code>signed_jitter</code>), not <code>rand</code> —
+      deterministic given the same seed. <code>audio::step_triggering_at</code> checks the two step
+      boundaries nearest the current tick (rather than exact modulo) so a nudged step still fires
+      at its own adjusted tick — the same function used live and in the offline bounce.</p>
+
+    <h2>Tempo: tap tempo, audio detection, tempo map</h2>
+    <p>The real-time engine applies two precision levels rather than one sample-accurate rewrite:
+      <code>Sequencer::process</code>'s tick clock re-resolves <code>bpm_at</code> at every tick
+      boundary (exact per-tick trigger precision, using the tick that just fired's own tempo).
+      Continuous automation and the offline bounce instead resolve tempo once per audio
+      buffer/render chunk — a few milliseconds of possible latency on a tempo change, traded for
+      not rewriting the sample-accurate automation math for a per-sample-varying rate.
+      <code>render_song_to_wav</code>'s total-length calculation
+      (<code>audio::samples_for_tick_span</code>) sums each constant-tempo segment's own duration,
+      so a bounce comes out the correct length across a tempo change.</p>
+    <p><code>src/tempo.rs</code>'s <code>TapTempo</code> averages up to 8 recent taps, auto-
+      resetting after a 2-second pause. <code>src/tempo_detection.rs</code>'s <code>detect_bpm</code>
+      is a time-domain onset detector (energy envelope → novelty → adaptive-threshold peak-picking
+      → inter-onset-interval histogram vote, octave-folded into 60–180 BPM) — good for clearly
+      rhythmic material, not a spectral beat tracker for a dense mix. There's no automatic
+      tempo-curve derivation from a recording (true beat-tracking across drift was cut from scope).</p>
+
+    <h2>MCP control</h2>
+    <p><code>src/bin/simple-daw-mcp.rs</code> is a standalone MCP server binary (Unix only) that
+      speaks MCP over stdio and forwards tool calls as opaque JSON over a Unix domain socket to
+      <code>src/mcp_control.rs</code> inside the main binary, which queues them for the UI thread
+      to apply on its next frame (several commands need to stay in lockstep with UI-only
+      bookkeeping only that thread touches).</p>
+
+    <h2>Other pieces</h2>
+    <table>
+      <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+      <tbody>
+        <tr><td><code>src/audio_input.rs</code></td><td>Live audio input capture for Audio-track recording; applies <code>Track::input_gain</code> once, in the capture callback.</td></tr>
+        <tr><td><code>src/midi_import.rs</code></td><td>Standard MIDI file import into piano-roll notes.</td></tr>
+        <tr><td><code>src/transient_detection.rs</code></td><td>Onset/attack detection and silence-gate segmentation, built on a shared short-time RMS envelope.</td></tr>
+        <tr><td><code>src/metering.rs</code></td><td>Peak/RMS/BS.1770-4 LUFS metering — one <code>LoudnessMeter</code> per track/master/submix, owned by the audio thread, published lock-free to the UI thread each frame.</td></tr>
+      </tbody>
+    </table>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

@@ -181,6 +181,56 @@ footer {
   font-size: 0.85rem;
 }
 
+nav.sidebar .crumb {
+  display: block;
+  color: var(--text-weak);
+  text-decoration: none;
+  font-size: 0.8rem;
+  margin-bottom: 16px;
+}
+
+nav.sidebar .crumb:hover {
+  color: var(--text);
+}
+
+nav.sidebar .section-label {
+  color: var(--text-weak);
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  margin: 18px 0 4px;
+}
+
+.hub-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 20px;
+  margin: 1.6em 0;
+}
+
+.hub-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 22px 24px;
+  text-decoration: none;
+  display: block;
+}
+
+.hub-card h3 {
+  margin-top: 0;
+  color: var(--accent);
+}
+
+.hub-card.technical h3 {
+  color: var(--accent-orange);
+}
+
+.hub-card p {
+  color: var(--text-weak);
+  margin-bottom: 0;
+}
+
 @media (max-width: 720px) {
   .layout {
     flex-direction: column;

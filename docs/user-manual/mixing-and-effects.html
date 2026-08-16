@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mixing &amp; Effects — simple-daw User Manual</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">User Manual</div>
+    <a href="index.html">Manual Home</a>
+    <a href="getting-started.html">1. Getting Started</a>
+    <a href="tracks-and-playlist.html">2. Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">3. Synth Engines</a>
+    <a href="editing-audio.html">4. Editing Audio</a>
+    <a href="groove-and-tempo.html">5. Groove &amp; Tempo</a>
+    <a href="mixing-and-effects.html" class="active">6. Mixing &amp; Effects</a>
+    <a href="audio-and-io.html">7. Files, MIDI &amp; Export</a>
+    <a href="ai-control.html">8. AI Control (MCP)</a>
+    <a href="case-studies.html">9. Case Studies</a>
+  </nav>
+  <main>
+    <h1>6. Mixing &amp; Effects</h1>
+    <p class="lead">Channel strips, buses, built-in DSP, CLAP plugins, sidechaining, freezing, and
+      automation — everything that shapes a track's signal on its way to the speakers.</p>
+
+    <h2>The Mixer</h2>
+    <p>Every track gets a channel strip: volume fader, pan, mute/solo, an FX chain, and a
+      <strong>Sends</strong> menu. Each strip shows a live peak/RMS bar meter plus LUFS loudness
+      (momentary/short-term always for master; hover a track's integrated reading for the same
+      breakdown). Integrated LUFS resets on every transport stop, so it reads "since the last time
+      playback started," the way a loudness-meter plugin is normally used.</p>
+
+    <h2>Built-in effects</h2>
+    <p>Available from any FX chain's <strong>+ Add Effect</strong> menu:</p>
+    <div class="card-grid">
+      <div class="card"><h4>Delay</h4></div>
+      <div class="card"><h4>Bitcrusher</h4></div>
+      <div class="card"><h4>Distortion</h4></div>
+      <div class="card"><h4>Reverb</h4></div>
+      <div class="card"><h4>Chorus</h4></div>
+      <div class="card"><h4>Filter</h4></div>
+      <div class="card"><h4>Tremolo</h4></div>
+      <div class="card"><h4>Compressor</h4></div>
+      <div class="card"><h4>Flanger</h4></div>
+      <div class="card"><h4>Phaser</h4></div>
+      <div class="card"><h4>Ring Modulator</h4></div>
+      <div class="card"><h4>Noise Gate</h4></div>
+      <div class="card"><h4>Phase Invert</h4></div>
+      <div class="card"><h4>Channel EQ</h4></div>
+      <div class="card"><h4>Limiter</h4></div>
+    </div>
+
+    <h2>Per-track FX chain</h2>
+    <p>Open a track's <strong>FX</strong> menu from its Channel Rack row. Effects added there run
+      in order, on that track's signal only. Each slot shows a <strong>Params</strong> button (to
+      edit the effect), any load/status message, and a remove button.</p>
+
+    <h2>Master bus FX</h2>
+    <p>The master bus has its own effect chain, applied after every track (and every submix — see
+      below) has been mixed together, configured the same way as a per-track chain — open it from
+      the <strong>Plugins</strong> window's "Master bus FX chain" section.</p>
+    <p>New songs start with a built-in <strong>Limiter</strong> already loaded on the master bus
+      (a look-ahead peak/brickwall limiter, not a same-instant compressor — see its params for
+      ceiling/release/input gain), the same way Logic ships an Adaptive Limiter on the master by
+      default. Remove it from the chain if you don't want it.</p>
+
+    <h2>Send buses</h2>
+    <p>The Mixer's <strong>+ Add Send</strong> button creates a named aux bus with its own FX chain
+      (built-in and/or CLAP, configured exactly like a track's or the master's). Each track gets a
+      <strong>Sends</strong> menu on its Mixer channel strip with one level knob per send bus —
+      raising it feeds that much of the track's post-fader/pan signal into the send, in parallel
+      with its normal path to the master bus. A send bus has no fader or pan of its own in this
+      minimal model: its own chain and each track's level knob are the only controls.</p>
+    <div class="note">
+      Sends are a live-mixing feature only — like the rest of the effect chains, they're excluded
+      from WAV export (see <a href="audio-and-io.html">Files, MIDI &amp; Export</a>).
+    </div>
+
+    <h2>Submix buses (Track Stacks)</h2>
+    <p>A track can route its output somewhere other than the master bus: pick a submix from the
+      <strong>Output</strong> dropdown on its channel strip instead of the default "Master." This
+      is this app's version of Logic's Track Stack (one shared fader and one shared insert chain
+      over a group of tracks) — there's no separate "group" concept, a submix bus <em>is</em> the
+      group.</p>
+    <ul>
+      <li>Create one from the Mixer's <strong>+ Add Submix</strong> button, name it, then point
+        every track that belongs to the group at it via its Output dropdown.</li>
+      <li>A submix has its own volume and mute/solo, and its own FX chain — but no pan (panning
+        stays per-track) and no automation of its own.</li>
+      <li>Soloing or muting a submix acts like soloing/muting every member track at once — the
+        same "solo wins" rule a plain track solo already applies.</li>
+      <li>Removing a submix sends every track that was routed to it back to Master.</li>
+    </ul>
+
+    <h2>Sidechain routing</h2>
+    <p>The <strong>Compressor</strong> and <strong>Noise Gate</strong> built-in effects, and any
+      CLAP plugin that declares a second audio input, can duck/gate against a different track's
+      signal instead of their own. Open the effect's Params and pick a <strong>Sidechain
+      source</strong> track — its pre-effects signal now drives the envelope follower instead of
+      the host track's own. Leave it on "None" for ordinary (non-sidechained) behavior.</p>
+    <div class="note warn">
+      A CLAP plugin's sidechain input only activates if that specific plugin actually declared a
+      second input port — picking a source on a plugin that doesn't support it is silently
+      ignored, the same tolerance an automation lane pointed at a deleted track already has.
+    </div>
+
+    <h2>Freeze / bounce-in-place</h2>
+    <p>Right-click a track's row in the Channel Rack and choose <strong>Freeze</strong> to render
+      its current output (synth/sample playback plus its own FX chain) down to a single audio
+      clip, then play that clip back instead of re-synthesizing live — useful to save CPU on a
+      CPU-heavy synth patch or a long CLAP effect chain. The track's own FX chain is bypassed
+      while frozen (its output is already baked into the frozen clip). <strong>Unfreeze</strong>
+      restores live synthesis and re-enables the chain.</p>
+
+    <h2>Plugin delay compensation</h2>
+    <p>Some effects (particularly look-ahead ones like the built-in Limiter, and some CLAP
+      plugins) introduce a small amount of processing latency. The mixer automatically delays
+      every other track by the right amount so a track running a latent effect still lines up in
+      time with the rest of the mix — nothing to configure, this happens transparently during
+      playback.</p>
+
+    <h2>CLAP plugin hosting</h2>
+    <p>Any FX slot (per-track, send, submix, or master) can instead host a CLAP plugin:</p>
+    <ul>
+      <li><strong>+ Add Effect → CLAP Plugin…</strong> creates an empty slot, then either browse
+        for a <code>.clap</code> file on disk or pick one from the project's plugin library.</li>
+      <li>Once loaded, its <strong>Params</strong> button opens either the plugin's own GUI
+        (embedded in the window when the plugin and platform support it, otherwise a floating
+        window it owns) or, if it declines both, a generic parameter window built from its own
+        declared CLAP parameters.</li>
+    </ul>
+    <div class="note warn">
+      CLAP hosting has no unloading a plugin once it's loaded mid-session, and no automation
+      recording from moving a knob live. An embedded plugin GUI's panel is sized once, at open
+      time — it doesn't renegotiate live if the plugin later asks to resize.
+    </div>
+    <p>Loaded plugin paths and their parameter values are saved with the song (see
+      <a href="audio-and-io.html">Files, MIDI &amp; Export</a>) and restored on load.</p>
+    <div class="note">
+      WAV export (bounce) mixes every track/submix/send's effect chain and automation into the
+      file — the only thing it doesn't consult is mute/solo, which the offline bounce ignores
+      entirely (every track always renders). See <a href="audio-and-io.html">Files, MIDI &amp;
+      Export</a>.
+    </div>
+
+    <h2>Automation ("rides")</h2>
+    <p>Two places to add automation lanes, both edited the same way (click empty space on the
+      lane's graph to add a point, drag a point to move it, right-click to delete it — a straight
+      line between two points is a ramp, more points make a full "ride"):</p>
+    <ul>
+      <li><strong>Region automation</strong> — an "Automation" panel below the Piano Roll/Beats
+        grid for whichever Region is currently open (see <a href="tracks-and-playlist.html">Tracks
+        &amp; Playlist</a>). Points are positioned relative to the Region's own start, and the
+        lane is only in effect while that Region is the active one on its track.</li>
+      <li><strong>Track automation</strong> — a separate "Track Automation" panel, always shown
+        for whichever track is selected, for lanes that apply across the whole arrangement
+        (absolute song ticks), including stretches where the track has no active Region at all.
+        Where a track-wide lane and an active Region's lane target the same parameter at the same
+        tick, the Region's own lane wins.</li>
+    </ul>
+    <p>A lane's <strong>+ Add Lane</strong> menu can target more than just the track it lives on:</p>
+    <ul>
+      <li>This track's own <strong>Volume</strong>, <strong>Pan</strong>, or a <strong>send
+        level</strong>.</li>
+      <li>A parameter of an effect in this track's own FX chain (built-in effects expose their
+        sliders by name; a CLAP plugin's parameters are only offered once it's actually loaded
+        into that slot).</li>
+      <li><strong>Other Track</strong> — a different track's Volume, Pan, send level, or effect
+        parameter.</li>
+      <li><strong>Send FX</strong> — a parameter of an effect loaded in a send bus's own chain.</li>
+      <li><strong>Master FX</strong> — a parameter of an effect loaded on the master bus.</li>
+    </ul>
+    <div class="note">
+      There's no automation target for a submix bus's own chain or volume — those stay static.
+    </div>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

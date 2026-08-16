@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Model — simple-daw Technical Docs</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">Technical Docs</div>
+    <a href="index.html">Overview</a>
+    <a href="data-model.html" class="active">Data Model</a>
+    <a href="architecture.html">Engine Architecture</a>
+  </nav>
+  <main>
+    <h1>Data Model</h1>
+    <p class="lead"><code>src/model.rs</code> is the pure data model — no audio, no UI. It owns
+      JSON save/load (serde) and migration of older song-file shapes. Everything on this page is
+      plain data; how it's turned into sound lives in <a href="architecture.html">Engine
+      Architecture</a>.</p>
+
+    <h2>Shape at a glance</h2>
+    <pre><code>Song
+├─ tracks: Vec&lt;Track&gt;
+│   ├─ kind: TrackKind            (StepGrid | PianoRoll | Audio)
+│   ├─ regions: Vec&lt;Region&gt;       (StepGrid/PianoRoll tracks)
+│   │   └─ content: RegionContent (StepGrid(Vec&lt;Lane&gt;) | PianoRoll(Vec&lt;Note&gt;))
+│   ├─ audio_clips: Vec&lt;AudioClip&gt;   (Audio tracks)
+│   ├─ take_folders: Vec&lt;TakeFolder&gt; (Audio tracks, recorded only)
+│   │   └─ takes: Vec&lt;Take&gt;, comp: Vec&lt;CompSegment&gt;
+│   ├─ effects: Vec&lt;TrackEffectConfig&gt;
+│   ├─ send_levels: Vec&lt;f32&gt;       (index-aligned with Song.sends)
+│   ├─ output: TrackOutput          (Master | Submix(index))
+│   └─ automation: Vec&lt;AutomationLane&gt; (track-wide, absolute-tick)
+├─ tempo_map: Vec&lt;TempoPoint&gt;
+├─ master_effects: Vec&lt;TrackEffectConfig&gt;
+├─ sends: Vec&lt;SendBus&gt;
+├─ submixes: Vec&lt;SubmixBus&gt;
+├─ plugins: Vec&lt;ProjectPlugin&gt;      (known CLAP plugin paths)
+└─ synth_presets: Vec&lt;SynthPreset&gt;  (song-local presets)</code></pre>
+
+    <h2>Song</h2>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td><code>String</code></td><td>Song title.</td></tr>
+        <tr><td><code>bpm</code></td><td><code>f32</code></td><td>Tempo at the start of the timeline. Still the single source of truth for every one-shot tempo read/write (transport LCD, MCP <code>set_bpm</code>, tap tempo, MIDI import).</td></tr>
+        <tr><td><code>tempo_map</code></td><td><code>Vec&lt;TempoPoint&gt;</code></td><td>Subsequent tempo-change points, purely additive. <code>Song::bpm_at(tick)</code> resolves the tempo in effect at any tick.</td></tr>
+        <tr><td><code>tracks</code></td><td><code>Vec&lt;Track&gt;</code></td><td>Every track, in display/mix order.</td></tr>
+        <tr><td><code>next_note_id</code></td><td><code>u64</code></td><td>Monotonic id counter for piano-roll <code>Note</code>s across the whole song.</td></tr>
+        <tr><td><code>master_effects</code></td><td><code>Vec&lt;TrackEffectConfig&gt;</code></td><td>The master bus's own effect chain, processed after every track/submix is mixed.</td></tr>
+        <tr><td><code>plugins</code></td><td><code>Vec&lt;ProjectPlugin&gt;</code></td><td>Known CLAP plugin paths for this project (feeds the plugin-picker UI).</td></tr>
+        <tr><td><code>synth_presets</code></td><td><code>Vec&lt;SynthPreset&gt;</code></td><td>Custom presets saved with this song (distinct from the built-in factory catalog in <code>src/factory_presets.rs</code>).</td></tr>
+        <tr><td><code>time_signature_numerator</code> / <code>_denominator</code></td><td><code>u8</code></td><td>Song time signature.</td></tr>
+        <tr><td><code>sends</code></td><td><code>Vec&lt;SendBus&gt;</code></td><td>Aux send buses. Index-aligned with every track's own <code>send_levels</code>.</td></tr>
+        <tr><td><code>submixes</code></td><td><code>Vec&lt;SubmixBus&gt;</code></td><td>Alternate-output group buses a track can route to instead of master.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Track</h2>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td><code>String</code></td><td>&nbsp;</td></tr>
+        <tr><td><code>midi_channel</code></td><td><code>u8</code></td><td>Used by MIDI import; not otherwise routed.</td></tr>
+        <tr><td><code>muted</code> / <code>solo</code></td><td><code>bool</code></td><td>Enforced at synthesis time in <code>Sequencer::process</code>; "solo wins" — see <a href="architecture.html">Engine Architecture</a>.</td></tr>
+        <tr><td><code>kind</code></td><td><code>TrackKind</code></td><td><code>StepGrid</code> / <code>PianoRoll</code> / <code>Audio</code> — fixed for the track's lifetime, determines which of <code>regions</code>/<code>audio_clips</code> is used and which <code>RegionContent</code> case its regions hold.</td></tr>
+        <tr><td><code>default_note_length_ticks</code></td><td><code>usize</code></td><td>Default length for a newly-drawn Piano Roll note.</td></tr>
+        <tr><td><code>effects</code></td><td><code>Vec&lt;TrackEffectConfig&gt;</code></td><td>This track's own insert chain.</td></tr>
+        <tr><td><code>volume</code></td><td><code>f32</code></td><td>Linear gain, post-synthesis pre-pan.</td></tr>
+        <tr><td><code>pan</code></td><td><code>f32</code></td><td>-1.0..1.0, equal-power split, applied once after the effects chain.</td></tr>
+        <tr><td><code>input_gain</code></td><td><code>f32</code></td><td>Preamp trim applied during recording only (Audio tracks) — distinct from <code>volume</code>, which only affects playback.</td></tr>
+        <tr><td><code>synth</code> / <code>synth_engine</code> / <code>trine</code> / <code>wave</code></td><td><code>SynthParams</code> / <code>SynthEngine</code> / <code>TrineParams</code> / <code>WaveParams</code></td><td>All three engines' params are always allocated; <code>synth_engine</code> selects which one this track's notes/steps actually trigger. See "Synth engine params" below.</td></tr>
+        <tr><td><code>audio_clips</code></td><td><code>Vec&lt;AudioClip&gt;</code></td><td>Audio tracks only.</td></tr>
+        <tr><td><code>take_folders</code></td><td><code>Vec&lt;TakeFolder&gt;</code></td><td>Audio tracks only, populated by recording (never by import/drag-in).</td></tr>
+        <tr><td><code>regions</code></td><td><code>Vec&lt;Region&gt;</code></td><td>StepGrid/PianoRoll tracks only.</td></tr>
+        <tr><td><code>send_levels</code></td><td><code>Vec&lt;f32&gt;</code></td><td>Linear gain per send bus, index-aligned with <code>Song.sends</code> by <code>add_send</code>/<code>remove_send</code>/<code>add_track</code>.</td></tr>
+        <tr><td><code>output</code></td><td><code>TrackOutput</code></td><td><code>Master</code> or <code>Submix(index)</code> — where this track's post-fader/pan signal sums to.</td></tr>
+        <tr><td><code>automation</code></td><td><code>Vec&lt;AutomationLane&gt;</code></td><td>Track-wide lanes, absolute song ticks, in effect across the whole arrangement (unlike a <code>Region</code>'s own lanes).</td></tr>
+        <tr><td><code>frozen</code> / <code>frozen_clip</code></td><td><code>bool</code> / <code>Option&lt;AudioClip&gt;</code></td><td>Freeze/bounce-in-place — reuses <code>AudioClip</code> rather than introducing new runtime state; the track's own chain is bypassed while frozen.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Region &amp; RegionContent</h2>
+    <p>A <code>Region</code> is a track's own musical content, positioned independently on that
+      track's Playlist row (Logic/Ableton-style) — unlike a shared FL-Studio-style Pattern,
+      placing similar material twice always means two independent copies.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td><code>String</code></td><td>&nbsp;</td></tr>
+        <tr><td><code>start_tick</code></td><td><code>usize</code></td><td>Absolute song position.</td></tr>
+        <tr><td><code>content_length_steps</code></td><td><code>usize</code></td><td>The content's own natural length, auto-grown to fit the furthest Piano Roll note by <code>grow_length_to_fit_notes</code>. Never shrinks.</td></tr>
+        <tr><td><code>loop_length_steps</code></td><td><code>usize</code></td><td>The on-timeline span this region occupies. Shorter than <code>content_length_steps</code> truncates; longer loops. Dragging a region's right edge in the Playlist controls this only.</td></tr>
+        <tr><td><code>content</code></td><td><code>RegionContent</code></td><td><code>StepGrid(Vec&lt;Lane&gt;)</code> or <code>PianoRoll(Vec&lt;Note&gt;)</code>.</td></tr>
+        <tr><td><code>fade_in_ticks</code> / <code>fade_out_ticks</code></td><td><code>usize</code></td><td>Linear ramp to/from silence at the region's on-timeline edges — see <code>fade_gain_at</code>, applied per-tick since it must scale already-triggered, freely-ringing voices.</td></tr>
+        <tr><td><code>automation</code></td><td><code>Vec&lt;AutomationLane&gt;</code></td><td>Region-local-tick lanes, only in effect while this region is the active one on its track.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Lane &amp; StepData (step-grid content)</h3>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>Lane.name</code></td><td><code>String</code></td><td>&nbsp;</td></tr>
+        <tr><td><code>Lane.pitch</code></td><td><code>u8</code></td><td>MIDI pitch used when the lane is driven by a synth.</td></tr>
+        <tr><td><code>Lane.steps</code></td><td><code>Vec&lt;Option&lt;StepData&gt;&gt;</code></td><td>One slot per grid step; <code>None</code> is an inactive step.</td></tr>
+        <tr><td><code>Lane.sample</code> / <code>sample_path</code></td><td><code>Option&lt;Arc&lt;SampleBuffer&gt;&gt;</code> / <code>String</code></td><td>An optional one-shot sample that, if loaded, takes priority over any synth on this lane.</td></tr>
+        <tr><td><code>Lane.synth_override</code> / <code>synth_engine</code> / <code>synth</code> / <code>trine</code> / <code>wave</code></td><td>&nbsp;</td><td>Per-lane synth patch overriding the track's own, when <code>synth_override</code> is set.</td></tr>
+        <tr><td><code>StepData.velocity</code></td><td><code>u8</code></td><td>Defaults to 100 on a newly-toggled step.</td></tr>
+        <tr><td><code>StepData.timing_offset_ticks</code></td><td><code>i8</code></td><td>Nudge from this step's own grid position, clamped to <code>±MAX_STEP_TIMING_OFFSET_TICKS</code> (11 ticks, half a step minus one — never crosses into a neighboring step). <code>StepData</code> deserializes from either its own object shape or a bare legacy velocity byte, so old song files still load.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Note (piano-roll content)</h3>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td><code>u64</code></td><td>Stable identity for selection/editing, assigned from <code>Song.next_note_id</code>.</td></tr>
+        <tr><td><code>pitch</code></td><td><code>u8</code></td><td>MIDI pitch.</td></tr>
+        <tr><td><code>start_tick</code> / <code>length_ticks</code></td><td><code>usize</code></td><td>Region-local position/duration. Notes trigger by exact-tick equality on <code>start_tick</code>.</td></tr>
+        <tr><td><code>velocity</code></td><td><code>u8</code></td><td>0..127.</td></tr>
+      </tbody>
+    </table>
+    <p><code>TICKS_PER_STEP = 24</code> throughout the model — all tick-based fields on this page
+      share that resolution.</p>
+
+    <h2>AudioClip</h2>
+    <p>Has no stored length by default — playback runs until the decoded buffer is exhausted —
+      but can be trimmed non-destructively and carries the Flex Time/Pitch edit results.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>start_tick</code></td><td><code>usize</code></td><td>Absolute song position.</td></tr>
+        <tr><td><code>file_path</code></td><td><code>String</code></td><td>Source WAV path.</td></tr>
+        <tr><td><code>gain</code></td><td><code>f32</code></td><td>Linear playback gain, 1.0 unity.</td></tr>
+        <tr><td><code>source_start_frame</code></td><td><code>usize</code></td><td>Head trim — real sample frames into the decoded (already warped/pitch-corrected) buffer.</td></tr>
+        <tr><td><code>length_ticks</code></td><td><code>usize</code></td><td>Tail trim, on-timeline duration. <code>0</code> is a sentinel meaning "play to the end of the buffer" — see <code>effective_length_ticks</code>/<code>full_length_ticks</code>.</td></tr>
+        <tr><td><code>fade_in_ticks</code> / <code>fade_out_ticks</code></td><td><code>usize</code></td><td>The <code>AudioClip</code> counterpart of <code>Region</code>'s fades — but ramped per-sample inside <code>SampleVoice</code>, not per-tick.</td></tr>
+        <tr><td><code>pitch_corrections</code></td><td><code>Vec&lt;PitchCorrection&gt;</code></td><td>Flex Pitch: retargeted ranges, applied by <code>load()</code> before <code>warp_markers</code> so a correction always indexes the unwarped recording.</td></tr>
+        <tr><td><code>warp_markers</code></td><td><code>Vec&lt;WarpMarker&gt;</code></td><td>Flex Time: a piecewise source-to-output time map. Fewer than 2 markers means untouched.</td></tr>
+        <tr><td><code>buffer</code> / <code>load_error</code></td><td><code>#[serde(skip)]</code></td><td>Decoded audio and any load failure — not persisted, rebuilt by <code>load()</code> after deserialization.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>WarpMarker &amp; PitchCorrection</h3>
+    <table>
+      <thead><tr><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>WarpMarker</code></td><td><code>source_frame: usize</code>, <code>output_frame: usize</code></td><td>One point in the Flex Time map: where a transient is in the recording → where it should land on the timeline. <code>stretch::warp_buffer</code> WSOLA-stretches each span between consecutive markers.</td></tr>
+        <tr><td><code>PitchCorrection</code></td><td><code>start_frame: usize</code>, <code>end_frame: usize</code>, <code>target_semitones: f32</code></td><td>One retargeted Flex Pitch note. Stored independently of <code>pitch::detect_notes</code>' own output, so a saved correction survives even if detector constants change later.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Take Folders &amp; comping</h2>
+    <table>
+      <thead><tr><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>TakeFolder</code></td><td><code>start_tick</code>, <code>length_ticks</code>, <code>gain</code>, <code>takes: Vec&lt;Take&gt;</code>, <code>comp: Vec&lt;CompSegment&gt;</code></td><td>Every take shares the folder's own <code>start_tick</code>/<code>length_ticks</code> — a take has none of its own.</td></tr>
+        <tr><td><code>Take</code></td><td><code>file_path</code>, <code>buffer</code>, <code>load_error</code></td><td>Just a recorded pass; no position/gain/trim of its own.</td></tr>
+        <tr><td><code>CompSegment</code></td><td><code>start_tick: usize</code>, <code>end_tick: usize</code>, <code>take_index: usize</code></td><td>Piecewise, always-gapless map of which take is heard for a stretch of the folder's span (relative to the folder). The sorted/gapless/non-overlapping invariant is maintained by every mutator (<code>add_take_and_activate</code>, <code>assign_take_to_range</code>).</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Automation</h2>
+    <table>
+      <thead><tr><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>AutomationLane</code></td><td><code>target: AutomationTarget</code>, <code>points: Vec&lt;AutomationPoint&gt;</code></td><td>One automated parameter's "ride." Lives on a <code>Region</code> (region-local ticks) or a <code>Track</code> (absolute song ticks).</td></tr>
+        <tr><td><code>AutomationPoint</code></td><td><code>tick: usize</code>, <code>value: f32</code></td><td>Linearly interpolated between neighbors by <code>value_at_fractional</code>; holds the nearest point's value outside the lane's own range.</td></tr>
+        <tr><td><code>EffectParamKey</code></td><td><code>Clap {'{'} param_id: u32 {'}'}</code> or <code>BuiltIn {'{'} param_name: String {'}'}</code></td><td>Addresses one parameter within an effect slot — CLAP plugins by stable numeric id, built-ins by field name.</td></tr>
+      </tbody>
+    </table>
+    <p><code>AutomationTarget</code> variants — a lane always lives on one region/track, but its
+      target doesn't have to be that same owner:</p>
+    <table>
+      <thead><tr><th>Variant</th><th>Rides</th></tr></thead>
+      <tbody>
+        <tr><td><code>Volume</code> / <code>Pan</code></td><td>This lane's own track's fader/pan.</td></tr>
+        <tr><td><code>SendLevel {'{'} send_index {'}'}</code></td><td>This track's own <code>send_levels[send_index]</code>.</td></tr>
+        <tr><td><code>EffectParam {'{'} slot_index, key {'}'}</code></td><td>A parameter in this track's own <code>effects[slot_index]</code>.</td></tr>
+        <tr><td><code>OtherTrackVolume</code> / <code>OtherTrackPan {'{'} track_index {'}'}</code></td><td>A <em>different</em> track's fader/pan.</td></tr>
+        <tr><td><code>OtherTrackSendLevel {'{'} track_index, send_index {'}'}</code></td><td>A different track's send level.</td></tr>
+        <tr><td><code>OtherTrackEffectParam {'{'} track_index, slot_index, key {'}'}</code></td><td>A parameter in a different track's own chain.</td></tr>
+        <tr><td><code>SendEffectParam {'{'} send_index, slot_index, key {'}'}</code></td><td>A parameter in a send bus's own chain.</td></tr>
+        <tr><td><code>MasterEffectParam {'{'} slot_index, key {'}'}</code></td><td>A parameter in the master bus's own chain.</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      There is no <code>SubmixEffectParam</code> variant — a submix's chain/volume aren't
+      automatable.
+    </div>
+
+    <h2>TrackEffectConfig</h2>
+    <p>One entry in any effect chain (track/master/send/submix) — <code>#[serde(tag = "kind")]</code>
+      so a saved song's JSON is self-describing about which effect each slot holds.</p>
+    <table>
+      <thead><tr><th>Variant</th><th>Key fields</th></tr></thead>
+      <tbody>
+        <tr><td><code>Clap</code></td><td><code>path</code>, <code>params: Vec&lt;(u32, f64)&gt;</code> (by CLAP param id, not index), <code>sidechain_source: Option&lt;usize&gt;</code></td></tr>
+        <tr><td><code>Delay</code></td><td><code>time_ms</code>, <code>feedback</code>, <code>mix</code></td></tr>
+        <tr><td><code>Bitcrusher</code></td><td><code>bit_depth</code> (1..16), <code>rate_divisor</code>, <code>mix</code></td></tr>
+        <tr><td><code>Distortion</code></td><td><code>drive</code>, <code>mix</code></td></tr>
+        <tr><td><code>Reverb</code></td><td><code>room_size</code>, <code>damping</code>, <code>mix</code></td></tr>
+        <tr><td><code>Chorus</code></td><td><code>rate_hz</code>, <code>depth_ms</code>, <code>mix</code></td></tr>
+        <tr><td><code>Filter</code></td><td><code>cutoff_hz</code>, <code>resonance</code>, <code>mode: FilterMode</code>, <code>mix</code></td></tr>
+        <tr><td><code>Tremolo</code></td><td><code>rate_hz</code>, <code>depth</code></td></tr>
+        <tr><td><code>Compressor</code></td><td><code>threshold_db</code>, <code>ratio</code>, <code>attack_ms</code>, <code>release_ms</code>, <code>makeup_db</code>, <code>sidechain_source</code></td></tr>
+        <tr><td><code>Flanger</code></td><td><code>rate_hz</code>, <code>depth_ms</code>, <code>feedback</code>, <code>mix</code></td></tr>
+        <tr><td><code>Phaser</code></td><td><code>rate_hz</code>, <code>depth</code>, <code>feedback</code>, <code>mix</code></td></tr>
+        <tr><td><code>RingModulator</code></td><td><code>carrier_hz</code>, <code>mix</code></td></tr>
+        <tr><td><code>NoiseGate</code></td><td><code>threshold_db</code>, <code>attack_ms</code>, <code>release_ms</code>, <code>range_db</code>, <code>sidechain_source</code></td></tr>
+        <tr><td><code>PhaseInvert</code></td><td><code>invert_left</code>, <code>invert_right</code> (no dry/wet mix — it's a phase toggle, not tone shaping)</td></tr>
+        <tr><td><code>ChannelEq</code></td><td><code>bands: Vec&lt;EqBand&gt;</code> — fixed 8-band chain (low cut, low shelf, 4 peaking, high shelf, high cut), each with <code>band_type</code>/<code>freq_hz</code>/<code>gain_db</code>/<code>q</code>/<code>enabled</code></td></tr>
+        <tr><td><code>Limiter</code></td><td><code>input_gain_db</code>, <code>ceiling_db</code>, <code>release_ms</code> — look-ahead, so a hard ceiling rather than <code>Compressor</code>'s soft target</td></tr>
+      </tbody>
+    </table>
+    <p><code>sidechain_source: Option&lt;usize&gt;</code> (on <code>Clap</code>, <code>Compressor</code>,
+      <code>NoiseGate</code>) is an index into <code>Song.tracks</code> of a track whose
+      pre-effects signal feeds this slot's sidechain key input instead of its own — silently
+      ignored if the loaded plugin/effect doesn't actually support a second input.</p>
+
+    <h2>Buses</h2>
+    <table>
+      <thead><tr><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>SendBus</code></td><td><code>name</code>, <code>effects: Vec&lt;TrackEffectConfig&gt;</code></td><td>An aux bus. No fader/pan of its own — a track's own <code>send_levels[i]</code> is the only level control.</td></tr>
+        <tr><td><code>SubmixBus</code></td><td><code>name</code>, <code>effects</code>, <code>volume</code>, <code>pan</code>, <code>muted</code>, <code>solo</code></td><td>An alternate-output group bus (Track Stack equivalent). Has its own volume/mute/solo (it stands in for its members' direct mix contribution) but per-track panning still applies upstream.</td></tr>
+        <tr><td><code>TrackOutput</code></td><td><code>Master</code> \| <code>Submix(usize)</code></td><td>Where a track's <code>Track::output</code> points. Removing a submix resets any track pointed at it back to <code>Master</code> and shifts down indices of tracks pointed past it.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Tempo, presets &amp; plugins</h2>
+    <table>
+      <thead><tr><th>Type</th><th>Fields</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>TempoPoint</code></td><td><code>tick: usize</code>, <code>bpm: f32</code></td><td>One point in <code>Song.tempo_map</code> — a step function, each point holds constant until the next.</td></tr>
+        <tr><td><code>SynthPreset</code></td><td><code>name</code>, <code>engine: SynthEngine</code>, <code>params: SynthParams</code>, <code>trine: Option&lt;TrineParams&gt;</code>, <code>wave: Option&lt;WaveParams&gt;</code></td><td>A song-local custom preset (distinct from the factory catalog).</td></tr>
+        <tr><td><code>ProjectPlugin</code></td><td><code>name</code>, <code>path</code></td><td>A known CLAP plugin path for this project's picker UI.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Synth engine params (overview)</h2>
+    <p>Each track always allocates all three engines' param structs; <code>synth_engine</code>
+      picks which one is live. Full field-by-field docs live as doc comments directly on each
+      struct in <code>model.rs</code> — this is a map of what's there, not an exhaustive list.</p>
+    <table>
+      <thead><tr><th>Type</th><th>Shape</th></tr></thead>
+      <tbody>
+        <tr><td><code>SynthParams</code> (Simple)</td><td>Waveform, pulse width, unison (voices/detune/width), ADSR, filter (cutoff/resonance/env amount/type), sub-oscillator mix, one LFO (waveform/rate/target/depth), glide.</td></tr>
+        <tr><td><code>TrineParams</code></td><td>Three oscillators, FM amount, ring-mod mix, analog drift (per-channel, drives its dual-mono stereo width), dual filter (<code>FilterRouting</code>, drive, FM amount, <code>FilterSlope</code>), a mod matrix (<code>mod_slots: Vec&lt;ModSlot&gt;</code>, each a <code>ModSource → ModTarget</code> pair with an amount).</td></tr>
+        <tr><td><code>WaveParams</code> (Wave)</td><td>Two wavetable oscillators with position-morph and phase-warp, unison, sub-oscillator (level/semitones), noise level, the same dual filter/mod-matrix machinery as Trine (<code>mod_slots: Vec&lt;WaveModSlot&gt;</code>), amp ADSR.</td></tr>
+      </tbody>
+    </table>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

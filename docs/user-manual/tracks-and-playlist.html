@@ -3,22 +3,28 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Tracks &amp; Playlist — simple-daw</title>
-<link rel="stylesheet" href="style.css">
+<title>Tracks &amp; Playlist — simple-daw User Manual</title>
+<link rel="stylesheet" href="../style.css">
 </head>
 <body>
 <div class="layout">
   <nav class="sidebar">
-    <a class="brand" href="index.html">simple-daw</a>
-    <a href="index.html">Overview &amp; Setup</a>
-    <a href="tracks-and-playlist.html" class="active">Tracks &amp; Playlist</a>
-    <a href="synth-engines.html">Synth Engines</a>
-    <a href="effects.html">Effects</a>
-    <a href="audio-and-io.html">Audio, MIDI &amp; Files</a>
-    <a href="ai-control.html">AI Control (MCP)</a>
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">User Manual</div>
+    <a href="index.html">Manual Home</a>
+    <a href="getting-started.html">1. Getting Started</a>
+    <a href="tracks-and-playlist.html" class="active">2. Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">3. Synth Engines</a>
+    <a href="editing-audio.html">4. Editing Audio</a>
+    <a href="groove-and-tempo.html">5. Groove &amp; Tempo</a>
+    <a href="mixing-and-effects.html">6. Mixing &amp; Effects</a>
+    <a href="audio-and-io.html">7. Files, MIDI &amp; Export</a>
+    <a href="ai-control.html">8. AI Control (MCP)</a>
+    <a href="case-studies.html">9. Case Studies</a>
   </nav>
   <main>
-    <h1>Tracks &amp; Playlist</h1>
+    <h1>2. Tracks &amp; Playlist</h1>
     <p class="lead">How tracks are created, arranged in time, and edited.</p>
 
     <h2>The Channel Rack</h2>
@@ -44,7 +50,7 @@
     <ul>
       <li><strong>M</strong> — mute the track.</li>
       <li><strong>S</strong> — solo the track.</li>
-      <li><strong>FX</strong> — open the track's effect chain menu (see <a href="effects.html">Effects</a>).</li>
+      <li><strong>FX</strong> — open the track's effect chain menu (see <a href="mixing-and-effects.html">Mixing &amp; Effects</a>).</li>
       <li><strong>✕</strong> — delete the track.</li>
       <li>For Audio tracks, an <strong>Input</strong> device picker appears while the track is armed.</li>
     </ul>
@@ -68,6 +74,9 @@
         Region's own output linearly to/from silence over the dragged span; it doesn't affect
         anything before/after the Region's own on-timeline extent.</li>
     </ul>
+    <p>Audio clips (on an Audio track's own row) have the equivalent trim/fade handles, plus
+      Take Folder comping and Flex Time/Pitch editing — see
+      <a href="editing-audio.html">Editing Audio</a>.</p>
     <p>Audio tracks get their own row for their recorded/imported clips instead of Regions — the
       two kinds never share a row. The <strong>Zoom</strong> slider at the top of the Playlist
       scales the whole timeline.</p>
@@ -107,10 +116,17 @@
       and <strong>Roll height</strong> controls in the top toolbar resize every track's piano roll
       at once.</p>
 
+    <h2>Quantize, humanize and groove</h2>
+    <p>Both the Piano Roll and the Beats window's per-lane menu offer quantize/humanize/groove-
+      template tools for tightening or loosening timing — see
+      <a href="groove-and-tempo.html">Groove &amp; Tempo</a>.</p>
+
     <h2>Automation</h2>
     <p>Both the Piano Roll and Beats windows show an <strong>Automation</strong> panel below the
       grid for whichever Region is open — volume/pan/send-level/effect-param "rides" scoped to
-      that one Region. See <a href="effects.html">Effects</a> for how lanes work.</p>
+      that one Region — plus a separate "Track Automation" panel for lanes that apply across the
+      whole arrangement. See <a href="mixing-and-effects.html">Mixing &amp; Effects</a> for how
+      lanes work.</p>
 
     <footer>simple-daw documentation</footer>
   </main>

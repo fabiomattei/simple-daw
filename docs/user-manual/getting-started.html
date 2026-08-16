@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Getting Started — simple-daw User Manual</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">User Manual</div>
+    <a href="index.html">Manual Home</a>
+    <a href="getting-started.html" class="active">1. Getting Started</a>
+    <a href="tracks-and-playlist.html">2. Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">3. Synth Engines</a>
+    <a href="editing-audio.html">4. Editing Audio</a>
+    <a href="groove-and-tempo.html">5. Groove &amp; Tempo</a>
+    <a href="mixing-and-effects.html">6. Mixing &amp; Effects</a>
+    <a href="audio-and-io.html">7. Files, MIDI &amp; Export</a>
+    <a href="ai-control.html">8. AI Control (MCP)</a>
+    <a href="case-studies.html">9. Case Studies</a>
+  </nav>
+  <main>
+    <h1>1. Getting Started</h1>
+    <p class="lead">From a clean checkout to your first audible sound.</p>
+
+    <h2>Install</h2>
+    <ul>
+      <li>A Rust toolchain, installed via <a href="https://rustup.rs/">rustup</a>.</li>
+      <li>On Linux: ALSA development headers for cpal's audio backend
+        (<code>alsa-lib-devel</code> on Fedora, <code>libasound2-dev</code> on Debian/Ubuntu).</li>
+      <li>Optional: a <code>.clap</code> plugin on disk if you want to try CLAP effect hosting —
+        none ship with the repo (see <a href="mixing-and-effects.html">Mixing &amp; Effects</a>).</li>
+    </ul>
+
+    <h2>Build &amp; launch</h2>
+    <pre><code>cargo build       # debug build
+cargo run         # launch the GUI app</code></pre>
+    <p>The app opens with a small demo song already loaded — a programmed "Drums" step-grid track
+      with a basic beat — and a docked Channel Rack panel on the left. Press <strong>▶</strong> in
+      the top toolbar to hear it immediately. There's no File → New; you either keep building on
+      what's loaded or use <strong>File → Load…</strong> to open a different song (see
+      <a href="audio-and-io.html">Files, MIDI &amp; Export</a>).</p>
+
+    <h2>A tour of the main window</h2>
+    <ul>
+      <li><strong>Top toolbar</strong> — transport (play/stop, record, metronome), tempo (BPM
+        field, TAP button), and the output audio device/sample-rate pickers on the right.</li>
+      <li><strong>Channel Rack</strong> (left, dockable or its own window) — where tracks are
+        created and their mute/solo/FX controls live.</li>
+      <li><strong>Playlist</strong> (center) — the song-wide arrangement timeline; every track's
+        Regions or audio clips are placed here.</li>
+      <li><strong>Mixer</strong> — channel strips, sends, submixes, and metering, opened from its
+        own window/tab.</li>
+      <li><strong>Beats</strong> and <strong>Piano Roll</strong> windows open when you double-click
+        a Region on the Playlist, matching that Region's track kind.</li>
+    </ul>
+
+    <h2>Adding your own track: a synth bassline</h2>
+    <ol>
+      <li>In the Channel Rack, click <strong>+ Add</strong> and choose <strong>Piano Roll
+        Track</strong>. It appears in the rack, alongside the demo song's Drums track, and gets its
+        own empty row on the Playlist.</li>
+      <li>On the Playlist, click empty space on that new track's row to create a one-bar Region.</li>
+      <li>Double-click the Region to open the Piano Roll. Click a few cells in the grid to drop
+        notes — pitch on the vertical axis, time on the horizontal.</li>
+      <li>Press <strong>▶</strong> in the top toolbar. You should hear your notes playing alongside
+        the demo drum beat.</li>
+    </ol>
+    <p>From here, <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a> covers every editing
+      gesture on the Channel Rack/Playlist/Beats/Piano Roll in full, and
+      <a href="synth-engines.html">Synth Engines</a> covers shaping that kick's own sound (or
+      picking a completely different one from a preset).</p>
+
+    <h2>Saving your work</h2>
+    <p><strong>File → Save As…</strong> writes the whole song — tracks, Regions, sample paths,
+      loaded effect paths and their parameters — to a JSON file. <strong>File → Save</strong>
+      re-saves to that same path afterward. See <a href="audio-and-io.html">Files, MIDI &amp;
+      Export</a> for loading songs back and bouncing to WAV.</p>
+
+    <h2>Where to go from here</h2>
+    <div class="card-grid">
+      <a class="card" href="tracks-and-playlist.html">
+        <h4>2. Tracks &amp; Playlist</h4>
+        <p>Every editing gesture across the Channel Rack, Playlist, Beats window and Piano Roll.</p>
+      </a>
+      <a class="card" href="synth-engines.html">
+        <h4>3. Synth Engines</h4>
+        <p>Shape or replace a track's sound with Simple, Trine, Wave, or a preset.</p>
+      </a>
+      <a class="card" href="case-studies.html">
+        <h4>9. Case Studies</h4>
+        <p>Full worked examples once you're comfortable with the basics.</p>
+      </a>
+    </div>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

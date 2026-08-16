@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Editing Audio — simple-daw User Manual</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">User Manual</div>
+    <a href="index.html">Manual Home</a>
+    <a href="getting-started.html">1. Getting Started</a>
+    <a href="tracks-and-playlist.html">2. Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">3. Synth Engines</a>
+    <a href="editing-audio.html" class="active">4. Editing Audio</a>
+    <a href="groove-and-tempo.html">5. Groove &amp; Tempo</a>
+    <a href="mixing-and-effects.html">6. Mixing &amp; Effects</a>
+    <a href="audio-and-io.html">7. Files, MIDI &amp; Export</a>
+    <a href="ai-control.html">8. AI Control (MCP)</a>
+    <a href="case-studies.html">9. Case Studies</a>
+  </nav>
+  <main>
+    <h1>4. Editing Audio</h1>
+    <p class="lead">Non-destructive editing for recorded/imported clips on Audio tracks: trim,
+      fades, comping between multiple takes, silence removal, and time/pitch editing.</p>
+    <div class="note">
+      All of this applies to <strong>Audio tracks</strong> (see
+      <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a> for creating one and recording
+      or importing a clip onto it).
+    </div>
+
+    <h2>Trim and fades</h2>
+    <p>A clip has no fixed length until you trim it — by default it plays the whole underlying
+      file. On the Playlist, drag a clip's edges/corners to edit it non-destructively (the source
+      file itself is never modified):</p>
+    <table>
+      <thead><tr><th>Drag</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>Left edge</td><td>Trim the start (head trim) — moves the clip's on-timeline start,
+          keeping its <em>end</em> fixed.</td></tr>
+        <tr><td>Right edge</td><td>Trim the end (tail trim) — shortens or extends how much of the
+          clip plays before it stops.</td></tr>
+        <tr><td>Top-left corner handle</td><td>Fade-in, shown as a shaded triangle.</td></tr>
+        <tr><td>Top-right corner handle</td><td>Fade-out, shown as a shaded triangle.</td></tr>
+      </tbody>
+    </table>
+    <p>Unlike a Region's fade (which ramps per-tick), an audio clip's fade ramps per-sample, so it
+      stays smooth regardless of tempo.</p>
+
+    <h2>Take Folders and comping</h2>
+    <p>Recording is grouped for comping automatically — importing or dragging in a file is not.
+      Re-record from the <em>exact same start position</em> on the same track and the new pass
+      joins the existing recording as another take in a <strong>Take Folder</strong>, instantly
+      comped in for the whole span. Recording from anywhere else starts a fresh folder.</p>
+    <ul>
+      <li><strong>Right-click a Take Folder</strong> on the Playlist for a whole-take picker (swap
+        which take plays for the entire folder) plus delete.</li>
+      <li><strong>Double-click a Take Folder</strong> to open the comp-editor window: one waveform
+        lane per take, stacked. Drag horizontally across a lane to "paint" that stretch of time
+        onto that take — the comp stays gapless automatically as you paint across lane
+        boundaries.</li>
+      <li>Every switch between takes gets a fixed 5ms auto-crossfade, so a take-switch mid-folder
+        never clicks.</li>
+    </ul>
+
+    <h2>Transient detection and Strip Silence</h2>
+    <p>A clip's waveform shows yellow tick marks at detected transients (attacks), recomputed live
+      as you view it. Right-click a clip and choose <strong>Strip Silence</strong> to replace it
+      with one new clip per non-silent segment (a fixed-threshold gate with hysteresis, so a brief
+      dip mid-word doesn't fracture a take) — each new clip stays anchored to the exact same
+      absolute song position its audio originally occupied, so anything synced against it doesn't
+      drift; each starts with fresh trim and no inherited fades.</p>
+
+    <h2>Flex Time and Flex Pitch</h2>
+    <p>Right-click a clip and choose <strong>Flex Time / Pitch…</strong> to open the flex editor,
+      with two tabs. Both tabs preview live as you drag and only commit (re-processing the audio)
+      when you release the mouse — dragging itself doesn't re-run the DSP on every frame.</p>
+    <table>
+      <thead><tr><th>Tab</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Time</strong></td><td>Drag a warp point (snapped to a detected transient)
+          to stretch the audio around it, changing duration without changing pitch — built on
+          WSOLA (Waveform Similarity Overlap-Add), which keeps consecutive grains in phase so
+          stretched audio doesn't "warble."</td></tr>
+        <tr><td><strong>Pitch</strong></td><td>Drag a detected note vertically to retarget its
+          pitch, centered on a "no change" gridline — changes pitch without changing the note's
+          duration.</td></tr>
+      </tbody>
+    </table>
+    <div class="note warn">
+      Both are hand-rolled time-domain DSP, functionally verified (hits its target duration/
+      frequency, silence stays silent) but not verified by ear — extreme stretch/shift amounts can
+      still produce audible artifacts a listening pass would catch.
+    </div>
+    <p>Edits are baked into the clip's own decoded audio once, at load time — everything else
+      (trim, fades, WAV export) treats a flexed clip exactly like an ordinary one.</p>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

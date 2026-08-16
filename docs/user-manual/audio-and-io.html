@@ -3,24 +3,30 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Audio, MIDI &amp; Files — simple-daw</title>
-<link rel="stylesheet" href="style.css">
+<title>Files, MIDI &amp; Export — simple-daw User Manual</title>
+<link rel="stylesheet" href="../style.css">
 </head>
 <body>
 <div class="layout">
   <nav class="sidebar">
-    <a class="brand" href="index.html">simple-daw</a>
-    <a href="index.html">Overview &amp; Setup</a>
-    <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a>
-    <a href="synth-engines.html">Synth Engines</a>
-    <a href="effects.html">Effects</a>
-    <a href="audio-and-io.html" class="active">Audio, MIDI &amp; Files</a>
-    <a href="ai-control.html">AI Control (MCP)</a>
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">User Manual</div>
+    <a href="index.html">Manual Home</a>
+    <a href="getting-started.html">1. Getting Started</a>
+    <a href="tracks-and-playlist.html">2. Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">3. Synth Engines</a>
+    <a href="editing-audio.html">4. Editing Audio</a>
+    <a href="groove-and-tempo.html">5. Groove &amp; Tempo</a>
+    <a href="mixing-and-effects.html">6. Mixing &amp; Effects</a>
+    <a href="audio-and-io.html" class="active">7. Files, MIDI &amp; Export</a>
+    <a href="ai-control.html">8. AI Control (MCP)</a>
+    <a href="case-studies.html">9. Case Studies</a>
   </nav>
   <main>
-    <h1>Audio, MIDI &amp; Files</h1>
-    <p class="lead">Sample playback, recording and importing audio, MIDI import, and getting a
-      song in and out of the app.</p>
+    <h1>7. Files, MIDI &amp; Export</h1>
+    <p class="lead">Recording and importing audio, MIDI import, and getting a song in and out of
+      the app.</p>
 
     <h2>Sample playback</h2>
     <p>Any Step Grid lane can be backed by a loaded WAV sample instead of a synth, via the
@@ -41,6 +47,10 @@
         shows input (after Trim is applied) while recording.</li>
       <li>To bring in an existing WAV file instead, import it the same way onto an Audio track.</li>
     </ul>
+    <p>Re-recording from the exact same position on the same track joins the earlier take into a
+      Take Folder instead of overwriting it — trimming, fading, comping between takes, transient
+      detection and Flex Time/Pitch are all covered in
+      <a href="editing-audio.html">Editing Audio</a>.</p>
 
     <h2>MIDI import</h2>
     <p>Use <strong>File → Import MIDI…</strong> to load a standard <code>.mid</code> file into a
@@ -62,10 +72,10 @@
       count (how many times the arrangement repeats in the bounced file), then click
       <strong>Export</strong>.</p>
     <div class="note">
-      Export reuses the exact same sequencing/mixing code as live playback, but it's dry only —
-      CLAP and built-in effects, sends, and automation aren't included in the bounce, only each
-      track's Volume/Pan and the raw synth/sample/step sequencing (see
-      <a href="effects.html">Effects</a>).
+      Export reuses the exact same sequencing/mixing code as live playback, including every
+      track/submix/send's own effect chain and automation — see
+      <a href="mixing-and-effects.html">Mixing &amp; Effects</a>. The one thing it doesn't consult
+      is mute/solo: every track always renders into the bounce, live or exported.
     </div>
 
     <h2>Transport &amp; output device</h2>

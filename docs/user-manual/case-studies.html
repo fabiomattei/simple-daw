@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Case Studies — simple-daw User Manual</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">User Manual</div>
+    <a href="index.html">Manual Home</a>
+    <a href="getting-started.html">1. Getting Started</a>
+    <a href="tracks-and-playlist.html">2. Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">3. Synth Engines</a>
+    <a href="editing-audio.html">4. Editing Audio</a>
+    <a href="groove-and-tempo.html">5. Groove &amp; Tempo</a>
+    <a href="mixing-and-effects.html">6. Mixing &amp; Effects</a>
+    <a href="audio-and-io.html">7. Files, MIDI &amp; Export</a>
+    <a href="ai-control.html">8. AI Control (MCP)</a>
+    <a href="case-studies.html" class="active">9. Case Studies</a>
+  </nav>
+  <main>
+    <h1>9. Case Studies</h1>
+    <p class="lead">Three worked examples that pull earlier chapters together into a finished
+      piece. Each assumes you've read <a href="getting-started.html">Getting Started</a>; links
+      point back to the chapter that covers each step in full.</p>
+
+    <h2>Case study 1 — an 8-bar chiptune loop</h2>
+    <p class="lead">Step-grid drums plus a Trine bassline, typical of a short overworld/menu loop
+      for a game.</p>
+    <ol>
+      <li>Add a <strong>Step Grid Track</strong> named "Drums," create a one-bar Region, and
+        program a kick/hat/snare pattern across a couple of lanes in the Beats window (see
+        <a href="tracks-and-playlist.html">Tracks &amp; Playlist</a>). Drag the Region's right
+        edge to loop it out to 8 bars.</li>
+      <li>Add a <strong>Piano Roll Track</strong> named "Bass," switch its synth engine to
+        <strong>Trine</strong> in its editor panel, and load a punchy bass preset from the
+        <strong>Factory</strong> preset list (see <a href="synth-engines.html">Synth Engines</a>).
+        Draw a simple root-note bassline following your drum pattern's feel.</li>
+      <li>Apply the <strong>Swing 8th (Light)</strong> groove template to the hi-hat lane and the
+        bassline for a bit of chiptune bounce (see <a href="groove-and-tempo.html">Groove &amp;
+        Tempo</a>).</li>
+      <li>Add a <strong>Bitcrusher</strong> at a low bit depth to the Drums track's FX chain for
+        lo-fi grit, and a light <strong>Reverb</strong> on a send bus that both tracks feed a
+        little into for glue (see <a href="mixing-and-effects.html">Mixing &amp; Effects</a>).</li>
+      <li>Set the loop count in <strong>File → Export…</strong> to however many repeats you need
+        and bounce to WAV (see <a href="audio-and-io.html">Files, MIDI &amp; Export</a>).</li>
+    </ol>
+
+    <h2>Case study 2 — comping a vocal take</h2>
+    <p class="lead">Recording several passes of a short vocal line and combining the best parts of
+      each into one clean take.</p>
+    <ol>
+      <li>Add an <strong>Audio Track</strong> — it's armed for recording automatically. Pick your
+        input device and set the <strong>Trim</strong> knob so the level meter reads comfortably
+        without clipping (see <a href="audio-and-io.html">Files, MIDI &amp; Export</a>).</li>
+      <li>Record a pass with <strong>⏺ Record</strong>. Rewind the playhead back to the exact same
+        start position and record again — the new pass joins the first as a second take in a
+        <strong>Take Folder</strong> rather than replacing it. Repeat for a third pass.</li>
+      <li>Double-click the Take Folder to open the comp editor. Listen through each take's lane and
+        drag across the best-sounding stretch of each to paint together one composite performance
+        (see <a href="editing-audio.html">Editing Audio</a>).</li>
+      <li>If one phrase drifted slightly off pitch, open <strong>Flex Time / Pitch…</strong> on the
+        comped clip and nudge that note back in tune from the Pitch tab.</li>
+      <li>Add a <strong>Noise Gate</strong> to clean up room noise between phrases, then a
+        <strong>Compressor</strong> to even out dynamics, both on the track's own FX chain.</li>
+    </ol>
+
+    <h2>Case study 3 — a tempo-mapped boss-battle cue</h2>
+    <p class="lead">A cue that starts at a tense, slower tempo and accelerates into a faster
+      section when the fight intensifies — the kind of tempo change a tempo map exists for.</p>
+    <ol>
+      <li>Build the slow intro section (drums, a tense pad on a <strong>Wave</strong>-engine track,
+        maybe a low drone) at whatever BPM feels right in the song's main tempo field.</li>
+      <li>Open the Playlist's <strong>Tempo Track</strong> panel and insert a point at the tick
+        where the fast section begins, then raise its BPM — everything after that point plays
+        faster, everything before it is unaffected (see <a href="groove-and-tempo.html">Groove
+        &amp; Tempo</a>).</li>
+      <li>Build the faster section's drums and lead on their own Regions positioned after that
+        tempo point — since note/step triggering follows the tempo map exactly, they'll lock to
+        the new tempo automatically.</li>
+      <li>Add a <strong>Filter</strong> effect to the pad track and automate its cutoff with a
+        <strong>Track Automation</strong> lane that opens up right around the tempo change, for a
+        rising-tension sweep into the faster section (see <a href="mixing-and-effects.html">Mixing
+        &amp; Effects</a>).</li>
+      <li>Automate the master bus's <strong>Limiter</strong> input gain (a <strong>Master FX</strong>
+        automation target) to push a little harder once the fast section kicks in, for extra
+        perceived loudness at the drop.</li>
+      <li>Export, remembering that WAV export mixes every effect chain and automation lane exactly
+        as heard live (see <a href="audio-and-io.html">Files, MIDI &amp; Export</a>).</li>
+    </ol>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>

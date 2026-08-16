@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Groove &amp; Tempo — simple-daw User Manual</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <a class="brand" href="../index.html">simple-daw</a>
+    <a class="crumb" href="../index.html">&larr; Docs home</a>
+    <div class="section-label">User Manual</div>
+    <a href="index.html">Manual Home</a>
+    <a href="getting-started.html">1. Getting Started</a>
+    <a href="tracks-and-playlist.html">2. Tracks &amp; Playlist</a>
+    <a href="synth-engines.html">3. Synth Engines</a>
+    <a href="editing-audio.html">4. Editing Audio</a>
+    <a href="groove-and-tempo.html" class="active">5. Groove &amp; Tempo</a>
+    <a href="mixing-and-effects.html">6. Mixing &amp; Effects</a>
+    <a href="audio-and-io.html">7. Files, MIDI &amp; Export</a>
+    <a href="ai-control.html">8. AI Control (MCP)</a>
+    <a href="case-studies.html">9. Case Studies</a>
+  </nav>
+  <main>
+    <h1>5. Groove &amp; Tempo</h1>
+    <p class="lead">Tools for tightening or loosening timing, and for tracking tempo across a
+      song.</p>
+
+    <h2>Quantize</h2>
+    <p>In the Piano Roll's toolbar (above the note grid), use <strong>Quantize</strong> to snap
+      notes toward the nearest grid line, by a strength from 0 (no change) to 100% (fully
+      snapped) — it targets your current note selection if you have one, or the whole open Region
+      otherwise. A step-grid lane's steps are already grid-locked by definition, so quantize only
+      applies to the Piano Roll.</p>
+
+    <h2>Humanize</h2>
+    <p><strong>Humanize</strong> nudges timing and velocity by a small pseudo-random jitter, in
+      the Piano Roll toolbar for notes and via a lane's own <strong>🎲</strong> popup menu in the
+      Beats window for steps. There's no per-step selection — a step-grid humanize action always
+      applies to a whole lane at once. The jitter is deterministic given the same seed (based on
+      the click time), which is why re-running it can give a different result each time you
+      click.</p>
+
+    <h2>Groove templates</h2>
+    <p>A groove template applies a repeating pattern of timing/velocity nudges across a cycle of
+      positions — the same swing feel you'd apply in a drum-machine or DAW groove quantize. Pick
+      one from the Piano Roll toolbar (notes) or a lane's 🎲 menu (steps):</p>
+    <table>
+      <thead><tr><th>Template</th><th>Feel</th></tr></thead>
+      <tbody>
+        <tr><td>Straight</td><td>No change — the "off" option.</td></tr>
+        <tr><td>Swing 8th (Light)</td><td>Subtle swing on the off-beat 8th notes.</td></tr>
+        <tr><td>Swing 8th (Heavy)</td><td>Pronounced swing on the off-beat 8th notes.</td></tr>
+        <tr><td>Swing 16th (Light)</td><td>Subtle swing on the 4th 16th-note of each group.</td></tr>
+        <tr><td>MPC Push</td><td>Pushes alternating positions slightly ahead of the beat, with a
+          velocity boost — a driving, ahead-of-the-beat feel.</td></tr>
+        <tr><td>MPC Lay-back</td><td>The mirror of Push — pulls alternating positions slightly
+          behind the beat with a velocity dip, for a laid-back feel.</td></tr>
+      </tbody>
+    </table>
+    <p>A step's timing nudge is capped so it can never cross into a neighboring step's own
+      territory — groove and humanize on a step-grid lane always stay musically unambiguous about
+      which step is which.</p>
+
+    <h2>Tap tempo</h2>
+    <p>Click the <strong>TAP</strong> button on the transport LCD in rhythm; after a couple of taps
+      it starts estimating BPM from your average tap interval, averaging up to the last 8 taps. A
+      pause of more than 2 seconds between taps resets the sequence and starts a fresh estimate.</p>
+
+    <h2>Audio tempo detection</h2>
+    <p><strong>File → Detect Tempo…</strong> opens a dialog to analyze a WAV file's tempo from its
+      audio (energy-envelope onset detection, works best on clearly rhythmic material like a drum
+      loop or click track — not a dense full mix) and offers to apply the detected BPM to the
+      song. This is separate from MIDI import's own "apply tempo" option, which just reads a MIDI
+      file's own embedded tempo event rather than analyzing audio.</p>
+
+    <h2>The tempo map (Smart Tempo)</h2>
+    <p>The song's main BPM field is still the tempo at the very start of the timeline. To change
+      tempo partway through a song, use the Playlist's <strong>Tempo Track</strong> panel:</p>
+    <ul>
+      <li><strong>Insert a point</strong> at the playhead — it defaults to whatever tempo is
+        already in effect there, so inserting one alone is a no-op until you adjust its value.</li>
+      <li><strong>Edit a point's BPM</strong> in place.</li>
+      <li><strong>Remove a point.</strong></li>
+    </ul>
+    <p>Tempo holds constant from one point to the next (a step function, not a smooth ramp) — there's
+      no dragging a point directly on the Playlist timeline, points are edited by value. Note/step
+      triggering follows tempo changes exactly (each tick re-resolves the tempo in effect);
+      continuous automation and WAV export follow it with buffer-level precision — close enough
+      that a tempo change is inaudible as a seam, but not literally sample-accurate the way trigger
+      timing is.</p>
+    <div class="note warn">
+      There's no automatic tempo-curve detection from a recording's actual performance (true
+      beat-tracking across tempo drift) — only the single-BPM audio detector above, and manually
+      placed tempo-map points.
+    </div>
+
+    <footer>simple-daw documentation</footer>
+  </main>
+</div>
+</body>
+</html>
