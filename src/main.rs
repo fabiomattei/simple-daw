@@ -4876,319 +4876,332 @@ fn wave_envelopes_ui(ui: &mut egui::Ui, wave: &mut WaveParams) {
     );
 }
 
-/// Bundled one-shot drum samples (`assets/samples/<category>/<file>.wav`), organized into
-/// categories the same way FL Studio's browser groups its own factory one-shots — offered
-/// from any step-grid lane's "🥁" menu (`lane_sample_controls`) as category submenus, and
-/// used to seed the demo song's drum lanes below.
-const FACTORY_DRUM_SAMPLES: &[(&str, &[(&str, &str)])] = &[
-    (
-        "Kick",
-        &[
-            ("Kick", "kick/kick.wav"),
-            ("Kick (Tight)", "kick/kick_tight.wav"),
-            ("Kick (808)", "kick/kick_808.wav"),
-            ("Kick (Sub)", "kick/kick_sub.wav"),
-            ("Kick (Punchy)", "kick/kick_punchy.wav"),
-            ("Kick (Distorted)", "kick/kick_distorted.wav"),
-            ("Kick (Lo-Fi)", "kick/kick_lofi.wav"),
-            ("Kick (Boom)", "kick/kick_boom.wav"),
-            ("Kick (Click)", "kick/kick_click.wav"),
-            ("Kick (B)", "kick/kick_b.wav"),
-            ("Kick (Tight, B)", "kick/kick_tight_b.wav"),
-            ("Kick (808, B)", "kick/kick_808_b.wav"),
-        ],
-    ),
-    (
-        "Snare",
-        &[
-            ("Snare", "snare/snare.wav"),
-            ("Snare (Tight)", "snare/snare_tight.wav"),
-            ("Snare (Fat)", "snare/snare_fat.wav"),
-            ("Snare (Rimshot)", "snare/snare_rimshot.wav"),
-            ("Snare (Lo-Fi)", "snare/snare_lofi.wav"),
-            ("Snare (808)", "snare/snare_808.wav"),
-            ("Snare (Cross-stick)", "snare/snare_crossstick.wav"),
-            ("Snare (B)", "snare/snare_b.wav"),
-            ("Snare (Tight, B)", "snare/snare_tight_b.wav"),
-            ("Snare (Fat, B)", "snare/snare_fat_b.wav"),
-        ],
-    ),
-    (
-        "Hat",
-        &[
-            ("Closed Hat", "hat/hat_closed.wav"),
-            ("Open Hat", "hat/hat_open.wav"),
-            ("Pedal Hat", "hat/hat_pedal.wav"),
-            ("Tight Hat", "hat/hat_tight.wav"),
-            ("Metallic Hat", "hat/hat_metallic.wav"),
-            ("Sizzle Hat", "hat/hat_sizzle.wav"),
-            ("Closed Hat (B)", "hat/hat_closed_b.wav"),
-            ("Open Hat (B)", "hat/hat_open_b.wav"),
-        ],
-    ),
-    (
-        "Clap",
-        &[
-            ("Clap", "clap/clap.wav"),
-            ("Clap (Tight)", "clap/clap_tight.wav"),
-            ("Clap (808)", "clap/clap_808.wav"),
-            ("Clap (Wide)", "clap/clap_wide.wav"),
-            ("Clap (B)", "clap/clap_b.wav"),
-            ("Clap (Tight, B)", "clap/clap_tight_b.wav"),
-        ],
-    ),
-    (
-        "Tom",
-        &[
-            ("Low Tom", "tom/tom_low.wav"),
-            ("Mid Tom", "tom/tom_mid.wav"),
-            ("High Tom", "tom/tom_high.wav"),
-            ("Floor Tom", "tom/tom_floor.wav"),
-            ("Synth Tom", "tom/tom_synth.wav"),
-        ],
-    ),
-    (
-        "Cymbal",
-        &[
-            ("Crash", "cymbal/crash.wav"),
-            ("Ride", "cymbal/ride.wav"),
-            ("Splash", "cymbal/splash.wav"),
-            ("China", "cymbal/china.wav"),
-            ("Bell", "cymbal/bell.wav"),
-            ("Crash (Reverse)", "cymbal/crash_reverse.wav"),
-            ("Crash 2", "cymbal/crash_2.wav"),
-            ("Sizzle", "cymbal/sizzle.wav"),
-            ("Crash (B)", "cymbal/crash_b.wav"),
-            ("Ride (B)", "cymbal/ride_b.wav"),
-        ],
-    ),
-    (
-        "Perc",
-        &[
-            ("Rim", "perc/rim.wav"),
-            ("Cowbell", "perc/cowbell.wav"),
-            ("Shaker", "perc/shaker.wav"),
-            ("Tambourine", "perc/tambourine.wav"),
-            ("Snap", "perc/snap.wav"),
-            ("Woodblock", "perc/woodblock.wav"),
-            ("Conga (High)", "perc/conga_high.wav"),
-            ("Conga (Low)", "perc/conga_low.wav"),
-            ("Bongo (High)", "perc/bongo_high.wav"),
-            ("Bongo (Low)", "perc/bongo_low.wav"),
-            ("Clave", "perc/clave.wav"),
-            ("Triangle", "perc/triangle.wav"),
-            ("Timbale (High)", "perc/timbale_high.wav"),
-            ("Timbale (Low)", "perc/timbale_low.wav"),
-            ("Agogo (High)", "perc/agogo_high.wav"),
-            ("Agogo (Low)", "perc/agogo_low.wav"),
-            ("Castanet", "perc/castanet.wav"),
-            ("Sleigh Bells", "perc/sleigh_bells.wav"),
-            ("Djembe", "perc/djembe.wav"),
-            ("Taiko", "perc/taiko.wav"),
-            ("Frame Drum", "perc/frame_drum.wav"),
-            ("Rim (B)", "perc/rim_b.wav"),
-            ("Cowbell (B)", "perc/cowbell_b.wav"),
-            ("Shaker (B)", "perc/shaker_b.wav"),
-            ("Tambourine (B)", "perc/tambourine_b.wav"),
-            ("Conga (High, B)", "perc/conga_high_b.wav"),
-            ("Conga (Low, B)", "perc/conga_low_b.wav"),
-            ("Bongo (High, B)", "perc/bongo_high_b.wav"),
-            ("Bongo (Low, B)", "perc/bongo_low_b.wav"),
-            ("Clave (B)", "perc/clave_b.wav"),
-        ],
-    ),
-    (
-        "Mallet",
-        &[
-            ("Marimba", "mallet/marimba.wav"),
-            ("Marimba (2nd)", "mallet/marimba_2nd.wav"),
-            ("Marimba (3rd)", "mallet/marimba_3rd.wav"),
-            ("Marimba (5th)", "mallet/marimba_5th.wav"),
-            ("Marimba (6th)", "mallet/marimba_6th.wav"),
-            ("Marimba (8ve)", "mallet/marimba_8ve.wav"),
-            ("Xylophone", "mallet/xylophone.wav"),
-            ("Xylophone (2nd)", "mallet/xylophone_2nd.wav"),
-            ("Xylophone (3rd)", "mallet/xylophone_3rd.wav"),
-            ("Xylophone (5th)", "mallet/xylophone_5th.wav"),
-            ("Xylophone (6th)", "mallet/xylophone_6th.wav"),
-            ("Xylophone (8ve)", "mallet/xylophone_8ve.wav"),
-            ("Kalimba", "mallet/kalimba.wav"),
-            ("Kalimba (2nd)", "mallet/kalimba_2nd.wav"),
-            ("Kalimba (3rd)", "mallet/kalimba_3rd.wav"),
-            ("Kalimba (5th)", "mallet/kalimba_5th.wav"),
-            ("Kalimba (6th)", "mallet/kalimba_6th.wav"),
-            ("Kalimba (8ve)", "mallet/kalimba_8ve.wav"),
-            ("Glockenspiel", "mallet/glockenspiel.wav"),
-            ("Glockenspiel (2nd)", "mallet/glockenspiel_2nd.wav"),
-            ("Glockenspiel (3rd)", "mallet/glockenspiel_3rd.wav"),
-            ("Glockenspiel (5th)", "mallet/glockenspiel_5th.wav"),
-            ("Glockenspiel (6th)", "mallet/glockenspiel_6th.wav"),
-            ("Glockenspiel (8ve)", "mallet/glockenspiel_8ve.wav"),
-            ("Vibraphone", "mallet/vibraphone.wav"),
-            ("Vibraphone (2nd)", "mallet/vibraphone_2nd.wav"),
-            ("Vibraphone (3rd)", "mallet/vibraphone_3rd.wav"),
-            ("Vibraphone (5th)", "mallet/vibraphone_5th.wav"),
-            ("Vibraphone (6th)", "mallet/vibraphone_6th.wav"),
-            ("Vibraphone (8ve)", "mallet/vibraphone_8ve.wav"),
-            ("Steel Drum", "mallet/steel_drum.wav"),
-            ("Steel Drum (2nd)", "mallet/steel_drum_2nd.wav"),
-            ("Steel Drum (3rd)", "mallet/steel_drum_3rd.wav"),
-            ("Steel Drum (5th)", "mallet/steel_drum_5th.wav"),
-            ("Steel Drum (6th)", "mallet/steel_drum_6th.wav"),
-            ("Steel Drum (8ve)", "mallet/steel_drum_8ve.wav"),
-            ("Celesta", "mallet/celesta.wav"),
-            ("Celesta (2nd)", "mallet/celesta_2nd.wav"),
-            ("Celesta (3rd)", "mallet/celesta_3rd.wav"),
-            ("Celesta (5th)", "mallet/celesta_5th.wav"),
-            ("Celesta (6th)", "mallet/celesta_6th.wav"),
-            ("Celesta (8ve)", "mallet/celesta_8ve.wav"),
-            ("Bell Tree", "mallet/bell_tree.wav"),
-        ],
-    ),
-    (
-        "Pluck",
-        &[
-            ("Guitar Pluck", "pluck/guitar_pluck.wav"),
-            ("Guitar Pluck (2nd)", "pluck/guitar_pluck_2nd.wav"),
-            ("Guitar Pluck (3rd)", "pluck/guitar_pluck_3rd.wav"),
-            ("Guitar Pluck (5th)", "pluck/guitar_pluck_5th.wav"),
-            ("Guitar Pluck (6th)", "pluck/guitar_pluck_6th.wav"),
-            ("Guitar Pluck (8ve)", "pluck/guitar_pluck_8ve.wav"),
-            ("Harp Pluck", "pluck/harp_pluck.wav"),
-            ("Harp Pluck (2nd)", "pluck/harp_pluck_2nd.wav"),
-            ("Harp Pluck (3rd)", "pluck/harp_pluck_3rd.wav"),
-            ("Harp Pluck (5th)", "pluck/harp_pluck_5th.wav"),
-            ("Harp Pluck (6th)", "pluck/harp_pluck_6th.wav"),
-            ("Harp Pluck (8ve)", "pluck/harp_pluck_8ve.wav"),
-            ("Koto", "pluck/koto.wav"),
-            ("Koto (2nd)", "pluck/koto_2nd.wav"),
-            ("Koto (3rd)", "pluck/koto_3rd.wav"),
-            ("Koto (5th)", "pluck/koto_5th.wav"),
-            ("Koto (6th)", "pluck/koto_6th.wav"),
-            ("Koto (8ve)", "pluck/koto_8ve.wav"),
-            ("Music Box", "pluck/music_box.wav"),
-            ("Music Box (2nd)", "pluck/music_box_2nd.wav"),
-            ("Music Box (3rd)", "pluck/music_box_3rd.wav"),
-            ("Music Box (5th)", "pluck/music_box_5th.wav"),
-            ("Music Box (6th)", "pluck/music_box_6th.wav"),
-            ("Music Box (8ve)", "pluck/music_box_8ve.wav"),
-            ("Nylon Pluck", "pluck/nylon_pluck.wav"),
-            ("Nylon Pluck (2nd)", "pluck/nylon_pluck_2nd.wav"),
-            ("Nylon Pluck (3rd)", "pluck/nylon_pluck_3rd.wav"),
-            ("Nylon Pluck (5th)", "pluck/nylon_pluck_5th.wav"),
-            ("Nylon Pluck (6th)", "pluck/nylon_pluck_6th.wav"),
-            ("Nylon Pluck (8ve)", "pluck/nylon_pluck_8ve.wav"),
-            ("Banjo", "pluck/banjo.wav"),
-            ("Banjo (2nd)", "pluck/banjo_2nd.wav"),
-            ("Banjo (3rd)", "pluck/banjo_3rd.wav"),
-            ("Banjo (5th)", "pluck/banjo_5th.wav"),
-            ("Banjo (6th)", "pluck/banjo_6th.wav"),
-            ("Banjo (8ve)", "pluck/banjo_8ve.wav"),
-        ],
-    ),
-    (
-        "Orchestral",
-        &[
-            ("Pizzicato", "orchestral/pizzicato.wav"),
-            ("Pizzicato (2nd)", "orchestral/pizzicato_2nd.wav"),
-            ("Pizzicato (3rd)", "orchestral/pizzicato_3rd.wav"),
-            ("Pizzicato (5th)", "orchestral/pizzicato_5th.wav"),
-            ("Pizzicato (6th)", "orchestral/pizzicato_6th.wav"),
-            ("Pizzicato (8ve)", "orchestral/pizzicato_8ve.wav"),
-            ("Brass Stab", "orchestral/brass_stab.wav"),
-            ("Brass Stab (2nd)", "orchestral/brass_stab_2nd.wav"),
-            ("Brass Stab (3rd)", "orchestral/brass_stab_3rd.wav"),
-            ("Brass Stab (5th)", "orchestral/brass_stab_5th.wav"),
-            ("Brass Stab (6th)", "orchestral/brass_stab_6th.wav"),
-            ("Brass Stab (8ve)", "orchestral/brass_stab_8ve.wav"),
-            ("Horn Hit", "orchestral/horn_hit.wav"),
-            ("Horn Hit (2nd)", "orchestral/horn_hit_2nd.wav"),
-            ("Horn Hit (3rd)", "orchestral/horn_hit_3rd.wav"),
-            ("Horn Hit (5th)", "orchestral/horn_hit_5th.wav"),
-            ("Horn Hit (6th)", "orchestral/horn_hit_6th.wav"),
-            ("Horn Hit (8ve)", "orchestral/horn_hit_8ve.wav"),
-            ("Choir Hit", "orchestral/choir_hit.wav"),
-            ("String Swell", "orchestral/string_swell.wav"),
-            ("Timpani", "orchestral/timpani.wav"),
-        ],
-    ),
-    (
-        "Chip FX",
-        &[
-            ("Coin", "chip/coin.wav"),
-            ("Jump", "chip/jump.wav"),
-            ("Laser", "chip/laser.wav"),
-            ("Powerup", "chip/powerup.wav"),
-            ("Blip", "chip/blip.wav"),
-            ("Explosion", "chip/explosion.wav"),
-            ("Hurt", "chip/hurt.wav"),
-            ("Select", "chip/select.wav"),
-            ("Level Up", "chip/level_up.wav"),
-            ("Game Over", "chip/game_over.wav"),
-            ("Checkpoint", "chip/checkpoint.wav"),
-            ("Footstep", "chip/footstep.wav"),
-            ("Menu Back", "chip/menu_back.wav"),
-            ("Error", "chip/error.wav"),
-            ("1-Up", "chip/one_up.wav"),
-            ("Countdown", "chip/countdown.wav"),
-            ("Power Down", "chip/power_down.wav"),
-            ("Teleport", "chip/teleport.wav"),
-            ("Charge Up", "chip/charge_up.wav"),
-            ("Warp", "chip/warp.wav"),
-            ("Item Get", "chip/item_get.wav"),
-            ("Boss Alert", "chip/boss_alert.wav"),
-        ],
-    ),
-    (
-        "FX",
-        &[
-            ("Riser", "fx/riser.wav"),
-            ("Downlifter", "fx/downlifter.wav"),
-            ("Impact", "fx/impact.wav"),
-            ("Whoosh", "fx/whoosh.wav"),
-            ("Sweep Up", "fx/sweep_up.wav"),
-            ("Sweep Down", "fx/sweep_down.wav"),
-            ("Braam", "fx/braam.wav"),
-            ("Sub Boom", "fx/sub_boom.wav"),
-            ("Glitch", "fx/glitch.wav"),
-            ("Reverse Snare", "fx/reverse_snare.wav"),
-        ],
-    ),
-    (
-        "Bass",
-        &[
-            ("Sub (Low)", "bass/sub_low.wav"),
-            ("Sub (Mid)", "bass/sub_mid.wav"),
-            ("Sub (High)", "bass/sub_high.wav"),
-            ("Sub Drop", "bass/sub_drop.wav"),
-            ("Bass Pluck", "bass/bass_pluck.wav"),
-            ("Bass Pluck (2nd)", "bass/bass_pluck_2nd.wav"),
-            ("Bass Pluck (3rd)", "bass/bass_pluck_3rd.wav"),
-            ("Bass Pluck (5th)", "bass/bass_pluck_5th.wav"),
-            ("Bass Pluck (6th)", "bass/bass_pluck_6th.wav"),
-            ("Bass Pluck (8ve)", "bass/bass_pluck_8ve.wav"),
-            ("Bass Growl", "bass/bass_growl.wav"),
-            ("Reese Bass", "bass/reese_bass.wav"),
-            ("Reese Bass (2nd)", "bass/reese_bass_2nd.wav"),
-            ("Reese Bass (3rd)", "bass/reese_bass_3rd.wav"),
-            ("Reese Bass (5th)", "bass/reese_bass_5th.wav"),
-            ("Reese Bass (6th)", "bass/reese_bass_6th.wav"),
-            ("Reese Bass (8ve)", "bass/reese_bass_8ve.wav"),
-            ("FM Bass", "bass/fm_bass.wav"),
-            ("FM Bass (2nd)", "bass/fm_bass_2nd.wav"),
-            ("FM Bass (3rd)", "bass/fm_bass_3rd.wav"),
-            ("FM Bass (5th)", "bass/fm_bass_5th.wav"),
-            ("FM Bass (6th)", "bass/fm_bass_6th.wav"),
-            ("FM Bass (8ve)", "bass/fm_bass_8ve.wav"),
-            ("Slap Bass", "bass/slap_bass.wav"),
-            ("Slap Bass (2nd)", "bass/slap_bass_2nd.wav"),
-            ("Slap Bass (3rd)", "bass/slap_bass_3rd.wav"),
-            ("Slap Bass (5th)", "bass/slap_bass_5th.wav"),
-            ("Slap Bass (6th)", "bass/slap_bass_6th.wav"),
-            ("Slap Bass (8ve)", "bass/slap_bass_8ve.wav"),
-        ],
-    ),
+/// One entry in a factory-sample category: (display label, path relative to
+/// `factory_samples_dir()`).
+type FactorySampleEntry = (&'static str, &'static str);
+
+const KICK_SAMPLES: &[FactorySampleEntry] = &[
+    ("Kick", "kick/kick.wav"),
+    ("Kick (Tight)", "kick/kick_tight.wav"),
+    ("Kick (808)", "kick/kick_808.wav"),
+    ("Kick (Sub)", "kick/kick_sub.wav"),
+    ("Kick (Punchy)", "kick/kick_punchy.wav"),
+    ("Kick (Distorted)", "kick/kick_distorted.wav"),
+    ("Kick (Lo-Fi)", "kick/kick_lofi.wav"),
+    ("Kick (Boom)", "kick/kick_boom.wav"),
+    ("Kick (Click)", "kick/kick_click.wav"),
+    ("Kick (B)", "kick/kick_b.wav"),
+    ("Kick (Tight, B)", "kick/kick_tight_b.wav"),
+    ("Kick (808, B)", "kick/kick_808_b.wav"),
+    ("Kick (Sub, B)", "kick/kick_sub_b.wav"),
+    ("Kick (Punchy, B)", "kick/kick_punchy_b.wav"),
+    ("Kick (Distorted, B)", "kick/kick_distorted_b.wav"),
+    ("Kick (Lo-Fi, B)", "kick/kick_lofi_b.wav"),
+    ("Kick (Boom, B)", "kick/kick_boom_b.wav"),
+    ("Kick (Click, B)", "kick/kick_click_b.wav"),
 ];
+
+const SNARE_SAMPLES: &[FactorySampleEntry] = &[
+    ("Snare", "snare/snare.wav"),
+    ("Snare (Tight)", "snare/snare_tight.wav"),
+    ("Snare (Fat)", "snare/snare_fat.wav"),
+    ("Snare (Rimshot)", "snare/snare_rimshot.wav"),
+    ("Snare (Lo-Fi)", "snare/snare_lofi.wav"),
+    ("Snare (808)", "snare/snare_808.wav"),
+    ("Snare (Cross-stick)", "snare/snare_crossstick.wav"),
+    ("Snare (B)", "snare/snare_b.wav"),
+    ("Snare (Tight, B)", "snare/snare_tight_b.wav"),
+    ("Snare (Fat, B)", "snare/snare_fat_b.wav"),
+    ("Snare (Rimshot, B)", "snare/snare_rimshot_b.wav"),
+    ("Snare (Lo-Fi, B)", "snare/snare_lofi_b.wav"),
+    ("Snare (808, B)", "snare/snare_808_b.wav"),
+    ("Snare (Cross-stick, B)", "snare/snare_crossstick_b.wav"),
+];
+
+const HAT_SAMPLES: &[FactorySampleEntry] = &[
+    ("Closed Hat", "hat/hat_closed.wav"),
+    ("Open Hat", "hat/hat_open.wav"),
+    ("Pedal Hat", "hat/hat_pedal.wav"),
+    ("Tight Hat", "hat/hat_tight.wav"),
+    ("Metallic Hat", "hat/hat_metallic.wav"),
+    ("Sizzle Hat", "hat/hat_sizzle.wav"),
+    ("Closed Hat (B)", "hat/hat_closed_b.wav"),
+    ("Open Hat (B)", "hat/hat_open_b.wav"),
+    ("Pedal Hat (B)", "hat/hat_pedal_b.wav"),
+    ("Tight Hat (B)", "hat/hat_tight_b.wav"),
+    ("Metallic Hat (B)", "hat/hat_metallic_b.wav"),
+    ("Sizzle Hat (B)", "hat/hat_sizzle_b.wav"),
+];
+
+const CLAP_SAMPLES: &[FactorySampleEntry] = &[
+    ("Clap", "clap/clap.wav"),
+    ("Clap (Tight)", "clap/clap_tight.wav"),
+    ("Clap (808)", "clap/clap_808.wav"),
+    ("Clap (Wide)", "clap/clap_wide.wav"),
+    ("Clap (B)", "clap/clap_b.wav"),
+    ("Clap (Tight, B)", "clap/clap_tight_b.wav"),
+    ("Clap (808, B)", "clap/clap_808_b.wav"),
+    ("Clap (Wide, B)", "clap/clap_wide_b.wav"),
+];
+
+const TOM_SAMPLES: &[FactorySampleEntry] = &[
+    ("Low Tom", "tom/tom_low.wav"),
+    ("Mid Tom", "tom/tom_mid.wav"),
+    ("High Tom", "tom/tom_high.wav"),
+    ("Floor Tom", "tom/tom_floor.wav"),
+    ("Synth Tom", "tom/tom_synth.wav"),
+    ("Low Tom (B)", "tom/tom_low_b.wav"),
+    ("Mid Tom (B)", "tom/tom_mid_b.wav"),
+    ("High Tom (B)", "tom/tom_high_b.wav"),
+    ("Floor Tom (B)", "tom/tom_floor_b.wav"),
+    ("Synth Tom (B)", "tom/tom_synth_b.wav"),
+];
+
+const CYMBAL_SAMPLES: &[FactorySampleEntry] = &[
+    ("Crash", "cymbal/crash.wav"),
+    ("Ride", "cymbal/ride.wav"),
+    ("Splash", "cymbal/splash.wav"),
+    ("China", "cymbal/china.wav"),
+    ("Bell", "cymbal/bell.wav"),
+    ("Crash (Reverse)", "cymbal/crash_reverse.wav"),
+    ("Crash 2", "cymbal/crash_2.wav"),
+    ("Sizzle", "cymbal/sizzle.wav"),
+    ("Crash (B)", "cymbal/crash_b.wav"),
+    ("Ride (B)", "cymbal/ride_b.wav"),
+    ("Splash (B)", "cymbal/splash_b.wav"),
+    ("China (B)", "cymbal/china_b.wav"),
+    ("Bell (B)", "cymbal/bell_b.wav"),
+    ("Crash (Reverse, B)", "cymbal/crash_reverse_b.wav"),
+    ("Crash 2 (B)", "cymbal/crash_2_b.wav"),
+    ("Sizzle (B)", "cymbal/sizzle_b.wav"),
+];
+
+const PERC_SAMPLES: &[FactorySampleEntry] = &[
+    ("Rim", "perc/rim.wav"),
+    ("Cowbell", "perc/cowbell.wav"),
+    ("Shaker", "perc/shaker.wav"),
+    ("Tambourine", "perc/tambourine.wav"),
+    ("Snap", "perc/snap.wav"),
+    ("Woodblock", "perc/woodblock.wav"),
+    ("Conga (High)", "perc/conga_high.wav"),
+    ("Conga (Low)", "perc/conga_low.wav"),
+    ("Bongo (High)", "perc/bongo_high.wav"),
+    ("Bongo (Low)", "perc/bongo_low.wav"),
+    ("Clave", "perc/clave.wav"),
+    ("Triangle", "perc/triangle.wav"),
+    ("Timbale (High)", "perc/timbale_high.wav"),
+    ("Timbale (Low)", "perc/timbale_low.wav"),
+    ("Agogo (High)", "perc/agogo_high.wav"),
+    ("Agogo (Low)", "perc/agogo_low.wav"),
+    ("Castanet", "perc/castanet.wav"),
+    ("Sleigh Bells", "perc/sleigh_bells.wav"),
+    ("Djembe", "perc/djembe.wav"),
+    ("Taiko", "perc/taiko.wav"),
+    ("Frame Drum", "perc/frame_drum.wav"),
+    ("Rim (B)", "perc/rim_b.wav"),
+    ("Cowbell (B)", "perc/cowbell_b.wav"),
+    ("Shaker (B)", "perc/shaker_b.wav"),
+    ("Tambourine (B)", "perc/tambourine_b.wav"),
+    ("Conga (High, B)", "perc/conga_high_b.wav"),
+    ("Conga (Low, B)", "perc/conga_low_b.wav"),
+    ("Bongo (High, B)", "perc/bongo_high_b.wav"),
+    ("Bongo (Low, B)", "perc/bongo_low_b.wav"),
+    ("Clave (B)", "perc/clave_b.wav"),
+    ("Snap (B)", "perc/snap_b.wav"),
+    ("Woodblock (B)", "perc/woodblock_b.wav"),
+    ("Triangle (B)", "perc/triangle_b.wav"),
+    ("Timbale (High, B)", "perc/timbale_high_b.wav"),
+    ("Timbale (Low, B)", "perc/timbale_low_b.wav"),
+    ("Agogo (High, B)", "perc/agogo_high_b.wav"),
+    ("Agogo (Low, B)", "perc/agogo_low_b.wav"),
+    ("Castanet (B)", "perc/castanet_b.wav"),
+    ("Sleigh Bells (B)", "perc/sleigh_bells_b.wav"),
+    ("Djembe (B)", "perc/djembe_b.wav"),
+    ("Taiko (B)", "perc/taiko_b.wav"),
+    ("Frame Drum (B)", "perc/frame_drum_b.wav"),
+];
+
+/// Non-melodic Mallet entries — the pitched instruments are generated by `MELODIC_INSTRUMENTS`
+/// below instead of hand-listed here.
+const MALLET_EXTRA_SAMPLES: &[FactorySampleEntry] =
+    &[("Bell Tree", "mallet/bell_tree.wav"), ("Bell Tree (B)", "mallet/bell_tree_b.wav")];
+
+/// Non-melodic Orchestral entries — Pizzicato/Brass Stab/Horn Hit are generated instead.
+const ORCHESTRAL_EXTRA_SAMPLES: &[FactorySampleEntry] = &[
+    ("Choir Hit", "orchestral/choir_hit.wav"),
+    ("String Swell", "orchestral/string_swell.wav"),
+    ("Timpani", "orchestral/timpani.wav"),
+];
+
+const CHIP_FX_SAMPLES: &[FactorySampleEntry] = &[
+    ("Coin", "chip/coin.wav"),
+    ("Jump", "chip/jump.wav"),
+    ("Laser", "chip/laser.wav"),
+    ("Powerup", "chip/powerup.wav"),
+    ("Blip", "chip/blip.wav"),
+    ("Explosion", "chip/explosion.wav"),
+    ("Hurt", "chip/hurt.wav"),
+    ("Select", "chip/select.wav"),
+    ("Level Up", "chip/level_up.wav"),
+    ("Game Over", "chip/game_over.wav"),
+    ("Checkpoint", "chip/checkpoint.wav"),
+    ("Footstep", "chip/footstep.wav"),
+    ("Menu Back", "chip/menu_back.wav"),
+    ("Error", "chip/error.wav"),
+    ("1-Up", "chip/one_up.wav"),
+    ("Countdown", "chip/countdown.wav"),
+    ("Power Down", "chip/power_down.wav"),
+    ("Teleport", "chip/teleport.wav"),
+    ("Charge Up", "chip/charge_up.wav"),
+    ("Warp", "chip/warp.wav"),
+    ("Item Get", "chip/item_get.wav"),
+    ("Boss Alert", "chip/boss_alert.wav"),
+    ("Coin (B)", "chip/coin_b.wav"),
+    ("Jump (B)", "chip/jump_b.wav"),
+    ("Laser (B)", "chip/laser_b.wav"),
+    ("Powerup (B)", "chip/powerup_b.wav"),
+    ("Blip (B)", "chip/blip_b.wav"),
+    ("Explosion (B)", "chip/explosion_b.wav"),
+    ("Hurt (B)", "chip/hurt_b.wav"),
+    ("Select (B)", "chip/select_b.wav"),
+    ("Level Up (B)", "chip/level_up_b.wav"),
+    ("Game Over (B)", "chip/game_over_b.wav"),
+    ("Checkpoint (B)", "chip/checkpoint_b.wav"),
+    ("Footstep (B)", "chip/footstep_b.wav"),
+    ("Menu Back (B)", "chip/menu_back_b.wav"),
+    ("Error (B)", "chip/error_b.wav"),
+    ("1-Up (B)", "chip/one_up_b.wav"),
+    ("Countdown (B)", "chip/countdown_b.wav"),
+    ("Power Down (B)", "chip/power_down_b.wav"),
+    ("Teleport (B)", "chip/teleport_b.wav"),
+    ("Charge Up (B)", "chip/charge_up_b.wav"),
+    ("Warp (B)", "chip/warp_b.wav"),
+    ("Item Get (B)", "chip/item_get_b.wav"),
+    ("Boss Alert (B)", "chip/boss_alert_b.wav"),
+];
+
+const FX_SAMPLES: &[FactorySampleEntry] = &[
+    ("Riser", "fx/riser.wav"),
+    ("Downlifter", "fx/downlifter.wav"),
+    ("Impact", "fx/impact.wav"),
+    ("Whoosh", "fx/whoosh.wav"),
+    ("Sweep Up", "fx/sweep_up.wav"),
+    ("Sweep Down", "fx/sweep_down.wav"),
+    ("Braam", "fx/braam.wav"),
+    ("Sub Boom", "fx/sub_boom.wav"),
+    ("Glitch", "fx/glitch.wav"),
+    ("Reverse Snare", "fx/reverse_snare.wav"),
+    ("Riser (B)", "fx/riser_b.wav"),
+    ("Downlifter (B)", "fx/downlifter_b.wav"),
+    ("Impact (B)", "fx/impact_b.wav"),
+    ("Whoosh (B)", "fx/whoosh_b.wav"),
+    ("Sweep Up (B)", "fx/sweep_up_b.wav"),
+    ("Sweep Down (B)", "fx/sweep_down_b.wav"),
+    ("Braam (B)", "fx/braam_b.wav"),
+    ("Sub Boom (B)", "fx/sub_boom_b.wav"),
+    ("Glitch (B)", "fx/glitch_b.wav"),
+    ("Reverse Snare (B)", "fx/reverse_snare_b.wav"),
+];
+
+/// Non-melodic Bass entries — Bass Pluck/Slap Bass/Reese Bass/FM Bass are generated instead.
+const BASS_EXTRA_SAMPLES: &[FactorySampleEntry] = &[
+    ("Sub (Low)", "bass/sub_low.wav"),
+    ("Sub (Mid)", "bass/sub_mid.wav"),
+    ("Sub (High)", "bass/sub_high.wav"),
+    ("Sub Drop", "bass/sub_drop.wav"),
+    ("Bass Growl", "bass/bass_growl.wav"),
+    ("Sub (Low, B)", "bass/sub_low_b.wav"),
+    ("Sub (Mid, B)", "bass/sub_mid_b.wav"),
+    ("Sub (High, B)", "bass/sub_high_b.wav"),
+    ("Sub Drop (B)", "bass/sub_drop_b.wav"),
+    ("Bass Growl (B)", "bass/bass_growl_b.wav"),
+];
+
+/// The 20 melodic (pitched, one-shot-per-note) instruments across Mallet/Pluck/Orchestral/Bass:
+/// (category, file-name stem, display name). Each gets a root sample (no suffix) plus every
+/// `CHROMATIC_NOTE_SUFFIXES` note, generated below rather than hand-listed — hand-listing ~260
+/// near-identical entries is exactly how the "m7"/"M7" note collided on macOS's
+/// case-insensitive filesystem (both saved to the same path) without anyone noticing.
+const MELODIC_INSTRUMENTS: &[(&str, &str, &str)] = &[
+    ("Mallet", "marimba", "Marimba"),
+    ("Mallet", "xylophone", "Xylophone"),
+    ("Mallet", "kalimba", "Kalimba"),
+    ("Mallet", "glockenspiel", "Glockenspiel"),
+    ("Mallet", "vibraphone", "Vibraphone"),
+    ("Mallet", "steel_drum", "Steel Drum"),
+    ("Mallet", "celesta", "Celesta"),
+    ("Pluck", "guitar_pluck", "Guitar Pluck"),
+    ("Pluck", "harp_pluck", "Harp Pluck"),
+    ("Pluck", "koto", "Koto"),
+    ("Pluck", "music_box", "Music Box"),
+    ("Pluck", "nylon_pluck", "Nylon Pluck"),
+    ("Pluck", "banjo", "Banjo"),
+    ("Orchestral", "pizzicato", "Pizzicato"),
+    ("Orchestral", "brass_stab", "Brass Stab"),
+    ("Orchestral", "horn_hit", "Horn Hit"),
+    ("Bass", "bass_pluck", "Bass Pluck"),
+    ("Bass", "slap_bass", "Slap Bass"),
+    ("Bass", "reese_bass", "Reese Bass"),
+    ("Bass", "fm_bass", "FM Bass"),
+];
+
+/// A full 2-octave chromatic range around each melodic instrument's root (root itself has no
+/// suffix and isn't listed here): (file-name suffix, display label), low to high.
+const CHROMATIC_NOTE_SUFFIXES: &[(&str, &str)] = &[
+    ("low8ve", "-8ve"),
+    ("m2", "m2"),
+    ("2nd", "2nd"),
+    ("m3", "m3"),
+    ("3rd", "3rd"),
+    ("4th", "4th"),
+    ("tt", "TT"),
+    ("5th", "5th"),
+    ("m6", "m6"),
+    ("6th", "6th"),
+    ("min7", "m7"),
+    ("maj7", "M7"),
+    ("8ve", "8ve"),
+];
+
+/// Built once and cached: per-category factory sample lists, combining the hand-listed
+/// non-melodic categories above with generated note entries for every `MELODIC_INSTRUMENTS`
+/// instrument (see its doc comment for why those are generated rather than hand-listed).
+fn factory_drum_samples() -> &'static [(&'static str, Vec<(String, String)>)] {
+    static SAMPLES: std::sync::LazyLock<Vec<(&'static str, Vec<(String, String)>)>> =
+        std::sync::LazyLock::new(|| {
+            fn owned(entries: &[FactorySampleEntry]) -> Vec<(String, String)> {
+                entries.iter().map(|(label, path)| (label.to_string(), path.to_string())).collect()
+            }
+            let mut categories: Vec<(&'static str, Vec<(String, String)>)> = vec![
+                ("Kick", owned(KICK_SAMPLES)),
+                ("Snare", owned(SNARE_SAMPLES)),
+                ("Hat", owned(HAT_SAMPLES)),
+                ("Clap", owned(CLAP_SAMPLES)),
+                ("Tom", owned(TOM_SAMPLES)),
+                ("Cymbal", owned(CYMBAL_SAMPLES)),
+                ("Perc", owned(PERC_SAMPLES)),
+                ("Mallet", owned(MALLET_EXTRA_SAMPLES)),
+                ("Pluck", Vec::new()),
+                ("Orchestral", owned(ORCHESTRAL_EXTRA_SAMPLES)),
+                ("Chip FX", owned(CHIP_FX_SAMPLES)),
+                ("FX", owned(FX_SAMPLES)),
+                ("Bass", owned(BASS_EXTRA_SAMPLES)),
+            ];
+            for (category, stem, display) in MELODIC_INSTRUMENTS {
+                let folder = category.to_lowercase();
+                let entry = categories
+                    .iter_mut()
+                    .find(|(name, _)| name == category)
+                    .expect("MELODIC_INSTRUMENTS category must exist in `categories` above");
+                entry.1.push((display.to_string(), format!("{folder}/{stem}.wav")));
+                for (suffix, label) in CHROMATIC_NOTE_SUFFIXES {
+                    entry.1.push((format!("{display} ({label})"), format!("{folder}/{stem}_{suffix}.wav")));
+                }
+            }
+            categories
+        });
+    &SAMPLES
+}
 
 fn factory_samples_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/samples")
@@ -5222,6 +5235,10 @@ fn preload_demo_samples(song: &Arc<Mutex<Song>>, sample_rate: u32) {
         (9, "tom/tom_high.wav"),     // High Tom
         (10, "cymbal/ride.wav"),     // Ride
         (11, "perc/cowbell.wav"),    // Cowbell
+        (12, "perc/shaker.wav"),     // Shaker
+        (13, "perc/tambourine.wav"), // Tambourine
+        (14, "perc/woodblock.wav"),  // Woodblock
+        (15, "perc/triangle.wav"),   // Triangle
     ];
     for (lane_index, filename) in lane_samples {
         if let Some(lane) = lanes.get_mut(lane_index) {
@@ -11978,10 +11995,10 @@ fn lane_sample_controls(ui: &mut egui::Ui, lane: &mut Lane, sample_rate: Option<
     let can_load = sample_rate.is_some();
     if can_load {
         ui.menu_button("🥁", |ui| {
-            for (category, sounds) in FACTORY_DRUM_SAMPLES {
+            for (category, sounds) in factory_drum_samples() {
                 ui.menu_button(*category, |ui| {
-                    for (label, filename) in *sounds {
-                        if ui.button(*label).clicked() {
+                    for (label, filename) in sounds {
+                        if ui.button(label).clicked() {
                             lane.sample_path =
                                 factory_samples_dir().join(filename).display().to_string();
                             if let Some(rate) = sample_rate {
