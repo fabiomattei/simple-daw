@@ -2,7 +2,7 @@
 
 A native Rust MIDI sequencer / groovebox for composing video game music — not a general-purpose DAW.
 
-Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three built-in synth engines, sample playback, a Playlist/arrangement timeline, WAV bounce, MIDI import, JSON song persistence, CLAP effect hosting, and composition tools (quantize/humanize/groove templates, tap tempo, audio tempo detection, and a tempo-map "Smart Tempo").
+Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three built-in synth engines, sample playback, a Playlist/arrangement timeline, WAV bounce, MIDI import, JSON song persistence, CLAP effect hosting, composition tools (quantize/humanize/groove templates, tap tempo, audio tempo detection, and a tempo-map "Smart Tempo"), and non-destructive audio-clip editing (trim/fades, transient detection/Strip Silence, take-folder comping, and WSOLA-based time-stretch/Flex Time/Flex Pitch).
 
 ## Features
 
@@ -11,7 +11,11 @@ Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three bu
 - **Three synth engines, selectable per track** — `Simple` (the original sine-family oscillator + exponential-decay envelope, percussive only), `Trine` (multi-oscillator with a filter/mod matrix), and `Wave` (two wavetable oscillators with position-morph and phase-warp, on the same filter/mod-matrix machinery as `Trine`). A library of built-in factory presets ships for all three.
 - **Playlist / arrangement** — each track owns its own independently positioned `Region`s (step-grid or piano-roll content, Logic/Ableton-style — not a shared FL Studio–style pattern), dragged and resized along a shared song timeline.
 - **Sample playback** — WAV one-shots via a per-track 32-voice sample player pool, resampled to the output device's rate at load time.
-- **Audio tracks** — record live input straight to a WAV file and drop it on the timeline as a clip, or import an existing WAV the same way.
+- **Audio tracks** — record live input straight to a WAV file and drop it on the timeline as a clip, or import an existing WAV the same way. Recordings made from the same playhead position group into a "Take Folder" instead of piling up as overlapping clips (see **Take Folder comping** below).
+- **Non-destructive clip trim and fades** — drag a clip's edges in the Playlist to trim its head/tail or set a fade in/out, without touching the source file.
+- **Transient detection and Strip Silence** — a clip's waveform shows detected attacks as tick marks; right-click a clip and choose "Strip Silence" to split it into separate clips around the silent gaps, each still anchored to its original position in time.
+- **Take Folder comping** — right-click a Take Folder to pick which whole take is heard, or double-click it to open the comp editor and drag across different takes' lanes to build a composite from pieces of each ("quick-swipe" comping).
+- **Flex Time and Flex Pitch (time-stretch)** — right-click a clip → "Flex Time / Pitch…" for a hand-rolled, pitch-preserving time-stretch (WSOLA): drag warp points snapped to detected transients to stretch/compress the audio around them, or switch to the Pitch tab to drag a detected note to retarget its pitch. No external DSP library — verified for correct duration/pitch in tests, but not by ear, so listen before trusting it on anything you care about.
 - **MIDI import** — load a standard `.mid` file into a track's piano roll.
 - **Song persistence** — save/load the whole song (tracks, regions, sample paths, loaded effect paths and parameter values) to/from a JSON file via the File menu.
 - **WAV export** — bounce the song to a file for a configurable number of loops; export uses the exact same sequencing/mixing code as live playback (dry only — effects, sends, submixes, and automation aren't included in the bounce, only each track's Volume/Pan and the raw synth/sample/step sequencing).
@@ -86,6 +90,9 @@ Unit tests cover synth/DSP math and the WAV exporter, but can't prove the live a
 - `src/groove.rs` — quantize/humanize/groove-template transforms for piano-roll notes and step-grid lanes.
 - `src/tempo.rs` — tap-tempo BPM averaging.
 - `src/tempo_detection.rs` — estimates a WAV file's BPM from its audio content.
+- `src/transient_detection.rs` — attack/onset detection and silence-gate segmentation, behind a clip's transient markers and "Strip Silence".
+- `src/stretch.rs` — WSOLA time-stretch, behind Flex Time.
+- `src/pitch.rs` — pitch detection and pitch-shifting, behind Flex Pitch.
 
 ## License
 
