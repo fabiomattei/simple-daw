@@ -2116,7 +2116,15 @@ impl Track {
         let name = name.into();
         for region in &mut self.regions {
             if let RegionContent::StepGrid(lanes) = &mut region.content {
-                lanes.push(Lane::new(name.clone(), pitch, region.content_length_steps));
+                // Match an existing lane's actual step count rather than trusting
+                // `content_length_steps`, which can drift from it (e.g. song files saved by an
+                // older version) — a new lane would otherwise render with fewer step buttons than
+                // its siblings.
+                let length_steps = lanes
+                    .first()
+                    .map(|lane| lane.steps.len())
+                    .unwrap_or(region.content_length_steps);
+                lanes.push(Lane::new(name.clone(), pitch, length_steps));
             }
         }
     }

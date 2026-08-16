@@ -87,14 +87,10 @@ impl CompressorEffect {
         (-1.0 / (time_ms.max(0.1) / 1000.0 * sample_rate)).exp()
     }
 
-    pub(super) fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
-        self.process_with_sidechain(l, r, None);
-    }
-
-    /// Same as `process`, but drives the envelope follower from `sidechain`'s rectified signal
-    /// (a key input, e.g. another track routed in for ducking) instead of `l`/`r`'s own — the
-    /// gain computed off that key is still applied to `l`/`r` themselves. `None` behaves exactly
-    /// like `process` (envelope follows the compressor's own input, as before sidechain existed).
+    /// Drives the envelope follower from `sidechain`'s rectified signal (a key input, e.g.
+    /// another track routed in for ducking) instead of `l`/`r`'s own — the gain computed off
+    /// that key is still applied to `l`/`r` themselves. `None` follows the compressor's own
+    /// input, as before sidechain existed.
     pub(super) fn process_with_sidechain(
         &mut self,
         l: &mut [f32],
@@ -129,7 +125,7 @@ mod tests {
         // envelope follower to settle so the measured gain reduction is steady-state.
         let mut l = vec![0.5f32; 4000];
         let mut r = vec![0.5f32; 4000];
-        compressor.process(&mut l, &mut r);
+        compressor.process_with_sidechain(&mut l, &mut r, None);
         let settled = l[3000];
         assert!(
             settled < 0.5,

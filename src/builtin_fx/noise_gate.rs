@@ -92,13 +92,9 @@ impl NoiseGateEffect {
         (-1.0 / (time_ms.max(0.1) / 1000.0 * sample_rate)).exp()
     }
 
-    pub(super) fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
-        self.process_with_sidechain(l, r, None);
-    }
-
-    /// Same as `process`, but the gate opens/closes off `sidechain`'s envelope (a key input)
-    /// rather than `l`/`r`'s own — e.g. gating a pad open only while a rhythm track is playing.
-    /// `None` behaves exactly like `process`.
+    /// The gate opens/closes off `sidechain`'s envelope (a key input) rather than `l`/`r`'s own
+    /// — e.g. gating a pad open only while a rhythm track is playing. `None` follows the gate's
+    /// own input, as before sidechain existed.
     pub(super) fn process_with_sidechain(
         &mut self,
         l: &mut [f32],
@@ -141,7 +137,7 @@ mod tests {
         let mut quiet_gate = NoiseGateEffect::new(-20.0, 1.0, 20.0, -60.0, sample_rate);
         let mut quiet_l = vec![0.01f32; 4000]; // well below -20dB threshold
         let mut quiet_r = quiet_l.clone();
-        quiet_gate.process(&mut quiet_l, &mut quiet_r);
+        quiet_gate.process_with_sidechain(&mut quiet_l, &mut quiet_r, None);
         assert!(
             quiet_l[3000].abs() < 0.01,
             "expected the gate to attenuate a signal below threshold, got {}",
@@ -151,7 +147,7 @@ mod tests {
         let mut loud_gate = NoiseGateEffect::new(-20.0, 1.0, 20.0, -60.0, sample_rate);
         let mut loud_l = vec![0.5f32; 4000]; // well above -20dB threshold
         let mut loud_r = loud_l.clone();
-        loud_gate.process(&mut loud_l, &mut loud_r);
+        loud_gate.process_with_sidechain(&mut loud_l, &mut loud_r, None);
         assert!(
             loud_l[3000] > 0.45,
             "expected the gate to pass a signal above threshold mostly unchanged, got {}",

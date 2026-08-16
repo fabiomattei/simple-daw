@@ -1579,7 +1579,7 @@ fn mixer_send_strip_ui(
                     fx_chain_ui(ui, fx);
                 });
                 ui.add_space(4.0);
-                if ui.small_button("✕ Remove").clicked() {
+                if ui.small_button("🗑 Remove").clicked() {
                     *remove_requested = Some(send_index);
                 }
             });
@@ -1669,7 +1669,7 @@ fn mixer_submix_strip_ui(
                 ui.label(egui::RichText::new(format!("{:.2}", submix.volume)).small());
 
                 ui.add_space(4.0);
-                if ui.small_button("✕ Remove").clicked() {
+                if ui.small_button("🗑 Remove").clicked() {
                     *remove_requested = Some(submix_index);
                 }
             });
@@ -4193,7 +4193,7 @@ fn trine_matrix_ui(ui: &mut egui::Ui, trine: &mut TrineParams) {
                     }
                 });
             ui.add(egui::Slider::new(&mut slot.amount, -1.0..=1.0).text("Amount"));
-            if ui.button("✕").clicked() {
+            if ui.button("🗑").on_hover_text("Remove this mod slot").clicked() {
                 to_remove = Some(index);
             }
         });
@@ -4710,7 +4710,7 @@ fn wave_matrix_ui(ui: &mut egui::Ui, wave: &mut WaveParams) {
                     }
                 });
             ui.add(egui::Slider::new(&mut slot.amount, -1.0..=1.0).text("Amount"));
-            if ui.button("✕").clicked() {
+            if ui.button("🗑").on_hover_text("Remove this mod slot").clicked() {
                 to_remove = Some(index);
             }
         });
@@ -6873,7 +6873,7 @@ impl eframe::App for SimpleDawApp {
                                 )
                                 .on_hover_text(plugin.path.as_str());
                                 if ui
-                                    .small_button("✕")
+                                    .small_button("🗑")
                                     .on_hover_text("Remove from the project plugin list")
                                     .clicked()
                                 {
@@ -7803,7 +7803,7 @@ struct TrackFxUi<'a> {
     /// Set by channel_rack_row_ui's "🎹" button to open that track's synth-settings window.
     /// Unused (and meaningless) for the master bus, which has no synth.
     synth_editor: &'a mut Option<usize>,
-    /// Set by channel_rack_row_ui's "✕" button; applied by the caller after the track loop ends
+    /// Set by channel_rack_row_ui's "🗑" button; applied by the caller after the track loop ends
     /// (can't remove from `song.tracks` mid-iteration since it's borrowed via `iter_mut`). Unused
     /// for the master bus, which can't be deleted.
     remove_requested: &'a mut Option<usize>,
@@ -7947,7 +7947,7 @@ fn channel_rack_row_ui(
                     ));
                 }
                 if ui
-                    .small_button("⤓")
+                    .small_button("💾")
                     .on_hover_text(
                         "Bounce in place: permanently replace this track's content with baked audio",
                     )
@@ -8010,7 +8010,7 @@ fn channel_rack_row_ui(
                     fx_chain_ui(ui, fx);
                 });
                 if ui
-                    .small_button("✕")
+                    .small_button("🗑")
                     .on_hover_text("Delete this track")
                     .clicked()
                 {
@@ -8115,7 +8115,7 @@ fn step_grid_lane_groove_menu_ui(
 /// A step-grid pattern's lanes: each lane's name, sample-load controls, and step buttons — the
 /// Beats window's contents (see `beats_contents_ui`), extracted so the row layout is defined in
 /// one place.
-/// Draws every lane's row and returns the index of a lane the user clicked "✕" on, if any —
+/// Draws every lane's row and returns the index of a lane the user clicked "🗑" on, if any —
 /// the caller applies the removal via `Song::remove_lane` so it stays in sync across patterns.
 fn step_grid_lanes_ui(
     ui: &mut egui::Ui,
@@ -8137,7 +8137,7 @@ fn step_grid_lanes_ui(
                     .desired_width(64.0)
                     .font(egui::TextStyle::Small),
             );
-            if ui.small_button("✕").on_hover_text("Remove lane").clicked() {
+            if ui.small_button("🗑").on_hover_text("Remove lane").clicked() {
                 remove_lane = Some(lane_index);
             }
             ui.add(egui::DragValue::new(&mut lane.pitch).range(0..=127))
@@ -8535,7 +8535,7 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
                 ui.colored_label(color, message);
             }
             if ui
-                .small_button("✕")
+                .small_button("🗑")
                 .on_hover_text("Remove this effect from the chain")
                 .clicked()
             {
@@ -9571,7 +9571,7 @@ fn tempo_track_ui(ui: &mut egui::Ui, song: &mut Song, current_tick: Option<usize
         ui.horizontal(|ui| {
             ui.label(format!("Tick {}", point.tick));
             ui.add(egui::DragValue::new(&mut point.bpm).range(20.0..=300.0).suffix(" BPM"));
-            if ui.small_button("✕").on_hover_text("Remove this tempo change").clicked() {
+            if ui.small_button("🗑").on_hover_text("Remove this tempo change").clicked() {
                 remove_index = Some(index);
             }
         });
@@ -11947,7 +11947,7 @@ fn automation_lanes_ui(
         );
         ui.horizontal(|ui| {
             ui.label(&label);
-            if ui.small_button("✕").on_hover_text("Remove lane").clicked() {
+            if ui.small_button("🗑").on_hover_text("Remove lane").clicked() {
                 lane_to_remove = Some(lane_index);
             }
         });
@@ -12037,7 +12037,7 @@ fn lane_sample_controls(ui: &mut egui::Ui, lane: &mut Lane, sample_rate: Option<
         ui.colored_label(egui::Color32::from_rgb(120, 220, 140), "●")
             .on_hover_text("Sample loaded");
         if ui
-            .small_button("✕")
+            .small_button("🗑")
             .on_hover_text("Remove sample, use synth")
             .clicked()
         {
