@@ -7706,7 +7706,7 @@ impl eframe::App for SimpleDawApp {
                 egui::ViewportId::from_hash_of("beats_viewport"),
                 egui::ViewportBuilder::default()
                     .with_title("Beats")
-                    .with_inner_size(egui::vec2(700.0, 400.0)),
+                    .with_inner_size(egui::vec2(1000.0, 650.0)),
                 |ui, _class| {
                     egui::CentralPanel::default()
                         .frame(beats_frame())
@@ -11994,7 +11994,7 @@ fn lane_sample_controls(ui: &mut egui::Ui, lane: &mut Lane, sample_rate: Option<
 
     let can_load = sample_rate.is_some();
     if can_load {
-        ui.menu_button("🥁", |ui| {
+        ui.menu_button("🎵", |ui| {
             for (category, sounds) in factory_drum_samples() {
                 ui.menu_button(*category, |ui| {
                     for (label, filename) in sounds {
@@ -12033,18 +12033,28 @@ fn lane_sample_controls(ui: &mut egui::Ui, lane: &mut Lane, sample_rate: Option<
         }
     }
 
-    if lane.sample.is_some() {
-        ui.colored_label(egui::Color32::from_rgb(120, 220, 140), "●")
-            .on_hover_text("Sample loaded");
-        if ui
-            .small_button("🗑")
-            .on_hover_text("Remove sample, use synth")
-            .clicked()
-        {
-            lane.clear_sample();
-        }
-    } else if let Some(err) = &lane.sample_error {
-        ui.colored_label(egui::Color32::RED, "●").on_hover_text(err);
+    // Always reserve space for the status dot and the remove-sample button, even when neither
+    // applies yet (a freshly added lane has no sample and no error) — otherwise this row's step
+    // buttons end up shifted left relative to every other lane's row.
+    let status_color = if lane.sample.is_some() {
+        egui::Color32::from_rgb(120, 220, 140)
+    } else if lane.sample_error.is_some() {
+        egui::Color32::RED
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let status_dot = ui.colored_label(status_color, "⏺");
+    if let Some(err) = &lane.sample_error {
+        status_dot.on_hover_text(err);
+    } else if lane.sample.is_some() {
+        status_dot.on_hover_text("Sample loaded");
+    }
+    if ui
+        .add_enabled(lane.sample.is_some(), egui::Button::new("🗑").small())
+        .on_hover_text("Remove sample, use synth")
+        .clicked()
+    {
+        lane.clear_sample();
     }
 }
 

@@ -150,6 +150,23 @@ th {
   border-left-color: var(--accent-orange);
 }
 
+figure.screenshot {
+  margin: 1.4em 0;
+}
+
+figure.screenshot img {
+  display: block;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+figure.screenshot figcaption {
+  color: var(--text-weak);
+  font-size: 0.85rem;
+  margin-top: 8px;
+}
+
 .card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
