@@ -4891,6 +4891,8 @@ const FACTORY_DRUM_SAMPLES: &[(&str, &[(&str, &str)])] = &[
             ("Kick (Punchy)", "kick/kick_punchy.wav"),
             ("Kick (Distorted)", "kick/kick_distorted.wav"),
             ("Kick (Lo-Fi)", "kick/kick_lofi.wav"),
+            ("Kick (Boom)", "kick/kick_boom.wav"),
+            ("Kick (Click)", "kick/kick_click.wav"),
         ],
     ),
     (
@@ -4902,6 +4904,7 @@ const FACTORY_DRUM_SAMPLES: &[(&str, &[(&str, &str)])] = &[
             ("Snare (Rimshot)", "snare/snare_rimshot.wav"),
             ("Snare (Lo-Fi)", "snare/snare_lofi.wav"),
             ("Snare (808)", "snare/snare_808.wav"),
+            ("Snare (Cross-stick)", "snare/snare_crossstick.wav"),
         ],
     ),
     (
@@ -4912,6 +4915,7 @@ const FACTORY_DRUM_SAMPLES: &[(&str, &[(&str, &str)])] = &[
             ("Pedal Hat", "hat/hat_pedal.wav"),
             ("Tight Hat", "hat/hat_tight.wav"),
             ("Metallic Hat", "hat/hat_metallic.wav"),
+            ("Sizzle Hat", "hat/hat_sizzle.wav"),
         ],
     ),
     (
@@ -4942,6 +4946,8 @@ const FACTORY_DRUM_SAMPLES: &[(&str, &[(&str, &str)])] = &[
             ("China", "cymbal/china.wav"),
             ("Bell", "cymbal/bell.wav"),
             ("Crash (Reverse)", "cymbal/crash_reverse.wav"),
+            ("Crash 2", "cymbal/crash_2.wav"),
+            ("Sizzle", "cymbal/sizzle.wav"),
         ],
     ),
     (
@@ -4959,6 +4965,22 @@ const FACTORY_DRUM_SAMPLES: &[(&str, &[(&str, &str)])] = &[
             ("Bongo (Low)", "perc/bongo_low.wav"),
             ("Clave", "perc/clave.wav"),
             ("Triangle", "perc/triangle.wav"),
+            ("Timbale (High)", "perc/timbale_high.wav"),
+            ("Timbale (Low)", "perc/timbale_low.wav"),
+            ("Agogo (High)", "perc/agogo_high.wav"),
+            ("Agogo (Low)", "perc/agogo_low.wav"),
+            ("Castanet", "perc/castanet.wav"),
+        ],
+    ),
+    (
+        "Mallet",
+        &[
+            ("Marimba", "mallet/marimba.wav"),
+            ("Xylophone", "mallet/xylophone.wav"),
+            ("Kalimba", "mallet/kalimba.wav"),
+            ("Glockenspiel", "mallet/glockenspiel.wav"),
+            ("Vibraphone", "mallet/vibraphone.wav"),
+            ("Steel Drum", "mallet/steel_drum.wav"),
         ],
     ),
     (
@@ -4972,6 +4994,25 @@ const FACTORY_DRUM_SAMPLES: &[(&str, &[(&str, &str)])] = &[
             ("Explosion", "chip/explosion.wav"),
             ("Hurt", "chip/hurt.wav"),
             ("Select", "chip/select.wav"),
+            ("Level Up", "chip/level_up.wav"),
+            ("Game Over", "chip/game_over.wav"),
+            ("Checkpoint", "chip/checkpoint.wav"),
+            ("Footstep", "chip/footstep.wav"),
+            ("Menu Back", "chip/menu_back.wav"),
+            ("Error", "chip/error.wav"),
+            ("1-Up", "chip/one_up.wav"),
+            ("Countdown", "chip/countdown.wav"),
+        ],
+    ),
+    (
+        "FX",
+        &[
+            ("Riser", "fx/riser.wav"),
+            ("Downlifter", "fx/downlifter.wav"),
+            ("Impact", "fx/impact.wav"),
+            ("Whoosh", "fx/whoosh.wav"),
+            ("Sweep Up", "fx/sweep_up.wav"),
+            ("Sweep Down", "fx/sweep_down.wav"),
         ],
     ),
     (
@@ -4979,7 +5020,10 @@ const FACTORY_DRUM_SAMPLES: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Sub (Low)", "bass/sub_low.wav"),
             ("Sub (Mid)", "bass/sub_mid.wav"),
+            ("Sub (High)", "bass/sub_high.wav"),
             ("Sub Drop", "bass/sub_drop.wav"),
+            ("Bass Pluck", "bass/bass_pluck.wav"),
+            ("Bass Growl", "bass/bass_growl.wav"),
         ],
     ),
 ];
