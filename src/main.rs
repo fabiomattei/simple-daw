@@ -4876,10 +4876,123 @@ fn wave_envelopes_ui(ui: &mut egui::Ui, wave: &mut WaveParams) {
     );
 }
 
-/// Points the demo song's drum lanes at the bundled placeholder one-shots,
-/// so opening the app for the first time plays real samples, not just the synth.
+/// Bundled one-shot drum samples (`assets/samples/<category>/<file>.wav`), organized into
+/// categories the same way FL Studio's browser groups its own factory one-shots — offered
+/// from any step-grid lane's "🥁" menu (`lane_sample_controls`) as category submenus, and
+/// used to seed the demo song's drum lanes below.
+const FACTORY_DRUM_SAMPLES: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Kick",
+        &[
+            ("Kick", "kick/kick.wav"),
+            ("Kick (Tight)", "kick/kick_tight.wav"),
+            ("Kick (808)", "kick/kick_808.wav"),
+            ("Kick (Sub)", "kick/kick_sub.wav"),
+            ("Kick (Punchy)", "kick/kick_punchy.wav"),
+            ("Kick (Distorted)", "kick/kick_distorted.wav"),
+            ("Kick (Lo-Fi)", "kick/kick_lofi.wav"),
+        ],
+    ),
+    (
+        "Snare",
+        &[
+            ("Snare", "snare/snare.wav"),
+            ("Snare (Tight)", "snare/snare_tight.wav"),
+            ("Snare (Fat)", "snare/snare_fat.wav"),
+            ("Snare (Rimshot)", "snare/snare_rimshot.wav"),
+            ("Snare (Lo-Fi)", "snare/snare_lofi.wav"),
+            ("Snare (808)", "snare/snare_808.wav"),
+        ],
+    ),
+    (
+        "Hat",
+        &[
+            ("Closed Hat", "hat/hat_closed.wav"),
+            ("Open Hat", "hat/hat_open.wav"),
+            ("Pedal Hat", "hat/hat_pedal.wav"),
+            ("Tight Hat", "hat/hat_tight.wav"),
+            ("Metallic Hat", "hat/hat_metallic.wav"),
+        ],
+    ),
+    (
+        "Clap",
+        &[
+            ("Clap", "clap/clap.wav"),
+            ("Clap (Tight)", "clap/clap_tight.wav"),
+            ("Clap (808)", "clap/clap_808.wav"),
+            ("Clap (Wide)", "clap/clap_wide.wav"),
+        ],
+    ),
+    (
+        "Tom",
+        &[
+            ("Low Tom", "tom/tom_low.wav"),
+            ("Mid Tom", "tom/tom_mid.wav"),
+            ("High Tom", "tom/tom_high.wav"),
+            ("Floor Tom", "tom/tom_floor.wav"),
+            ("Synth Tom", "tom/tom_synth.wav"),
+        ],
+    ),
+    (
+        "Cymbal",
+        &[
+            ("Crash", "cymbal/crash.wav"),
+            ("Ride", "cymbal/ride.wav"),
+            ("Splash", "cymbal/splash.wav"),
+            ("China", "cymbal/china.wav"),
+            ("Bell", "cymbal/bell.wav"),
+            ("Crash (Reverse)", "cymbal/crash_reverse.wav"),
+        ],
+    ),
+    (
+        "Perc",
+        &[
+            ("Rim", "perc/rim.wav"),
+            ("Cowbell", "perc/cowbell.wav"),
+            ("Shaker", "perc/shaker.wav"),
+            ("Tambourine", "perc/tambourine.wav"),
+            ("Snap", "perc/snap.wav"),
+            ("Woodblock", "perc/woodblock.wav"),
+            ("Conga (High)", "perc/conga_high.wav"),
+            ("Conga (Low)", "perc/conga_low.wav"),
+            ("Bongo (High)", "perc/bongo_high.wav"),
+            ("Bongo (Low)", "perc/bongo_low.wav"),
+            ("Clave", "perc/clave.wav"),
+            ("Triangle", "perc/triangle.wav"),
+        ],
+    ),
+    (
+        "Chip FX",
+        &[
+            ("Coin", "chip/coin.wav"),
+            ("Jump", "chip/jump.wav"),
+            ("Laser", "chip/laser.wav"),
+            ("Powerup", "chip/powerup.wav"),
+            ("Blip", "chip/blip.wav"),
+            ("Explosion", "chip/explosion.wav"),
+            ("Hurt", "chip/hurt.wav"),
+            ("Select", "chip/select.wav"),
+        ],
+    ),
+    (
+        "Bass",
+        &[
+            ("Sub (Low)", "bass/sub_low.wav"),
+            ("Sub (Mid)", "bass/sub_mid.wav"),
+            ("Sub Drop", "bass/sub_drop.wav"),
+        ],
+    ),
+];
+
+fn factory_samples_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/samples")
+}
+
+/// Points the demo song's drum lanes at the bundled placeholder one-shots (matching the lane
+/// names `Song::demo()` sets up, in order), so opening the app for the first time plays real
+/// samples, not just the synth.
 fn preload_demo_samples(song: &Arc<Mutex<Song>>, sample_rate: u32) {
-    let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/samples");
+    let assets = factory_samples_dir();
     let mut song = song.lock().unwrap();
     let Some(drums_index) = song.tracks.iter().position(|t| t.name == "Drums") else {
         return;
@@ -4890,7 +5003,21 @@ fn preload_demo_samples(song: &Arc<Mutex<Song>>, sample_rate: u32) {
     let RegionContent::StepGrid(lanes) = &mut region.content else {
         return;
     };
-    for (lane_index, filename) in [(0, "kick.wav"), (1, "snare.wav"), (2, "hat.wav")] {
+    let lane_samples = [
+        (0, "kick/kick.wav"),        // Kick
+        (1, "snare/snare.wav"),      // Snare
+        (2, "hat/hat_closed.wav"),   // Closed Hat
+        (3, "hat/hat_open.wav"),     // Open Hat
+        (4, "clap/clap.wav"),        // Clap
+        (5, "perc/rim.wav"),         // Rim
+        (6, "tom/tom_low.wav"),      // Low Tom
+        (7, "cymbal/crash.wav"),     // Crash
+        (8, "tom/tom_mid.wav"),      // Mid Tom
+        (9, "tom/tom_high.wav"),     // High Tom
+        (10, "cymbal/ride.wav"),     // Ride
+        (11, "perc/cowbell.wav"),    // Cowbell
+    ];
+    for (lane_index, filename) in lane_samples {
         if let Some(lane) = lanes.get_mut(lane_index) {
             lane.sample_path = assets.join(filename).display().to_string();
             lane.load_sample(sample_rate);
@@ -11643,6 +11770,26 @@ fn lane_sample_controls(ui: &mut egui::Ui, lane: &mut Lane, sample_rate: Option<
     );
 
     let can_load = sample_rate.is_some();
+    if can_load {
+        ui.menu_button("🥁", |ui| {
+            for (category, sounds) in FACTORY_DRUM_SAMPLES {
+                ui.menu_button(*category, |ui| {
+                    for (label, filename) in *sounds {
+                        if ui.button(*label).clicked() {
+                            lane.sample_path =
+                                factory_samples_dir().join(filename).display().to_string();
+                            if let Some(rate) = sample_rate {
+                                lane.load_sample(rate);
+                            }
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        })
+        .response
+        .on_hover_text("Load a built-in drum sample");
+    }
     if ui
         .add_enabled(can_load, egui::Button::new("Browse"))
         .clicked()
