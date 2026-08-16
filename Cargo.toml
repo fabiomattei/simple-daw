@@ -5,13 +5,31 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-clack-extensions = { version = "0.1.1", features = ["audio-ports", "params", "gui", "clack-host"] }
+clack-extensions = { version = "0.1.1", features = ["audio-ports", "params", "gui", "clack-host", "raw-window-handle_06"] }
 clack-host = "0.1.1"
 cpal = "0.18.1"
 eframe = "0.35.0"
 egui = "0.35.0"
 hound = "3.5.1"
 midly = { version = "0.5.3", default-features = false, features = ["std"] }
+# Needed to hand our own app window to CLAP's GUI-embedding API (src/gui_embed) — version pinned
+# to what eframe/winit already resolve, so this doesn't pull in a second copy.
+raw-window-handle = "0.6"
 rfd = "0.17.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Native container-view creation for embedded CLAP plugin GUIs (src/gui_embed) — CLAP's embedding
+# protocol has no "position within parent" call, so the host must own a small positionable native
+# view/window to parent the plugin into. All three are already resolved transitively via
+# eframe/winit at these same versions, so this shouldn't add a second compiled copy of any of them.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSView"] }
+objc2-foundation = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11rb = "0.13"

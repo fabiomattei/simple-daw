@@ -645,6 +645,7 @@ dependencies = [
  "clack-common",
  "clack-host",
  "clap-sys",
+ "raw-window-handle",
 ]
 
 [[package]]
@@ -3019,9 +3020,15 @@ dependencies = [
  "egui",
  "hound",
  "midly",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
+ "windows",
+ "x11rb",
 ]
 
 [[package]]

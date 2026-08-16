@@ -1912,41 +1912,77 @@ impl WaveVoice {
     }
 }
 
-/// Plays back a pre-resampled one-shot sample from start to end.
+/// Plays back a pre-resampled one-shot sample from `start_position` to `end_position` (exclusive),
+/// with optional linear fade-in/fade-out ramps at the edges — the frame-domain counterpart of
+/// `Region::fade_gain_at`, but evaluated per sample rather than per tick since a clip's playback
+/// position isn't tick-quantized.
 #[derive(Clone, Default)]
 struct SampleVoice {
     buffer: Option<Arc<SampleBuffer>>,
     position: usize,
+    start_position: usize,
+    end_position: usize,
     gain: f32,
+    fade_in_frames: usize,
+    fade_out_frames: usize,
 }
 
 impl SampleVoice {
+    /// Plays `buffer` in full, from its own start to its own end, with no fades — used for
+    /// velocity-triggered one-shot samples (drum-lane steps), not `AudioClip` playback (see
+    /// `trigger_clip`).
     fn trigger(&mut self, buffer: Arc<SampleBuffer>, velocity: u8) {
-        self.trigger_with_gain(buffer, (velocity as f32 / 127.0).clamp(0.0, 1.0));
+        let gain = (velocity as f32 / 127.0).clamp(0.0, 1.0);
+        self.trigger_clip(buffer, gain, 0, usize::MAX, 0, 0);
     }
 
-    /// Same as `trigger`, but with a continuous gain instead of a 0..127 velocity byte — used for
-    /// `AudioClip` playback (see `model::AudioClip::gain`), which isn't velocity-triggered.
-    fn trigger_with_gain(&mut self, buffer: Arc<SampleBuffer>, gain: f32) {
+    /// Same as `trigger`, but for `AudioClip` playback (see `model::AudioClip`): a continuous gain
+    /// instead of a 0..127 velocity byte, plus a trim window (`start_frame..end_frame`, clamped to
+    /// the buffer's own length) and fade-in/out ramp lengths in frames — both converted from the
+    /// clip's tick-domain fields by the caller (`Sequencer::process`), since only that call site
+    /// knows the tempo in effect at the clip's start tick.
+    fn trigger_clip(
+        &mut self,
+        buffer: Arc<SampleBuffer>,
+        gain: f32,
+        start_frame: usize,
+        end_frame: usize,
+        fade_in_frames: usize,
+        fade_out_frames: usize,
+    ) {
+        let len = buffer.mono.len();
+        self.start_position = start_frame.min(len);
+        self.position = self.start_position;
+        self.end_position = end_frame.min(len);
         self.buffer = Some(buffer);
-        self.position = 0;
         self.gain = gain;
+        self.fade_in_frames = fade_in_frames;
+        self.fade_out_frames = fade_out_frames;
     }
 
     fn next_sample(&mut self) -> f32 {
+        if self.position >= self.end_position {
+            self.buffer = None;
+            return 0.0;
+        }
         let Some(buffer) = &self.buffer else {
             return 0.0;
         };
-        match buffer.mono.get(self.position) {
-            Some(&s) => {
-                self.position += 1;
-                s * self.gain
-            }
-            None => {
-                self.buffer = None;
-                0.0
-            }
+        let Some(&s) = buffer.mono.get(self.position) else {
+            self.buffer = None;
+            return 0.0;
+        };
+        let elapsed = self.position - self.start_position;
+        let remaining = self.end_position - self.position;
+        let mut fade = 1.0f32;
+        if self.fade_in_frames > 0 {
+            fade = fade.min((elapsed as f32 / self.fade_in_frames as f32).clamp(0.0, 1.0));
         }
+        if self.fade_out_frames > 0 {
+            fade = fade.min((remaining as f32 / self.fade_out_frames as f32).clamp(0.0, 1.0));
+        }
+        self.position += 1;
+        s * self.gain * fade
     }
 }
 
@@ -2020,21 +2056,21 @@ pub(crate) fn arrangement_length_ticks(song: &Song) -> usize {
         .max()
         .unwrap_or(0);
 
-    // An audio clip has no stored length (see `model::AudioClip`) — its duration is however long
-    // its decoded buffer is, in real seconds, converted to ticks at the tempo in effect where the
-    // clip starts (see `Song::bpm_at`) so a recording never gets truncated by the arrangement
-    // looping underneath it. If a tempo change lands partway through the clip, its tick length is
-    // still computed at its own starting tempo throughout — a documented approximation, the same
-    // kind `render_song_to_wav`'s per-chunk-not-per-sample tempo resolution already accepts.
+    // An untrimmed audio clip's duration is however long its decoded buffer is, in real seconds,
+    // converted to ticks at the tempo in effect where the clip starts (see `Song::bpm_at`) so a
+    // recording never gets truncated by the arrangement looping underneath it — a trimmed clip
+    // uses its own stored `length_ticks` instead (see `AudioClip::effective_length_ticks`). If a
+    // tempo change lands partway through the clip, its tick length is still computed at its own
+    // starting tempo throughout — a documented approximation, the same kind
+    // `render_song_to_wav`'s per-chunk-not-per-sample tempo resolution already accepts.
     let audio_end = song
         .tracks
         .iter()
         .flat_map(|track| track.audio_clips.iter())
         .filter_map(|clip| {
-            let buffer = clip.buffer.as_ref()?;
-            let duration_seconds = buffer.mono.len() as f64 / buffer.sample_rate.max(1) as f64;
+            clip.buffer.as_ref()?;
             let duration_ticks =
-                (duration_seconds * ticks_per_second(song.bpm_at(clip.start_tick))).ceil() as usize;
+                clip.effective_length_ticks(ticks_per_second(song.bpm_at(clip.start_tick)));
             Some(clip.start_tick + duration_ticks)
         })
         .max()
@@ -2379,8 +2415,29 @@ impl Sequencer {
                             continue;
                         }
                         let Some(buffer) = &clip.buffer else { continue };
-                        tv.sample_voices[tv.next_sample_voice]
-                            .trigger_with_gain(buffer.clone(), clip.gain);
+                        // Trim/fade are stored in ticks (source-offset excepted — see
+                        // `model::AudioClip`) and converted to frames here, at the tempo in effect
+                        // where the clip starts, matching `arrangement_length_ticks`'s and
+                        // `effective_length_ticks`'s own documented approximation.
+                        let tps = ticks_per_second(snapshot.bpm_at(self.tick_index));
+                        let frames_per_tick = buffer.sample_rate as f64 / tps;
+                        let length_frames =
+                            (clip.effective_length_ticks(tps) as f64 * frames_per_tick).round()
+                                as usize;
+                        let start_frame = clip.source_start_frame;
+                        let end_frame = start_frame.saturating_add(length_frames);
+                        let fade_in_frames =
+                            (clip.fade_in_ticks as f64 * frames_per_tick).round() as usize;
+                        let fade_out_frames =
+                            (clip.fade_out_ticks as f64 * frames_per_tick).round() as usize;
+                        tv.sample_voices[tv.next_sample_voice].trigger_clip(
+                            buffer.clone(),
+                            clip.gain,
+                            start_frame,
+                            end_frame,
+                            fade_in_frames,
+                            fade_out_frames,
+                        );
                         tv.next_sample_voice = (tv.next_sample_voice + 1) % SAMPLE_VOICE_COUNT;
                     }
                 }
@@ -4386,6 +4443,48 @@ mod tests {
             voice.buffer.is_none(),
             "voice should free itself once exhausted"
         );
+    }
+
+    #[test]
+    fn trigger_clip_plays_only_the_trimmed_window() {
+        let buffer = Arc::new(SampleBuffer {
+            sample_rate: 48_000,
+            mono: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+        });
+        let mut voice = SampleVoice::default();
+        // Trim to frames 1..4 (values 2.0, 3.0, 4.0), no fades.
+        voice.trigger_clip(buffer, 1.0, 1, 4, 0, 0);
+
+        assert_eq!(voice.next_sample(), 2.0);
+        assert_eq!(voice.next_sample(), 3.0);
+        assert_eq!(voice.next_sample(), 4.0);
+        assert_eq!(
+            voice.next_sample(),
+            0.0,
+            "voice should stop at end_frame, ignoring the rest of the buffer"
+        );
+    }
+
+    #[test]
+    fn trigger_clip_ramps_fade_in_and_fade_out_linearly() {
+        let buffer = Arc::new(SampleBuffer {
+            sample_rate: 48_000,
+            mono: vec![1.0; 8],
+        });
+        let mut voice = SampleVoice::default();
+        // 8-frame clip, 2-frame fade-in, 2-frame fade-out.
+        voice.trigger_clip(buffer, 1.0, 0, 8, 2, 2);
+
+        let samples: Vec<f32> = (0..8).map(|_| voice.next_sample()).collect();
+        // Fade-in ramps over frames 0..2 (elapsed frames played so far); fade-out ramps over the
+        // last 2 frames remaining before `end_position` — the last played frame (7) is always one
+        // step short of `end_position`, so it never hits exactly 0.0.
+        assert!((samples[0] - 0.0).abs() < 0.001, "frame 0: {}", samples[0]);
+        assert!((samples[1] - 0.5).abs() < 0.001, "frame 1: {}", samples[1]);
+        assert!((samples[2] - 1.0).abs() < 0.001, "frame 2: fully faded in");
+        assert!((samples[5] - 1.0).abs() < 0.001, "frame 5: still full before fade-out");
+        assert!((samples[6] - 1.0).abs() < 0.001, "frame 6: {}", samples[6]);
+        assert!((samples[7] - 0.5).abs() < 0.001, "frame 7: {}", samples[7]);
     }
 
     /// De-interleaves a stereo `i16` sample stream (as `render_song_to_wav` now writes) back down

@@ -3,6 +3,7 @@ mod audio_input;
 mod builtin_fx;
 mod factory_presets;
 mod groove;
+mod gui_embed;
 #[cfg(unix)]
 mod mcp_control;
 mod metering;
@@ -38,6 +39,7 @@ use plugin_host::{
     DawHost, EffectInstance, LoadedEffect, MasterEffectSlots, PluginGuiHandle, PluginParamInfo,
     SendEffectSlots, SubmixEffectSlots, TrackEffectSlots,
 };
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use sample::SampleBuffer;
 use wavetable::{WaveWarpMode, WavetableId};
 
@@ -169,18 +171,15 @@ fn x_to_tick(x: f32, zoom: f32) -> usize {
 }
 
 /// An `AudioClip`'s on-timeline length in ticks, for drawing/hit-testing its block in the
-/// Playlist. Clips have no stored length (see `model::AudioClip`) — this converts however long
-/// the decoded buffer actually is into ticks at the song's current tempo (`ticks_per_second`,
+/// Playlist — `AudioClip::effective_length_ticks` at the song's current tempo (`ticks_per_second`,
 /// from `audio::ticks_per_second`), same as `audio::arrangement_length_ticks` does for looping.
 fn audio_clip_length_ticks(clip: &AudioClip, ticks_per_second: f64) -> usize {
-    match &clip.buffer {
-        Some(buffer) => {
-            let duration_seconds = buffer.mono.len() as f64 / buffer.sample_rate.max(1) as f64;
-            (duration_seconds * ticks_per_second).ceil().max(1.0) as usize
-        }
+    if clip.buffer.is_some() {
+        clip.effective_length_ticks(ticks_per_second).max(1)
+    } else {
         // Still loading (or failed to load) — a minimal placeholder width keeps a broken clip
         // visible/selectable to move or delete, rather than invisible.
-        None => TICKS_PER_STEP,
+        TICKS_PER_STEP
     }
 }
 
@@ -373,15 +372,42 @@ struct PlaylistEditorTargets<'a> {
     beats_region: &'a mut Option<usize>,
 }
 
-/// At most one audio-track clip is being dragged at a time — the `AudioClip` counterpart of
-/// `PlaylistDrag`. Only supports moving (no resize/create by drag, unlike `PlaylistDragMode`): an
-/// `AudioClip` has no stored length to resize (see `model::AudioClip`), and clips are only ever
-/// created by recording, not drawn out on the timeline. `track_index`/`clip_index` re-check bounds
-/// every frame, in case the clip was removed (delete button) since the drag began.
+/// What the currently in-progress audio-clip drag (if any) is doing — the `AudioClip` counterpart
+/// of `PlaylistDragMode`. Clips are only ever created by recording/import, never drawn out on the
+/// timeline, so there's no `Create` mode. Every arm's `clip_index` re-checks bounds every frame, in
+/// case the clip was removed (right-click) since the drag began.
+enum AudioClipDragMode {
+    /// Dragging an existing clip's body: changes `start_tick` only.
+    Move {
+        track_index: usize,
+        clip_index: usize,
+        grab_tick_offset: i64,
+    },
+    /// Dragging an existing clip's left edge: changes `start_tick`/`source_start_frame`/
+    /// `length_ticks` together, keeping the clip's on-timeline end point fixed in place.
+    TrimStart {
+        track_index: usize,
+        clip_index: usize,
+    },
+    /// Dragging an existing clip's right edge: changes `length_ticks` only.
+    TrimEnd {
+        track_index: usize,
+        clip_index: usize,
+    },
+    /// Dragging the fade-in handle: changes `AudioClip::fade_in_ticks` only.
+    FadeIn {
+        track_index: usize,
+        clip_index: usize,
+    },
+    /// Dragging the fade-out handle: changes `AudioClip::fade_out_ticks` only.
+    FadeOut {
+        track_index: usize,
+        clip_index: usize,
+    },
+}
+
 struct AudioClipDrag {
-    track_index: usize,
-    clip_index: usize,
-    grab_tick_offset: i64,
+    mode: AudioClipDragMode,
 }
 
 /// Which effect's parameter-editor window (if any) is currently open. There's only ever one such
@@ -515,6 +541,12 @@ struct SimpleDawApp {
     submix_meters: MeterHandles,
     /// Which effect's parameter-editor window (if any) is currently open.
     effect_editor: Option<EffectEditorTarget>,
+    /// Which slot's embedded plugin GUI (if any) currently owns the one reserved panel inside the
+    /// "FX Params" window (see `plugin_gui_button_ui`) — at most one embedded GUI is ever shown at
+    /// once, since there's only ever one such window. Opening a different target's embedded GUI
+    /// closes whichever one this points at first; floating GUIs aren't tracked here since they're
+    /// independent OS windows that can already coexist.
+    active_embedded_gui: Option<EffectEditorTarget>,
     /// Index of the track whose synth-settings window (waveform/attack/decay) is currently open,
     /// if any. Unlike `effect_editor`, this operates straight on `Song::tracks[..].synth` (model
     /// data, no live plugin instance to juggle), so its window body just borrows `song` directly.
@@ -747,6 +779,7 @@ impl SimpleDawApp {
             master_meter,
             submix_meters,
             effect_editor: None,
+            active_embedded_gui: None,
             synth_editor: None,
             lane_synth_editor: None,
             new_preset_name: String::new(),
@@ -2452,15 +2485,27 @@ fn effect_params_ui(ui: &mut egui::Ui, effect: Option<&mut LoadedEffect>) {
     }
 }
 
-/// Renders an "Open GUI"/"Close GUI" toggle for a loaded CLAP plugin's floating window, next to
-/// `effect_params_ui`'s sliders in the FX params window. Renders nothing if the plugin doesn't
-/// implement the `gui` extension. Also polls whether the plugin closed its own window since the
-/// last frame (e.g. the user hit its close button), so the toggle's label stays in sync.
+/// Renders an "Open GUI"/"Close GUI" toggle for a loaded CLAP plugin's GUI, next to
+/// `effect_params_ui`'s sliders in the FX params window — and, while the currently-open GUI is
+/// embedded, reserves a panel of window space matching its negotiated size and keeps its native
+/// container view positioned under that panel every frame. Renders nothing if the plugin doesn't
+/// implement the `gui` extension. Also polls whether the plugin closed its own floating window
+/// since the last frame (e.g. the user hit its close button), so the toggle's label stays in sync.
+///
+/// `embed_target` is `Some((window_handle, scale_factor))` whenever the app's own window handle
+/// is available (always, outside headless/test contexts) — `open_plugin_gui` tries embedding
+/// first and only falls back to a floating window if the plugin or platform doesn't support it.
+/// `target`/`active_embedded_gui` track which slot currently owns the one embedded panel that can
+/// exist at a time (see `SimpleDawApp::active_embedded_gui`'s doc comment); the caller is
+/// responsible for having already closed any *other* slot's embedded GUI before this runs.
 fn plugin_gui_button_ui(
     ui: &mut egui::Ui,
     instance: &mut PluginInstance<DawHost>,
     gui: &mut PluginGuiHandle,
     title: &str,
+    embed_target: Option<(RawWindowHandle, f64)>,
+    target: EffectEditorTarget,
+    active_embedded_gui: &mut Option<EffectEditorTarget>,
 ) {
     if !gui.is_supported() {
         return;
@@ -2470,11 +2515,93 @@ fn plugin_gui_button_ui(
     if gui.is_open() {
         if ui.button("Close GUI").clicked() {
             plugin_host::close_plugin_gui(instance, gui);
+            if *active_embedded_gui == Some(target) {
+                *active_embedded_gui = None;
+            }
+        } else if let Some(size) = gui.embedded_size() {
+            let (rect, _response) = ui.allocate_exact_size(
+                egui::vec2(size.width as f32, size.height as f32),
+                egui::Sense::hover(),
+            );
+            plugin_host::resize_embedded_plugin_gui(
+                gui,
+                rect.min.x as f64,
+                rect.min.y as f64,
+                rect.width() as f64,
+                rect.height() as f64,
+            );
         }
     } else if ui.button("Open GUI").clicked() {
-        if let Err(err) = plugin_host::open_plugin_gui(instance, gui, title) {
-            ui.colored_label(egui::Color32::RED, format!("{err:#}"));
+        match plugin_host::open_plugin_gui(instance, gui, title, embed_target) {
+            Ok(_) => {
+                if gui.is_embedded() {
+                    *active_embedded_gui = Some(target);
+                }
+            }
+            Err(err) => {
+                ui.colored_label(egui::Color32::RED, format!("{err:#}"));
+            }
         }
+    }
+}
+
+/// Closes the GUI (floating or embedded) for the effect slot at `target`, if one is open — used
+/// to tear down a stale embedded GUI when the "FX Params" window switches to a different slot or
+/// closes entirely (see the two call sites in `SimpleDawApp::ui`). A free function taking each
+/// collection explicitly, the same shape as `apply_loaded_effects` and friends, since it needs to
+/// look a slot up in whichever of the four (master/track/send/submix) it turns out to be in.
+#[allow(clippy::too_many_arguments)]
+fn close_effect_gui(
+    target: EffectEditorTarget,
+    master_effect_instances: &mut [Option<PluginInstance<DawHost>>],
+    master_effect_guis: &mut [Option<PluginGuiHandle>],
+    track_effect_instances: &mut [Vec<Option<PluginInstance<DawHost>>>],
+    track_effect_guis: &mut [Vec<Option<PluginGuiHandle>>],
+    send_effect_instances: &mut [Vec<Option<PluginInstance<DawHost>>>],
+    send_effect_guis: &mut [Vec<Option<PluginGuiHandle>>],
+    submix_effect_instances: &mut [Vec<Option<PluginInstance<DawHost>>>],
+    submix_effect_guis: &mut [Vec<Option<PluginGuiHandle>>],
+) {
+    let (instance, gui) = match target {
+        EffectEditorTarget::Master(slot_index) => (
+            master_effect_instances
+                .get_mut(slot_index)
+                .and_then(|instance| instance.as_mut()),
+            master_effect_guis.get_mut(slot_index).and_then(|gui| gui.as_mut()),
+        ),
+        EffectEditorTarget::Track(track_index, slot_index) => (
+            track_effect_instances
+                .get_mut(track_index)
+                .and_then(|slots| slots.get_mut(slot_index))
+                .and_then(|instance| instance.as_mut()),
+            track_effect_guis
+                .get_mut(track_index)
+                .and_then(|slots| slots.get_mut(slot_index))
+                .and_then(|gui| gui.as_mut()),
+        ),
+        EffectEditorTarget::Send(send_index, slot_index) => (
+            send_effect_instances
+                .get_mut(send_index)
+                .and_then(|slots| slots.get_mut(slot_index))
+                .and_then(|instance| instance.as_mut()),
+            send_effect_guis
+                .get_mut(send_index)
+                .and_then(|slots| slots.get_mut(slot_index))
+                .and_then(|gui| gui.as_mut()),
+        ),
+        EffectEditorTarget::Submix(submix_index, slot_index) => (
+            submix_effect_instances
+                .get_mut(submix_index)
+                .and_then(|slots| slots.get_mut(slot_index))
+                .and_then(|instance| instance.as_mut()),
+            submix_effect_guis
+                .get_mut(submix_index)
+                .and_then(|slots| slots.get_mut(slot_index))
+                .and_then(|gui| gui.as_mut()),
+        ),
+    };
+    if let (Some(instance), Some(gui)) = (instance, gui) {
+        plugin_host::close_plugin_gui(instance, gui);
     }
 }
 
@@ -5232,7 +5359,7 @@ fn transport_lcd_ui(
 }
 
 impl eframe::App for SimpleDawApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let playing = self.transport.is_playing();
         if playing {
             ui.ctx().request_repaint_after(Duration::from_millis(33));
@@ -6205,6 +6332,32 @@ impl eframe::App for SimpleDawApp {
         }
 
         if let Some(target) = self.effect_editor {
+            // Only one embedded GUI panel can exist at a time (there's only ever one "FX Params"
+            // window) — if a *different* slot's embedded GUI is still marked active (e.g. the
+            // user clicked a different slot's "Params" button while a GUI was open), close it
+            // before this window opens its own, so its container view doesn't linger unpositioned.
+            if let Some(other) = self.active_embedded_gui
+                && other != target
+            {
+                close_effect_gui(
+                    other,
+                    &mut self.master_effect_instances,
+                    &mut self.master_effect_guis,
+                    &mut self.track_effect_instances,
+                    &mut self.track_effect_guis,
+                    &mut self.send_effect_instances,
+                    &mut self.send_effect_guis,
+                    &mut self.submix_effect_instances,
+                    &mut self.submix_effect_guis,
+                );
+                self.active_embedded_gui = None;
+            }
+
+            let embed_target = frame.window_handle().ok().map(|handle| {
+                let scale_factor = frame.winit_window().map(|w| w.scale_factor()).unwrap_or(1.0);
+                (handle.as_raw(), scale_factor)
+            });
+
             let title = match target {
                 EffectEditorTarget::Master(slot_index) => {
                     format!("Master FX {} Params", slot_index + 1)
@@ -6221,9 +6374,14 @@ impl eframe::App for SimpleDawApp {
             };
             let gui_title = title.clone();
             let mut open = true;
+            // No live resize renegotiation with an embedded plugin GUI (see `plugin_host`'s doc
+            // comment on `open_plugin_gui`'s embedded path) — disable dragging the window's own
+            // edges while one is open, rather than let the user resize a panel nothing then keeps
+            // in sync with the plugin.
+            let resizable = self.active_embedded_gui != Some(target);
             egui::Window::new(title)
                 .collapsible(false)
-                .resizable(true)
+                .resizable(resizable)
                 .open(&mut open)
                 .show(ui.ctx(), |ui| match target {
                     EffectEditorTarget::Master(slot_index) => {
@@ -6250,7 +6408,15 @@ impl eframe::App for SimpleDawApp {
                                 .get_mut(slot_index)
                                 .and_then(|gui| gui.as_mut()),
                         ) {
-                            plugin_gui_button_ui(ui, instance, gui, &gui_title);
+                            plugin_gui_button_ui(
+                                ui,
+                                instance,
+                                gui,
+                                &gui_title,
+                                embed_target,
+                                target,
+                                &mut self.active_embedded_gui,
+                            );
                         }
                     }
                     EffectEditorTarget::Track(track_index, slot_index) => {
@@ -6279,7 +6445,15 @@ impl eframe::App for SimpleDawApp {
                                 .and_then(|slots| slots.get_mut(slot_index))
                                 .and_then(|gui| gui.as_mut()),
                         ) {
-                            plugin_gui_button_ui(ui, instance, gui, &gui_title);
+                            plugin_gui_button_ui(
+                                ui,
+                                instance,
+                                gui,
+                                &gui_title,
+                                embed_target,
+                                target,
+                                &mut self.active_embedded_gui,
+                            );
                         }
                     }
                     EffectEditorTarget::Send(send_index, slot_index) => {
@@ -6308,7 +6482,15 @@ impl eframe::App for SimpleDawApp {
                                 .and_then(|slots| slots.get_mut(slot_index))
                                 .and_then(|gui| gui.as_mut()),
                         ) {
-                            plugin_gui_button_ui(ui, instance, gui, &gui_title);
+                            plugin_gui_button_ui(
+                                ui,
+                                instance,
+                                gui,
+                                &gui_title,
+                                embed_target,
+                                target,
+                                &mut self.active_embedded_gui,
+                            );
                         }
                     }
                     EffectEditorTarget::Submix(submix_index, slot_index) => {
@@ -6337,11 +6519,35 @@ impl eframe::App for SimpleDawApp {
                                 .and_then(|slots| slots.get_mut(slot_index))
                                 .and_then(|gui| gui.as_mut()),
                         ) {
-                            plugin_gui_button_ui(ui, instance, gui, &gui_title);
+                            plugin_gui_button_ui(
+                                ui,
+                                instance,
+                                gui,
+                                &gui_title,
+                                embed_target,
+                                target,
+                                &mut self.active_embedded_gui,
+                            );
                         }
                     }
                 });
             if !open {
+                // The window that reserved this embedded GUI's panel is gone — nothing keeps its
+                // container view positioned anymore, so close it rather than leave it stranded.
+                if self.active_embedded_gui == Some(target) {
+                    close_effect_gui(
+                        target,
+                        &mut self.master_effect_instances,
+                        &mut self.master_effect_guis,
+                        &mut self.track_effect_instances,
+                        &mut self.track_effect_guis,
+                        &mut self.send_effect_instances,
+                        &mut self.send_effect_guis,
+                        &mut self.submix_effect_instances,
+                        &mut self.submix_effect_guis,
+                    );
+                    self.active_embedded_gui = None;
+                }
                 self.effect_editor = None;
             }
         }
@@ -8463,11 +8669,62 @@ fn draw_region_fade_overlays(
     }
 }
 
-/// Draws a Logic-style min/max waveform for an `Audio`-track clip's whole buffer, stretched across
-/// `rect` (a clip has no stored length — see `model::AudioClip` — so its rect already spans the
-/// buffer's full real-time duration; one column of pixels covers a proportional slice of samples).
-fn draw_audio_clip_waveform(painter: &egui::Painter, rect: egui::Rect, buffer: &SampleBuffer) {
-    let samples = &buffer.mono;
+/// Draws `clip`'s fade-in/fade-out ramps, the `AudioClip` counterpart of
+/// `draw_region_fade_overlays` — same wedge convention, but against `span_ticks`
+/// (`AudioClip::effective_length_ticks`) rather than a region's `loop_length_steps`. Dragging the
+/// point where the wedge ends (see `handle_audio_clip_interaction`'s `near_fade_in_handle`/
+/// `near_fade_out_handle`) is how `fade_in_ticks`/`fade_out_ticks` get set. Draws nothing for a
+/// fade of 0.
+fn draw_audio_clip_fade_overlays(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    clip: &AudioClip,
+    span_ticks: usize,
+    zoom: f32,
+) {
+    if span_ticks == 0 {
+        return;
+    }
+    let fade_shade = egui::Color32::from_black_alpha(110);
+    if clip.fade_in_ticks > 0 {
+        let fade_w = tick_to_x(clip.fade_in_ticks.min(span_ticks), zoom).min(rect.width());
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                rect.left_top(),
+                egui::pos2(rect.left() + fade_w, rect.top()),
+                rect.left_bottom(),
+            ],
+            fade_shade,
+            egui::Stroke::NONE,
+        ));
+    }
+    if clip.fade_out_ticks > 0 {
+        let fade_w = tick_to_x(clip.fade_out_ticks.min(span_ticks), zoom).min(rect.width());
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                rect.right_top(),
+                egui::pos2(rect.right() - fade_w, rect.top()),
+                rect.right_bottom(),
+            ],
+            fade_shade,
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
+/// Draws a Logic-style min/max waveform for an `Audio`-track clip's trimmed window
+/// (`start_frame..end_frame` into the decoded buffer, per `AudioClip::source_start_frame`/
+/// `effective_length_ticks`), stretched across `rect` — one column of pixels covers a proportional
+/// slice of that window's samples, not the whole buffer.
+fn draw_audio_clip_waveform(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    buffer: &SampleBuffer,
+    start_frame: usize,
+    end_frame: usize,
+) {
+    let len = buffer.mono.len();
+    let samples = &buffer.mono[start_frame.min(len)..end_frame.min(len)];
     let width_px = rect.width().round() as usize;
     if samples.is_empty() || width_px == 0 {
         return;
@@ -8780,16 +9037,27 @@ fn playlist_contents_ui(
                 for clip in &track.audio_clips {
                     let x = rect.left() + tick_to_x(clip.start_tick, zoom);
                     let clip_ticks_per_second = audio::ticks_per_second(song.bpm_at(clip.start_tick));
-                    let w = tick_to_x(audio_clip_length_ticks(clip, clip_ticks_per_second), zoom)
-                        .max(3.0);
+                    let span_ticks = audio_clip_length_ticks(clip, clip_ticks_per_second);
+                    let w = tick_to_x(span_ticks, zoom).max(3.0);
                     let clip_rect = egui::Rect::from_min_size(
                         egui::pos2(x, y + 1.0),
                         egui::vec2(w, PLAYLIST_LANE_HEIGHT - 2.0),
                     );
                     painter.rect_filled(clip_rect, 2u8, color);
                     if let Some(buffer) = &clip.buffer {
-                        draw_audio_clip_waveform(&painter, clip_rect, buffer);
+                        let frames_per_tick = buffer.sample_rate as f64 / clip_ticks_per_second;
+                        let end_frame = clip.source_start_frame.saturating_add(
+                            (span_ticks as f64 * frames_per_tick).round() as usize,
+                        );
+                        draw_audio_clip_waveform(
+                            &painter,
+                            clip_rect,
+                            buffer,
+                            clip.source_start_frame,
+                            end_frame,
+                        );
                     }
+                    draw_audio_clip_fade_overlays(&painter, clip_rect, clip, span_ticks, zoom);
                     painter.rect_stroke(
                         clip_rect,
                         2u8,
@@ -9181,10 +9449,10 @@ fn handle_playlist_interaction(
 
 /// Hit-tests and applies click/drag gestures against every `Audio`-kind track's `audio_clips`,
 /// rendered in the same Playlist canvas as `handle_playlist_interaction` but in the rows below it
-/// (`audio_rows_top` onward — see `playlist_contents_ui`). Much simpler than
-/// `handle_playlist_interaction`: only move and delete, since a clip has no stored length to
-/// resize and is never drawn out by hand (see `model::AudioClip`, `handle_playlist_interaction`'s
-/// doc comment on why the two aren't shared).
+/// (`audio_rows_top` onward — see `playlist_contents_ui`). Mirrors
+/// `handle_playlist_interaction`'s structure (click/drag_started/dragged/drag_stopped) but for
+/// clips instead of regions, and with no `Create` mode — a clip is only ever created by
+/// recording/import, never drawn out on the timeline.
 #[allow(clippy::too_many_arguments)]
 fn handle_audio_clip_interaction(
     response: &egui::Response,
@@ -9197,36 +9465,69 @@ fn handle_audio_clip_interaction(
 ) {
     let local = |p: egui::Pos2| (p.x - rect.left(), p.y - rect.top());
     let row_count = audio_track_indices.len();
-    let y_to_track = |y: f32| -> Option<usize> {
+    let y_to_track_row = |y: f32| -> Option<usize> {
         if y < audio_rows_top {
             return None;
         }
         let row = ((y - audio_rows_top) / PLAYLIST_LANE_HEIGHT)
             .floor()
             .max(0.0) as usize;
-        (row < row_count).then(|| audio_track_indices[row])
+        (row < row_count).then_some(row)
+    };
+    let row_frac_at = |ly: f32, row: usize| -> f32 {
+        ((ly - audio_rows_top) / PLAYLIST_LANE_HEIGHT) - row as f32
     };
     // Snapshot before any `&mut song.tracks[...]` borrow below, mirroring the same pre-borrow
     // pattern used elsewhere (e.g. `piano_roll_contents_ui`'s `other_tracks_snapshot`) — a plain
     // closure calling `song.bpm_at(...)` here would hold `song` captured for this whole
     // function's remaining borrows, conflicting with those later mutable ones.
     let (base_bpm, tempo_map) = (song.bpm, song.tempo_map.clone());
+    let bpm_at_tick = |tick: usize| -> f32 {
+        tempo_map
+            .iter()
+            .rev()
+            .find(|point| point.tick <= tick)
+            .map_or(base_bpm, |point| point.bpm)
+    };
+    let clip_span_ticks = |c: &AudioClip| {
+        audio_clip_length_ticks(c, audio::ticks_per_second(bpm_at_tick(c.start_tick)))
+    };
     let clip_at = |clips: &[AudioClip], tick: usize| {
-        clips.iter().position(|c| {
-            let bpm = tempo_map
-                .iter()
-                .rev()
-                .find(|point| point.tick <= c.start_tick)
-                .map_or(base_bpm, |point| point.bpm);
-            let len = audio_clip_length_ticks(c, audio::ticks_per_second(bpm));
-            tick >= c.start_tick && tick < c.start_tick + len
-        })
+        clips
+            .iter()
+            .position(|c| tick >= c.start_tick && tick < c.start_tick + clip_span_ticks(c))
+    };
+    // Trim/fade handles sit at the clip's own left/right edges or, for fades, at the point its
+    // ramp ends — see the matching drawing code in `playlist_contents_ui`
+    // (`draw_audio_clip_fade_overlays`). Fade handles are restricted to the top half of the row
+    // (`row_frac`) so a fade handle at fade_*_ticks == 0 (sitting right at the clip's corner)
+    // doesn't shadow the whole-height trim/move hit-tests below, mirroring
+    // `handle_playlist_interaction`'s `near_fade_in_handle`/`near_fade_out_handle`.
+    let near_trim_start_handle = |clip: &AudioClip, local_x: f32| {
+        (local_x - tick_to_x(clip.start_tick, zoom)).abs() <= RESIZE_HANDLE_PX
+    };
+    let near_trim_end_handle = |clip: &AudioClip, local_x: f32| {
+        let end_x = tick_to_x(clip.start_tick + clip_span_ticks(clip), zoom);
+        (local_x - end_x).abs() <= RESIZE_HANDLE_PX
+    };
+    let near_fade_in_handle = |clip: &AudioClip, local_x: f32| {
+        let span_ticks = clip_span_ticks(clip);
+        let fade_ticks = clip.fade_in_ticks.min(span_ticks);
+        let x = tick_to_x(clip.start_tick + fade_ticks, zoom);
+        (local_x - x).abs() <= RESIZE_HANDLE_PX
+    };
+    let near_fade_out_handle = |clip: &AudioClip, local_x: f32| {
+        let span_ticks = clip_span_ticks(clip);
+        let fade_ticks = clip.fade_out_ticks.min(span_ticks);
+        let x = tick_to_x(clip.start_tick + span_ticks - fade_ticks, zoom);
+        (local_x - x).abs() <= RESIZE_HANDLE_PX
     };
 
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             let (lx, ly) = local(pos);
-            if let Some(track_index) = y_to_track(ly) {
+            if let Some(row) = y_to_track_row(ly) {
+                let track_index = audio_track_indices[row];
                 let clips = &mut song.tracks[track_index].audio_clips;
                 if let Some(index) = clip_at(clips, x_to_tick(lx, zoom)) {
                     clips.remove(index);
@@ -9238,15 +9539,56 @@ fn handle_audio_clip_interaction(
     if drag.is_none() && response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
             let (lx, ly) = local(pos);
-            if let Some(track_index) = y_to_track(ly) {
+            if let Some(row) = y_to_track_row(ly) {
+                let track_index = audio_track_indices[row];
+                let row_frac = row_frac_at(ly, row);
                 let tick = x_to_tick(lx, zoom);
-                if let Some(clip_index) = clip_at(&song.tracks[track_index].audio_clips, tick) {
-                    let grab_tick_offset = tick as i64
-                        - song.tracks[track_index].audio_clips[clip_index].start_tick as i64;
+                let clips = &song.tracks[track_index].audio_clips;
+                let hovered_clip = clip_at(clips, tick);
+                if let Some(clip_index) = hovered_clip
+                    .filter(|&i| row_frac <= 0.5 && near_fade_in_handle(&clips[i], lx))
+                {
                     *drag = Some(AudioClipDrag {
-                        track_index,
-                        clip_index,
-                        grab_tick_offset,
+                        mode: AudioClipDragMode::FadeIn {
+                            track_index,
+                            clip_index,
+                        },
+                    });
+                } else if let Some(clip_index) = hovered_clip
+                    .filter(|&i| row_frac <= 0.5 && near_fade_out_handle(&clips[i], lx))
+                {
+                    *drag = Some(AudioClipDrag {
+                        mode: AudioClipDragMode::FadeOut {
+                            track_index,
+                            clip_index,
+                        },
+                    });
+                } else if let Some(clip_index) =
+                    hovered_clip.filter(|&i| near_trim_end_handle(&clips[i], lx))
+                {
+                    *drag = Some(AudioClipDrag {
+                        mode: AudioClipDragMode::TrimEnd {
+                            track_index,
+                            clip_index,
+                        },
+                    });
+                } else if let Some(clip_index) =
+                    hovered_clip.filter(|&i| near_trim_start_handle(&clips[i], lx))
+                {
+                    *drag = Some(AudioClipDrag {
+                        mode: AudioClipDragMode::TrimStart {
+                            track_index,
+                            clip_index,
+                        },
+                    });
+                } else if let Some(clip_index) = hovered_clip {
+                    let grab_tick_offset = tick as i64 - clips[clip_index].start_tick as i64;
+                    *drag = Some(AudioClipDrag {
+                        mode: AudioClipDragMode::Move {
+                            track_index,
+                            clip_index,
+                            grab_tick_offset,
+                        },
                     });
                 }
             }
@@ -9254,25 +9596,128 @@ fn handle_audio_clip_interaction(
     }
 
     if let Some(state) = drag {
+        let (track_index, clip_index) = match &state.mode {
+            AudioClipDragMode::Move {
+                track_index,
+                clip_index,
+                ..
+            }
+            | AudioClipDragMode::TrimStart {
+                track_index,
+                clip_index,
+            }
+            | AudioClipDragMode::TrimEnd {
+                track_index,
+                clip_index,
+            }
+            | AudioClipDragMode::FadeIn {
+                track_index,
+                clip_index,
+            }
+            | AudioClipDragMode::FadeOut {
+                track_index,
+                clip_index,
+            } => (*track_index, *clip_index),
+        };
         let clips = song
             .tracks
-            .get_mut(state.track_index)
+            .get_mut(track_index)
             .map(|t| &mut t.audio_clips);
-        let Some(clips) = clips.filter(|c| state.clip_index < c.len()) else {
+        let Some(clips) = clips.filter(|c| clip_index < c.len()) else {
             // The clip behind this drag was removed mid-drag (right-click) — drop the dangling state.
             *drag = None;
             return;
         };
-        if response.dragged() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let (lx, _ly) = local(pos);
-                let tick = x_to_tick(lx.max(0.0), zoom) as i64;
-                clips[state.clip_index].start_tick =
-                    (tick - state.grab_tick_offset).max(0) as usize;
+        match &state.mode {
+            AudioClipDragMode::Move {
+                grab_tick_offset, ..
+            } => {
+                let grab_tick_offset = *grab_tick_offset;
+                if response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let (lx, _ly) = local(pos);
+                        let tick = x_to_tick(lx.max(0.0), zoom) as i64;
+                        clips[clip_index].start_tick = (tick - grab_tick_offset).max(0) as usize;
+                    }
+                }
+                if response.drag_stopped() {
+                    *drag = None;
+                }
             }
-        }
-        if response.drag_stopped() {
-            *drag = None;
+            AudioClipDragMode::TrimStart { .. } => {
+                if response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let (lx, _ly) = local(pos);
+                        let clip = &mut clips[clip_index];
+                        if let Some(buffer) = clip.buffer.clone() {
+                            let tps = audio::ticks_per_second(bpm_at_tick(clip.start_tick));
+                            let frames_per_tick = buffer.sample_rate as f64 / tps;
+                            let old_start_tick = clip.start_tick;
+                            let end_tick = old_start_tick + clip.effective_length_ticks(tps);
+                            let new_start_tick =
+                                x_to_tick(lx.max(0.0), zoom).min(end_tick.saturating_sub(1));
+                            let delta_ticks = new_start_tick as i64 - old_start_tick as i64;
+                            let delta_frames =
+                                (delta_ticks as f64 * frames_per_tick).round() as i64;
+                            clip.source_start_frame =
+                                (clip.source_start_frame as i64 + delta_frames).max(0) as usize;
+                            clip.start_tick = new_start_tick;
+                            clip.length_ticks = end_tick.saturating_sub(new_start_tick).max(1);
+                        }
+                    }
+                }
+                if response.drag_stopped() {
+                    *drag = None;
+                }
+            }
+            AudioClipDragMode::TrimEnd { .. } => {
+                if response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let (lx, _ly) = local(pos);
+                        let clip = &mut clips[clip_index];
+                        let tps = audio::ticks_per_second(bpm_at_tick(clip.start_tick));
+                        let max_ticks = clip.full_length_ticks(tps).max(1);
+                        let tick = x_to_tick(lx.max(0.0), zoom);
+                        clip.length_ticks =
+                            tick.saturating_sub(clip.start_tick).clamp(1, max_ticks);
+                    }
+                }
+                if response.drag_stopped() {
+                    *drag = None;
+                }
+            }
+            AudioClipDragMode::FadeIn { .. } => {
+                if response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let (lx, _ly) = local(pos);
+                        let tick = x_to_tick(lx.max(0.0), zoom);
+                        let clip = &mut clips[clip_index];
+                        let tps = audio::ticks_per_second(bpm_at_tick(clip.start_tick));
+                        let span_ticks = clip.effective_length_ticks(tps);
+                        let offset = tick.saturating_sub(clip.start_tick);
+                        clip.fade_in_ticks = offset.min(span_ticks);
+                    }
+                }
+                if response.drag_stopped() {
+                    *drag = None;
+                }
+            }
+            AudioClipDragMode::FadeOut { .. } => {
+                if response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let (lx, _ly) = local(pos);
+                        let tick = x_to_tick(lx.max(0.0), zoom);
+                        let clip = &mut clips[clip_index];
+                        let tps = audio::ticks_per_second(bpm_at_tick(clip.start_tick));
+                        let span_ticks = clip.effective_length_ticks(tps);
+                        let end_tick = clip.start_tick + span_ticks;
+                        clip.fade_out_ticks = end_tick.saturating_sub(tick).min(span_ticks);
+                    }
+                }
+                if response.drag_stopped() {
+                    *drag = None;
+                }
+            }
         }
     }
 }

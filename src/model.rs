@@ -1530,9 +1530,9 @@ fn default_clip_gain() -> f32 {
 /// (the audio equivalent of `Region`, which `StepGrid`/`PianoRoll` tracks use instead). Mirrors `Lane`'s
 /// `sample_path`/`sample`/`sample_error` split: `file_path` is the persisted reference, `buffer`
 /// is the decoded, resampled audio re-loaded from it after deserializing (see
-/// `Song::load_from_file`). Has no stored length — playback simply runs until `buffer` is
-/// exhausted (see `audio::SampleVoice`), so a clip's audible duration is real time, not
-/// tempo-relative, matching how a recording actually behaves.
+/// `Song::load_from_file`). Trim/fade fields all default to `0`, meaning "no trim/fade yet" — a
+/// freshly recorded/imported clip, and any clip from a song file saved before trimming existed,
+/// plays its whole decoded buffer with no ramps, exactly as before this feature existed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AudioClip {
     pub start_tick: usize,
@@ -1540,6 +1540,23 @@ pub struct AudioClip {
     /// Linear gain applied to this clip's playback. 1.0 is unity.
     #[serde(default = "default_clip_gain")]
     pub gain: f32,
+    /// Trim: the decoded buffer's frame index playback starts from (head trim). Real sample
+    /// frames, not ticks — audio content isn't tempo-elastic (that's a future "Flex Time" feature,
+    /// not this one). `0` plays from the buffer's own start, same as before trimming existed.
+    #[serde(default)]
+    pub source_start_frame: usize,
+    /// Trim: this clip's on-timeline duration in ticks. `0` is a sentinel meaning "play to the end
+    /// of the decoded buffer from `source_start_frame`" — see `effective_length_ticks`.
+    #[serde(default)]
+    pub length_ticks: usize,
+    /// Ticks (from `start_tick`) over which this clip's output ramps up from silence, the audio-clip
+    /// counterpart of `Region::fade_in_ticks`. `0` means no fade.
+    #[serde(default)]
+    pub fade_in_ticks: usize,
+    /// Ticks (into the end of `effective_length_ticks`) over which this clip's output ramps down to
+    /// silence, the audio-clip counterpart of `Region::fade_out_ticks`. `0` means no fade.
+    #[serde(default)]
+    pub fade_out_ticks: usize,
     #[serde(skip)]
     pub buffer: Option<Arc<SampleBuffer>>,
     #[serde(skip)]
@@ -1547,14 +1564,45 @@ pub struct AudioClip {
 }
 
 impl AudioClip {
-    /// A new clip referencing `file_path` at `start_tick`, unloaded until `load` is called.
+    /// A new clip referencing `file_path` at `start_tick`, unloaded until `load` is called. No
+    /// trim/fade until explicitly set.
     pub fn new(start_tick: usize, file_path: impl Into<String>) -> Self {
         Self {
             start_tick,
             file_path: file_path.into(),
             gain: default_clip_gain(),
+            source_start_frame: 0,
+            length_ticks: 0,
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
             buffer: None,
             load_error: None,
+        }
+    }
+
+    /// This clip's on-timeline duration in ticks if it were untrimmed at the tail — the cap
+    /// `effective_length_ticks` falls back to when `length_ticks` is the "no trim" sentinel, and
+    /// what a tail-trim (right-edge) drag can extend back out to. Converted from the buffer's
+    /// remaining real-time duration (from `source_start_frame` onward) via `ticks_per_second` (see
+    /// `audio::ticks_per_second`) — the caller's job, not this module's, to avoid `model.rs`
+    /// depending on `audio.rs` (see `audio::arrangement_length_ticks`'s doc comment on the same
+    /// tempo-at-start-tick approximation).
+    pub fn full_length_ticks(&self, ticks_per_second: f64) -> usize {
+        let Some(buffer) = &self.buffer else {
+            return 0;
+        };
+        let remaining_frames = buffer.mono.len().saturating_sub(self.source_start_frame);
+        let duration_seconds = remaining_frames as f64 / buffer.sample_rate.max(1) as f64;
+        (duration_seconds * ticks_per_second).ceil() as usize
+    }
+
+    /// This clip's on-timeline duration in ticks. `length_ticks` of `0` (untrimmed clips, and song
+    /// files saved before trim existed) falls back to `full_length_ticks`.
+    pub fn effective_length_ticks(&self, ticks_per_second: f64) -> usize {
+        if self.length_ticks > 0 {
+            self.length_ticks
+        } else {
+            self.full_length_ticks(ticks_per_second)
         }
     }
 
@@ -2768,6 +2816,10 @@ mod tests {
         let audio_index = song.add_track("Vocals", 5, TrackKind::Audio);
         let mut clip = AudioClip::new(48, "some/recording.wav");
         clip.gain = 0.8;
+        clip.source_start_frame = 4_800;
+        clip.length_ticks = 960;
+        clip.fade_in_ticks = 96;
+        clip.fade_out_ticks = 192;
         song.tracks[audio_index].audio_clips.push(clip);
 
         let path = std::env::temp_dir().join(format!(
@@ -2784,10 +2836,61 @@ mod tests {
         assert_eq!(loaded_clip.start_tick, 48);
         assert_eq!(loaded_clip.file_path, "some/recording.wav");
         assert_eq!(loaded_clip.gain, 0.8);
+        assert_eq!(loaded_clip.source_start_frame, 4_800);
+        assert_eq!(loaded_clip.length_ticks, 960);
+        assert_eq!(loaded_clip.fade_in_ticks, 96);
+        assert_eq!(loaded_clip.fade_out_ticks, 192);
         assert!(
             loaded_clip.buffer.is_none(),
             "decoded audio isn't song data and must not be serialized"
         );
+    }
+
+    #[test]
+    fn audio_clip_from_a_pre_trim_song_file_defaults_to_untrimmed_no_fade() {
+        // A song file saved before trim/fade existed has none of the new fields in its JSON —
+        // `#[serde(default)]` must fill them with the "no trim/fade yet" sentinel (0), not fail to
+        // parse or silently drop the clip.
+        let json = r#"{
+            "start_tick": 48,
+            "file_path": "some/recording.wav",
+            "gain": 0.8
+        }"#;
+        let clip: AudioClip = serde_json::from_str(json).unwrap();
+        assert_eq!(clip.source_start_frame, 0);
+        assert_eq!(clip.length_ticks, 0);
+        assert_eq!(clip.fade_in_ticks, 0);
+        assert_eq!(clip.fade_out_ticks, 0);
+    }
+
+    #[test]
+    fn effective_length_ticks_uses_length_ticks_when_trimmed() {
+        let mut clip = AudioClip::new(0, "some/recording.wav");
+        clip.length_ticks = 480;
+        assert_eq!(clip.effective_length_ticks(1000.0), 480);
+    }
+
+    #[test]
+    fn effective_length_ticks_falls_back_to_full_buffer_when_untrimmed() {
+        let mut clip = AudioClip::new(0, "some/recording.wav");
+        clip.buffer = Some(Arc::new(SampleBuffer {
+            sample_rate: 48_000,
+            mono: vec![0.0; 48_000],
+        }));
+        // 1 second of audio at 48kHz, converted at 1000 ticks/second, is 1000 ticks.
+        assert_eq!(clip.effective_length_ticks(1000.0), 1000);
+    }
+
+    #[test]
+    fn effective_length_ticks_accounts_for_source_start_frame() {
+        let mut clip = AudioClip::new(0, "some/recording.wav");
+        clip.source_start_frame = 24_000;
+        clip.buffer = Some(Arc::new(SampleBuffer {
+            sample_rate: 48_000,
+            mono: vec![0.0; 48_000],
+        }));
+        // Only the remaining 0.5s (24_000 frames) past the trimmed head counts.
+        assert_eq!(clip.effective_length_ticks(1000.0), 500);
     }
 
     #[test]

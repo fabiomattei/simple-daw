@@ -2,7 +2,7 @@
 
 A native Rust MIDI sequencer / groovebox for composing video game music — not a general-purpose DAW.
 
-Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three built-in synth engines, sample playback, a Playlist/arrangement timeline, WAV bounce, MIDI import, JSON song persistence, and CLAP effect hosting.
+Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three built-in synth engines, sample playback, a Playlist/arrangement timeline, WAV bounce, MIDI import, JSON song persistence, CLAP effect hosting, and composition tools (quantize/humanize/groove templates, tap tempo, audio tempo detection, and a tempo-map "Smart Tempo").
 
 ## Features
 
@@ -20,6 +20,9 @@ Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three bu
 - **Submix buses (Track Stacks / alternate output routing)** — route a track's output into a shared submix bus instead of straight to master, picked from an "Output" dropdown on its Mixer channel strip. A submix has its own fader, Mute/Solo, and FX chain, so a group of tracks can share one compressor/reverb instance and be ridden together with one fader — Logic's Track Stack, minimal version.
 - **Region fades and automation** — drag a Region's corner handles in the Playlist for a fade in/out; every Region also carries its own automation lanes (volume/pan/send-level/effect-param "rides," multi-point, edited under the Piano Roll/Beats grid) scoped to that Region's own track.
 - **Metering** — peak/RMS bar meters and BS.1770-4 LUFS (momentary/short-term/integrated) on every Mixer channel strip, the master strip, and every submix strip.
+- **Quantize, humanize, and groove templates** — snap piano-roll notes to a grid at an adjustable strength, randomly nudge timing/velocity, or apply a built-in swing/accent template (straight, swing 8th/16th, MPC push/lay-back) from the Piano Roll toolbar. Step-grid lanes get the same humanize/groove-template treatment from a per-lane "🎲" menu in the Beats window, including a small per-step timing offset (not just velocity) that the step-grid never had before.
+- **Tap tempo and audio tempo detection** — tap the transport LCD's TAP button in time to set the song's BPM, or use File → Detect Tempo… to estimate a WAV file's BPM from its audio content (best on clearly rhythmic material like a drum loop or click track) and apply it to the song.
+- **Tempo map ("Smart Tempo")** — the Playlist's Tempo Track panel lets you insert tempo-change points at the playhead, so a song's tempo can change partway through instead of staying fixed for the whole arrangement. Tempo changes are instant (a step function), not a smooth ramp.
 
 ## Building
 
@@ -80,6 +83,9 @@ Unit tests cover synth/DSP math and the WAV exporter, but can't prove the live a
 - `src/sample.rs` — WAV decoding and resampling for one-shot sample playback.
 - `src/wavetable.rs` — wavetable data and sampling for the `Wave` synth engine.
 - `src/midi_import.rs` — standard MIDI file (`.mid`) import into piano-roll notes.
+- `src/groove.rs` — quantize/humanize/groove-template transforms for piano-roll notes and step-grid lanes.
+- `src/tempo.rs` — tap-tempo BPM averaging.
+- `src/tempo_detection.rs` — estimates a WAV file's BPM from its audio content.
 
 ## License
 

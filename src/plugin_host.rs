@@ -12,8 +12,10 @@ use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_host::events::event_types::ParamValueEvent;
 use clack_host::prelude::*;
 use clack_host::utils::Cookie;
+use raw_window_handle::RawWindowHandle;
 
 use crate::builtin_fx::BuiltInEffect;
+use crate::gui_embed::EmbeddedContainer;
 use crate::model::TrackEffectConfig;
 
 /// A CLAP parameter's static metadata, as declared by the plugin at load time (id, display name,
@@ -108,15 +110,24 @@ impl LoadedEffect {
     }
 }
 
-/// Host-side bookkeeping for one plugin's floating GUI window. Returned by `load_and_activate`
-/// alongside its `PluginInstance`/`LoadedEffect`; callers (`main.rs`) keep it next to the
-/// `PluginInstance`, since opening/closing the GUI needs that instance's main-thread handle just
-/// like `query_channel_count`/`query_params` do at load time.
+/// Host-side bookkeeping for one plugin's GUI — either floating (a separate OS window, entirely
+/// plugin-managed) or embedded (drawn into a host-owned container view docked inside our own
+/// window, see `gui_embed`). Returned by `load_and_activate` alongside its
+/// `PluginInstance`/`LoadedEffect`; callers (`main.rs`) keep it next to the `PluginInstance`,
+/// since opening/closing the GUI needs that instance's main-thread handle just like
+/// `query_channel_count`/`query_params` do at load time.
 pub struct PluginGuiHandle {
     /// `None` if the plugin doesn't implement the `gui` extension at all.
     gui: Option<PluginGui>,
     closed_by_plugin: Arc<AtomicBool>,
     is_open: bool,
+    /// `Some` while an embedded GUI is open; `None` for a floating GUI (or none at all). Dropping
+    /// this tears the container down, so it's always cleared alongside `is_open` going false.
+    embedded: Option<EmbeddedContainer>,
+    /// The size negotiated with the plugin when the currently-open embedded GUI was opened (see
+    /// `open_plugin_gui`'s returned `GuiSize`) — callers need this every frame, not just at open
+    /// time, to keep reserving the same amount of space for it. `None` whenever `embedded` is.
+    embedded_size: Option<GuiSize>,
 }
 
 impl PluginGuiHandle {
@@ -125,9 +136,21 @@ impl PluginGuiHandle {
         self.gui.is_some()
     }
 
-    /// Whether this plugin's floating GUI window is currently open.
+    /// Whether this plugin's GUI (floating or embedded) is currently open.
     pub fn is_open(&self) -> bool {
         self.is_open
+    }
+
+    /// Whether the currently-open GUI is embedded (as opposed to floating). `false` if no GUI is
+    /// open at all.
+    pub fn is_embedded(&self) -> bool {
+        self.embedded.is_some()
+    }
+
+    /// The size negotiated for the currently-open embedded GUI, if any — the amount of space a
+    /// caller should reserve for it every frame (see `resize_embedded_plugin_gui`).
+    pub fn embedded_size(&self) -> Option<GuiSize> {
+        self.embedded_size
     }
 }
 
@@ -375,6 +398,8 @@ pub fn load_and_activate(
             gui,
             closed_by_plugin: gui_closed,
             is_open: false,
+            embedded: None,
+            embedded_size: None,
         },
     ))
 }
@@ -436,17 +461,46 @@ pub fn load_offline_chain(specs: &[TrackEffectConfig], sample_rate: f64, block_s
     OfflineEffectChain { chain, _instances: instances }
 }
 
-/// Negotiates and opens `instance`'s floating GUI window (see the `gui` extension's negotiation
-/// steps: `is_api_supported` → `create` → `suggest_title` → `show`). Errors if the plugin has no
-/// `gui` extension, doesn't support a floating window on this platform, or the plugin itself
-/// rejects one of these steps.
+/// Negotiates and opens `instance`'s GUI, preferring an embedded view docked in the host's own
+/// window over a floating OS window when possible.
+///
+/// If `embed_target` is `Some((parent_window, scale_factor))` and the plugin's `is_api_supported`
+/// accepts an embedded configuration for this platform's default `GuiApiType`, follows CLAP's
+/// embedded negotiation (`create` → `set_scale` → `get_size` → build a `gui_embed::EmbeddedContainer`
+/// sized to the plugin's own preferred size → `set_parent` → `show`) and returns `Ok(Some(size))`
+/// so the caller knows how much space to reserve for it. Otherwise falls back to the floating-window
+/// negotiation (`is_api_supported` → `create` → `suggest_title` → `show`) and returns `Ok(None)`.
+///
+/// Errors if the plugin has no `gui` extension at all, or if whichever path was attempted fails —
+/// this does not silently fall back from a failed embedded attempt to floating, since a plugin
+/// that claimed to support embedding but then failed partway through is a real problem worth
+/// surfacing, not papering over.
 pub fn open_plugin_gui(
     instance: &mut PluginInstance<DawHost>,
     handle: &mut PluginGuiHandle,
     title: &str,
-) -> Result<()> {
+    embed_target: Option<(RawWindowHandle, f64)>,
+) -> Result<Option<GuiSize>> {
     let gui = handle.gui.context("plugin has no GUI")?;
     let mut plugin = instance.plugin_handle();
+
+    if let Some((parent, scale_factor)) = embed_target
+        && let Some(api_type) = GuiApiType::default_for_current_platform()
+    {
+        let embed_configuration = GuiConfiguration {
+            api_type,
+            is_floating: false,
+        };
+        if gui.is_api_supported(&mut plugin, embed_configuration) {
+            let (container, size) =
+                open_embedded_gui(&gui, &mut plugin, api_type, parent, scale_factor)?;
+            handle.embedded = Some(container);
+            handle.embedded_size = Some(size);
+            handle.closed_by_plugin.store(false, Ordering::Release);
+            handle.is_open = true;
+            return Ok(Some(size));
+        }
+    }
 
     let api_type = GuiApiType::default_for_current_platform()
         .context("no default floating GUI API for this platform")?;
@@ -472,10 +526,75 @@ pub fn open_plugin_gui(
 
     handle.closed_by_plugin.store(false, Ordering::Release);
     handle.is_open = true;
-    Ok(())
+    Ok(None)
 }
 
-/// Hides and destroys `instance`'s floating GUI window. A no-op if none is open
+/// The embedded half of `open_plugin_gui`'s negotiation, split out to keep that function's two
+/// paths (embedded vs. floating) readable. On any failure after `create` succeeds, calls
+/// `destroy` before returning the error so the plugin's GUI resources aren't left half-allocated.
+fn open_embedded_gui(
+    gui: &PluginGui,
+    plugin: &mut PluginMainThreadHandle,
+    api_type: GuiApiType,
+    parent: RawWindowHandle,
+    scale_factor: f64,
+) -> Result<(EmbeddedContainer, GuiSize)> {
+    let configuration = GuiConfiguration {
+        api_type,
+        is_floating: false,
+    };
+    gui.create(plugin, configuration)
+        .context("failed to create plugin GUI")?;
+
+    // Cocoa uses logical points and handles its own scaling; `set_scale` should not be called
+    // for it (see `GuiApiType::COCOA`'s doc comment). Not fatal if a Win32/X11 plugin declines
+    // it — the container itself still applies `scale_factor` to its own sizing regardless.
+    if api_type != GuiApiType::COCOA {
+        let _ = gui.set_scale(plugin, scale_factor);
+    }
+
+    let size = gui.get_size(plugin).unwrap_or(GuiSize {
+        width: 480,
+        height: 320,
+    });
+
+    let mut container = match EmbeddedContainer::create(parent, scale_factor) {
+        Ok(container) => container,
+        Err(err) => {
+            gui.destroy(plugin);
+            return Err(err);
+        }
+    };
+    container.set_frame(0.0, 0.0, size.width as f64, size.height as f64);
+
+    // SAFETY: `container` is kept alive in `PluginGuiHandle::embedded` for as long as this GUI
+    // stays open, and is only dropped (tearing down and removing the native view/window) after
+    // `destroy` has been called for it, in `close_plugin_gui`/`plugin_gui_poll_closed` — matching
+    // `set_parent`'s requirement that the parent stay valid until then.
+    if let Err(err) = unsafe { gui.set_parent(plugin, container.clap_window()) } {
+        gui.destroy(plugin);
+        return Err(anyhow::Error::new(err).context("failed to set plugin GUI parent"));
+    }
+
+    if let Err(err) = gui.show(plugin) {
+        gui.destroy(plugin);
+        return Err(anyhow::Error::new(err).context("failed to show plugin GUI"));
+    }
+
+    Ok((container, size))
+}
+
+/// Repositions/resizes the currently-open embedded GUI's container to `x`/`y`/`width`/`height`
+/// (top-left-origin egui logical points, relative to the parent window's content area) — called
+/// every frame while the reserved panel for it is on screen. A no-op if no GUI is open, or the
+/// open one is floating rather than embedded.
+pub fn resize_embedded_plugin_gui(handle: &mut PluginGuiHandle, x: f64, y: f64, width: f64, height: f64) {
+    if let Some(container) = handle.embedded.as_mut() {
+        container.set_frame(x, y, width, height);
+    }
+}
+
+/// Hides and destroys `instance`'s GUI (floating or embedded). A no-op if none is open
 /// (`PluginGuiHandle::is_open` is `false`).
 pub fn close_plugin_gui(instance: &mut PluginInstance<DawHost>, handle: &mut PluginGuiHandle) {
     let (Some(gui), true) = (handle.gui, handle.is_open) else {
@@ -484,13 +603,17 @@ pub fn close_plugin_gui(instance: &mut PluginInstance<DawHost>, handle: &mut Plu
     let mut plugin = instance.plugin_handle();
     let _ = gui.hide(&mut plugin);
     gui.destroy(&mut plugin);
+    handle.embedded = None;
+    handle.embedded_size = None;
     handle.is_open = false;
 }
 
 /// Polls whether the plugin closed its own floating window since the last call (e.g. the user hit
 /// its close button), clearing the flag. If so, destroys the GUI's resources — required by CLAP
 /// once the plugin reports the window closed — and updates `handle`. Returns whether the window
-/// was just closed, so callers know to update any "GUI open" UI state.
+/// was just closed, so callers know to update any "GUI open" UI state. Embedded GUIs don't self-
+/// close this way in practice (there's no close button on a bare container view), but the same
+/// bookkeeping applies if a plugin ever reports it regardless.
 pub fn plugin_gui_poll_closed(
     instance: &mut PluginInstance<DawHost>,
     handle: &mut PluginGuiHandle,
@@ -501,6 +624,8 @@ pub fn plugin_gui_poll_closed(
     if let Some(gui) = handle.gui {
         gui.destroy(&mut instance.plugin_handle());
     }
+    handle.embedded = None;
+    handle.embedded_size = None;
     handle.is_open = false;
     true
 }
