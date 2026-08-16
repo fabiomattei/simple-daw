@@ -21,6 +21,10 @@ use crate::wavetable::{self, WaveWarpMode, WavetableId};
 /// 16th-note grid: 4 steps per beat.
 const STEPS_PER_BEAT: f64 = 4.0;
 const VOICE_COUNT: usize = 32;
+/// Fixed fade-in/out applied at every `TakeFolder` comp-segment boundary (see `Sequencer::process`'s
+/// take-folder trigger loop) so switching which take is heard mid-folder doesn't click — short
+/// enough to be inaudible as a fade, long enough to smooth a hard amplitude discontinuity.
+const TAKE_FOLDER_CROSSFADE_SECONDS: f32 = 0.005;
 const SAMPLE_VOICE_COUNT: usize = 32;
 const MASTER_GAIN: f32 = 0.3;
 /// Level (relative to a voice's starting amplitude) considered inaudible; below this a voice is freed.
@@ -2076,7 +2080,21 @@ pub(crate) fn arrangement_length_ticks(song: &Song) -> usize {
         .max()
         .unwrap_or(0);
 
-    pattern_end.max(audio_end).max(TICKS_PER_STEP).max(1)
+    // A `TakeFolder`'s span is explicit (`length_ticks`, frozen at the first take's own recorded
+    // duration — see `model::TakeFolder`), unlike a plain `AudioClip`'s implicit-until-trimmed one.
+    let take_folder_end = song
+        .tracks
+        .iter()
+        .flat_map(|track| track.take_folders.iter())
+        .map(|folder| folder.start_tick + folder.length_ticks)
+        .max()
+        .unwrap_or(0);
+
+    pattern_end
+        .max(audio_end)
+        .max(take_folder_end)
+        .max(TICKS_PER_STEP)
+        .max(1)
 }
 
 struct Sequencer {
@@ -2439,6 +2457,46 @@ impl Sequencer {
                             fade_out_frames,
                         );
                         tv.next_sample_voice = (tv.next_sample_voice + 1) % SAMPLE_VOICE_COUNT;
+                    }
+                    // Take Folders (see `model::TakeFolder`) trigger one `SampleVoice` per comp
+                    // segment that starts on this tick, from the same `sample_voices` pool plain
+                    // audio clips use above — a comp segment is windowed into its take's buffer
+                    // exactly like a trimmed `AudioClip` is windowed into its own (same
+                    // `trigger_clip`), with a small fixed crossfade at every segment's edges so
+                    // switching takes mid-folder doesn't click.
+                    for folder in &track.take_folders {
+                        let tps = ticks_per_second(snapshot.bpm_at(folder.start_tick));
+                        let frames_per_tick_for = |take: &crate::model::Take| {
+                            take.buffer.as_ref().map(|b| b.sample_rate as f64 / tps)
+                        };
+                        for segment in &folder.comp {
+                            let abs_start_tick = folder.start_tick + segment.start_tick;
+                            if abs_start_tick != self.tick_index {
+                                continue;
+                            }
+                            let Some(take) = folder.takes.get(segment.take_index) else {
+                                continue;
+                            };
+                            let Some(buffer) = &take.buffer else { continue };
+                            let Some(frames_per_tick) = frames_per_tick_for(take) else {
+                                continue;
+                            };
+                            let start_frame =
+                                (segment.start_tick as f64 * frames_per_tick).round() as usize;
+                            let end_frame =
+                                (segment.end_tick as f64 * frames_per_tick).round() as usize;
+                            let crossfade_frames =
+                                (TAKE_FOLDER_CROSSFADE_SECONDS * buffer.sample_rate as f32) as usize;
+                            tv.sample_voices[tv.next_sample_voice].trigger_clip(
+                                buffer.clone(),
+                                folder.gain,
+                                start_frame,
+                                end_frame,
+                                crossfade_frames,
+                                crossfade_frames,
+                            );
+                            tv.next_sample_voice = (tv.next_sample_voice + 1) % SAMPLE_VOICE_COUNT;
+                        }
                     }
                 }
                 // The tempo *at the tick that just fired* (not the one it's about to advance to)

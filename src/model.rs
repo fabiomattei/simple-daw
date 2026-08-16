@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::pitch::{self, PitchCorrection};
 use crate::sample::SampleBuffer;
+use crate::stretch::{self, WarpMarker};
 use crate::wavetable::{WaveWarpMode, WavetableId};
 
 /// One active step-grid trigger: a velocity plus a small timing nudge off the step's own grid
@@ -1540,9 +1542,11 @@ pub struct AudioClip {
     /// Linear gain applied to this clip's playback. 1.0 is unity.
     #[serde(default = "default_clip_gain")]
     pub gain: f32,
-    /// Trim: the decoded buffer's frame index playback starts from (head trim). Real sample
-    /// frames, not ticks — audio content isn't tempo-elastic (that's a future "Flex Time" feature,
-    /// not this one). `0` plays from the buffer's own start, same as before trimming existed.
+    /// Trim: the decoded (and, if `warp_markers`/`pitch_corrections` are set, already
+    /// warped/pitch-corrected — see `load`) buffer's frame index playback starts from (head trim).
+    /// Real sample frames, not ticks — trim itself stays non-tempo-elastic even though the
+    /// underlying buffer might now be. `0` plays from the buffer's own start, same as before
+    /// trimming existed.
     #[serde(default)]
     pub source_start_frame: usize,
     /// Trim: this clip's on-timeline duration in ticks. `0` is a sentinel meaning "play to the end
@@ -1557,6 +1561,17 @@ pub struct AudioClip {
     /// silence, the audio-clip counterpart of `Region::fade_out_ticks`. `0` means no fade.
     #[serde(default)]
     pub fade_out_ticks: usize,
+    /// Flex Pitch: per-note pitch retargeting, applied by `load` before `warp_markers` (so a
+    /// correction's frame range always indexes into the *unwarped* recording, regardless of
+    /// whether the clip is also time-stretched) — see `pitch::apply_pitch_corrections`. Empty
+    /// means untouched, same sentinel convention as every other field here.
+    #[serde(default)]
+    pub pitch_corrections: Vec<PitchCorrection>,
+    /// Flex Time: a piecewise source-time-to-output-time map, applied by `load` last — see
+    /// `stretch::warp_buffer`. Fewer than 2 markers (including the empty default) means
+    /// untouched — one point alone doesn't define a span to stretch.
+    #[serde(default)]
+    pub warp_markers: Vec<WarpMarker>,
     #[serde(skip)]
     pub buffer: Option<Arc<SampleBuffer>>,
     #[serde(skip)]
@@ -1575,6 +1590,8 @@ impl AudioClip {
             length_ticks: 0,
             fade_in_ticks: 0,
             fade_out_ticks: 0,
+            pitch_corrections: Vec::new(),
+            warp_markers: Vec::new(),
             buffer: None,
             load_error: None,
         }
@@ -1607,7 +1624,66 @@ impl AudioClip {
     }
 
     /// Loads `file_path`, resampled to `target_sample_rate` — see `Lane::load_sample`, the
-    /// equivalent for step-grid one-shot samples.
+    /// equivalent for step-grid one-shot samples. If `pitch_corrections`/`warp_markers` are set,
+    /// the decoded buffer is pitch-corrected then time-warped before being stored, so every other
+    /// consumer of `buffer` (playback, trim, fades, the offline bounce) sees the edited audio
+    /// without needing to know Flex Time/Pitch exist — see `pitch::apply_pitch_corrections` and
+    /// `stretch::warp_buffer`'s doc comments for why this "bake once at load time" approach was
+    /// chosen over stretching/shifting live in the real-time engine.
+    pub fn load(&mut self, target_sample_rate: u32) {
+        let path = self.file_path.trim();
+        if path.is_empty() {
+            self.buffer = None;
+            self.load_error = None;
+            return;
+        }
+        match SampleBuffer::load_wav_resampled(std::path::Path::new(path), target_sample_rate) {
+            Ok(mut buffer) => {
+                if !self.pitch_corrections.is_empty() {
+                    buffer = pitch::apply_pitch_corrections(&buffer, &self.pitch_corrections);
+                }
+                if self.warp_markers.len() >= 2 {
+                    buffer = stretch::warp_buffer(&buffer, &self.warp_markers);
+                }
+                self.buffer = Some(Arc::new(buffer));
+                self.load_error = None;
+            }
+            Err(err) => {
+                self.buffer = None;
+                self.load_error = Some(format!("{err:#}"));
+            }
+        }
+    }
+}
+
+fn default_take_gain() -> f32 {
+    1.0
+}
+
+/// One recorded pass inside a `TakeFolder` — the same "persisted reference plus decoded buffer"
+/// split as `AudioClip`/`Lane`'s sample fields, but with no `start_tick`/gain/trim of its own:
+/// every take in a folder starts at the folder's own `start_tick`, and which stretch of which
+/// take is actually heard is entirely the `comp`'s job (see `TakeFolder`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Take {
+    pub file_path: String,
+    #[serde(skip)]
+    pub buffer: Option<Arc<SampleBuffer>>,
+    #[serde(skip)]
+    pub load_error: Option<String>,
+}
+
+impl Take {
+    pub fn new(file_path: impl Into<String>) -> Self {
+        Self {
+            file_path: file_path.into(),
+            buffer: None,
+            load_error: None,
+        }
+    }
+
+    /// Loads `file_path`, resampled to `target_sample_rate` — see `AudioClip::load`, the
+    /// equivalent for a plain (non-take) recorded/imported clip.
     pub fn load(&mut self, target_sample_rate: u32) {
         let path = self.file_path.trim();
         if path.is_empty() {
@@ -1623,6 +1699,142 @@ impl AudioClip {
             Err(err) => {
                 self.buffer = None;
                 self.load_error = Some(format!("{err:#}"));
+            }
+        }
+    }
+}
+
+/// Which take is heard for one stretch of a `TakeFolder`'s span — `start_tick`/`end_tick` are
+/// relative to the folder's own `start_tick`, not absolute song ticks (so moving the folder moves
+/// every segment with it for free). A folder's `comp` is a sequence of these covering its whole
+/// span with no gaps or overlaps — see `TakeFolder::set_active_take`, the only way `comp` is
+/// mutated in this phase (segment-level comp-dragging is a later feature).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompSegment {
+    pub start_tick: usize,
+    pub end_tick: usize,
+    pub take_index: usize,
+}
+
+/// A Logic-style "Take Folder": several recorded passes of the same performance
+/// (`takes`), all starting at the same absolute `start_tick` and covering the same on-timeline
+/// `length_ticks`, with `comp` choosing which take is heard for each stretch of that span. Lives in
+/// its own `Track::take_folders` list, parallel to `Track::audio_clips` — comping only applies to
+/// *recorded* material (see `main.rs`'s `finish_recording`); a plain imported/dragged-in file is
+/// never grouped into one of these.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TakeFolder {
+    pub start_tick: usize,
+    /// Frozen at the first take's own recorded duration when the folder is created — later takes
+    /// recorded into the same folder don't change it (see `main.rs`'s `finish_recording`), the same
+    /// way a `Region`'s `loop_length_steps` doesn't grow just because its content did.
+    pub length_ticks: usize,
+    /// Linear gain applied to whichever take/segment is currently playing. 1.0 is unity.
+    #[serde(default = "default_take_gain")]
+    pub gain: f32,
+    pub takes: Vec<Take>,
+    pub comp: Vec<CompSegment>,
+}
+
+impl TakeFolder {
+    /// A new folder with a single take occupying its whole span — the state right after the first
+    /// recording into an empty spot on an armed track.
+    pub fn new(start_tick: usize, length_ticks: usize, file_path: impl Into<String>) -> Self {
+        Self {
+            start_tick,
+            length_ticks,
+            gain: default_take_gain(),
+            takes: vec![Take::new(file_path)],
+            comp: vec![CompSegment {
+                start_tick: 0,
+                end_tick: length_ticks,
+                take_index: 0,
+            }],
+        }
+    }
+
+    /// Adds a new take (a re-recording from the exact same `start_tick`, see `finish_recording`)
+    /// and immediately comps the whole folder to it — "the take you just recorded is what you
+    /// hear," until comped otherwise. Returns the new take's index.
+    pub fn add_take_and_activate(&mut self, file_path: impl Into<String>) -> usize {
+        self.takes.push(Take::new(file_path));
+        let new_index = self.takes.len() - 1;
+        self.set_active_take(new_index);
+        new_index
+    }
+
+    /// Replaces `comp` with a single segment spanning the whole folder, assigned to `take_index` —
+    /// the "pick one whole take" operation the right-click context menu exposes (see
+    /// `assign_take_to_range` for the segment-level "quick-swipe" comp-editor's own mutation).
+    /// Out-of-bounds `take_index` is a no-op.
+    pub fn set_active_take(&mut self, take_index: usize) {
+        if take_index >= self.takes.len() {
+            return;
+        }
+        self.comp = vec![CompSegment {
+            start_tick: 0,
+            end_tick: self.length_ticks,
+            take_index,
+        }];
+    }
+
+    /// Reassigns `[start_tick, end_tick)` (clamped to the folder's own span) to `take_index`,
+    /// splitting/trimming whichever existing segments it overlaps so `comp` stays sorted, gapless,
+    /// and non-overlapping — the "quick-swipe" comp-editor's mutation (`main.rs`'s take-folder
+    /// editor window), called live as the user drags across a take's lane. `start_tick >= end_tick`
+    /// (a zero-width or backwards range) or an out-of-bounds `take_index` is a no-op.
+    pub fn assign_take_to_range(&mut self, take_index: usize, start_tick: usize, end_tick: usize) {
+        let start_tick = start_tick.min(self.length_ticks);
+        let end_tick = end_tick.min(self.length_ticks);
+        if start_tick >= end_tick || take_index >= self.takes.len() {
+            return;
+        }
+        let mut rebuilt = Vec::with_capacity(self.comp.len() + 2);
+        for segment in &self.comp {
+            // The portion of this existing segment, if any, that survives before/after the
+            // overwritten range — the range itself is pushed once, separately, below.
+            if segment.start_tick < start_tick {
+                rebuilt.push(CompSegment {
+                    start_tick: segment.start_tick,
+                    end_tick: segment.end_tick.min(start_tick),
+                    take_index: segment.take_index,
+                });
+            }
+            if segment.end_tick > end_tick {
+                rebuilt.push(CompSegment {
+                    start_tick: segment.start_tick.max(end_tick),
+                    end_tick: segment.end_tick,
+                    take_index: segment.take_index,
+                });
+            }
+        }
+        rebuilt.push(CompSegment {
+            start_tick,
+            end_tick,
+            take_index,
+        });
+        rebuilt.retain(|s| s.start_tick < s.end_tick);
+        rebuilt.sort_by_key(|s| s.start_tick);
+        // Merge neighbors that ended up pointing at the same take (overwriting into the middle of
+        // a same-take segment, or two neighbors landing on the same take after a drag) so `comp`
+        // doesn't accumulate meaningless same-take splits.
+        let mut merged: Vec<CompSegment> = Vec::with_capacity(rebuilt.len());
+        for segment in rebuilt {
+            match merged.last_mut() {
+                Some(last) if last.take_index == segment.take_index && last.end_tick == segment.start_tick => {
+                    last.end_tick = segment.end_tick;
+                }
+                _ => merged.push(segment),
+            }
+        }
+        self.comp = merged;
+    }
+
+    /// Loads every take's buffer, resampled to `target_sample_rate` — see `Song::reload_samples`.
+    pub fn load_all(&mut self, target_sample_rate: u32) {
+        for take in &mut self.takes {
+            if !take.file_path.trim().is_empty() {
+                take.load(target_sample_rate);
             }
         }
     }
@@ -1690,6 +1902,11 @@ pub struct Track {
     /// so song files saved before audio tracks existed still load, with no clips.
     #[serde(default)]
     pub audio_clips: Vec<AudioClip>,
+    /// Take Folders (see `TakeFolder`) — recorded audio grouped for comping, kept separate from
+    /// `audio_clips` since only recordings (not imports) ever land here. `#[serde(default)]` so
+    /// song files saved before comping existed still load, with none.
+    #[serde(default)]
+    pub take_folders: Vec<TakeFolder>,
     /// This track's own independently-positioned regions (see `Region`), only used when
     /// `kind` is `StepGrid`/`PianoRoll` — the melodic/drum-grid equivalent of `audio_clips`.
     /// `#[serde(default)]` so song files saved before regions existed still load, with no regions
@@ -1751,6 +1968,7 @@ impl Track {
             trine: TrineParams::default(),
             wave: WaveParams::default(),
             audio_clips: Vec::new(),
+            take_folders: Vec::new(),
             regions: Vec::new(),
             send_levels: Vec::new(),
             output: TrackOutput::Master,
@@ -1776,6 +1994,7 @@ impl Track {
             trine: TrineParams::default(),
             wave: WaveParams::default(),
             audio_clips: Vec::new(),
+            take_folders: Vec::new(),
             regions: Vec::new(),
             send_levels: Vec::new(),
             output: TrackOutput::Master,
@@ -1801,6 +2020,7 @@ impl Track {
             trine: TrineParams::default(),
             wave: WaveParams::default(),
             audio_clips: Vec::new(),
+            take_folders: Vec::new(),
             regions: Vec::new(),
             send_levels: Vec::new(),
             output: TrackOutput::Master,
@@ -2344,6 +2564,9 @@ impl Song {
                     clip.load(sample_rate);
                 }
             }
+            for folder in &mut track.take_folders {
+                folder.load_all(sample_rate);
+            }
         }
     }
 }
@@ -2480,6 +2703,7 @@ fn legacy_to_patterns_era(legacy: LegacySong) -> PatternsEraSong {
             trine: legacy_track.trine,
             wave: legacy_track.wave,
             audio_clips: Vec::new(),
+            take_folders: Vec::new(),
             regions: Vec::new(),
             send_levels: Vec::new(),
             output: TrackOutput::Master,
@@ -2820,6 +3044,15 @@ mod tests {
         clip.length_ticks = 960;
         clip.fade_in_ticks = 96;
         clip.fade_out_ticks = 192;
+        clip.pitch_corrections = vec![PitchCorrection {
+            start_frame: 100,
+            end_frame: 200,
+            target_semitones: 2.5,
+        }];
+        clip.warp_markers = vec![
+            WarpMarker { source_frame: 0, output_frame: 0 },
+            WarpMarker { source_frame: 48_000, output_frame: 44_100 },
+        ];
         song.tracks[audio_index].audio_clips.push(clip);
 
         let path = std::env::temp_dir().join(format!(
@@ -2840,6 +3073,10 @@ mod tests {
         assert_eq!(loaded_clip.length_ticks, 960);
         assert_eq!(loaded_clip.fade_in_ticks, 96);
         assert_eq!(loaded_clip.fade_out_ticks, 192);
+        assert_eq!(loaded_clip.pitch_corrections.len(), 1);
+        assert_eq!(loaded_clip.pitch_corrections[0].target_semitones, 2.5);
+        assert_eq!(loaded_clip.warp_markers.len(), 2);
+        assert_eq!(loaded_clip.warp_markers[1].output_frame, 44_100);
         assert!(
             loaded_clip.buffer.is_none(),
             "decoded audio isn't song data and must not be serialized"
@@ -2861,6 +3098,64 @@ mod tests {
         assert_eq!(clip.length_ticks, 0);
         assert_eq!(clip.fade_in_ticks, 0);
         assert_eq!(clip.fade_out_ticks, 0);
+        assert!(clip.pitch_corrections.is_empty());
+        assert!(clip.warp_markers.is_empty());
+    }
+
+    /// Writes a short mono sine WAV to the system temp dir for `AudioClip::load` integration
+    /// tests — the one place in this file that actually exercises the decode path, since
+    /// `AudioClip`'s other tests only ever set `buffer` directly.
+    fn write_test_wav(sample_rate: u32, duration_seconds: f32) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-flex-{}-{}.wav",
+            std::process::id(),
+            sample_rate
+        ));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        let n = (sample_rate as f32 * duration_seconds) as usize;
+        for i in 0..n {
+            let s = (2.0 * std::f32::consts::PI * 220.0 * i as f32 / sample_rate as f32).sin();
+            writer.write_sample((s * i16::MAX as f32) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    #[test]
+    fn load_applies_warp_markers_to_the_decoded_buffer() {
+        let sample_rate = 48_000;
+        let path = write_test_wav(sample_rate, 1.0);
+        let mut clip = AudioClip::new(0, path.to_string_lossy().to_string());
+        clip.warp_markers = vec![
+            WarpMarker { source_frame: 0, output_frame: 0 },
+            WarpMarker {
+                source_frame: sample_rate as usize,
+                output_frame: sample_rate as usize * 2,
+            },
+        ];
+        clip.load(sample_rate);
+        std::fs::remove_file(&path).ok();
+
+        let buffer = clip.buffer.expect("clip should have loaded");
+        assert_eq!(buffer.mono.len(), sample_rate as usize * 2);
+    }
+
+    #[test]
+    fn load_with_no_warp_markers_or_pitch_corrections_leaves_the_buffer_untouched() {
+        let sample_rate = 48_000;
+        let path = write_test_wav(sample_rate, 0.5);
+        let mut clip = AudioClip::new(0, path.to_string_lossy().to_string());
+        clip.load(sample_rate);
+        std::fs::remove_file(&path).ok();
+
+        let buffer = clip.buffer.expect("clip should have loaded");
+        assert_eq!(buffer.mono.len(), sample_rate as usize / 2);
     }
 
     #[test]
@@ -2891,6 +3186,150 @@ mod tests {
         }));
         // Only the remaining 0.5s (24_000 frames) past the trimmed head counts.
         assert_eq!(clip.effective_length_ticks(1000.0), 500);
+    }
+
+    #[test]
+    fn take_folder_new_comps_the_whole_span_to_its_first_take() {
+        let folder = TakeFolder::new(480, 960, "take1.wav");
+        assert_eq!(folder.takes.len(), 1);
+        assert_eq!(folder.comp.len(), 1);
+        assert_eq!(folder.comp[0].take_index, 0);
+        assert_eq!(folder.comp[0].start_tick, 0);
+        assert_eq!(folder.comp[0].end_tick, 960);
+    }
+
+    #[test]
+    fn add_take_and_activate_appends_and_comps_the_new_take() {
+        let mut folder = TakeFolder::new(0, 960, "take1.wav");
+        let new_index = folder.add_take_and_activate("take2.wav");
+        assert_eq!(new_index, 1);
+        assert_eq!(folder.takes.len(), 2);
+        assert_eq!(folder.comp.len(), 1, "still one segment spanning the whole folder");
+        assert_eq!(folder.comp[0].take_index, 1);
+    }
+
+    #[test]
+    fn set_active_take_replaces_comp_with_a_single_whole_span_segment() {
+        let mut folder = TakeFolder::new(0, 960, "take1.wav");
+        folder.add_take_and_activate("take2.wav");
+        folder.add_take_and_activate("take3.wav");
+        folder.set_active_take(0);
+        assert_eq!(folder.comp.len(), 1);
+        assert_eq!(folder.comp[0].take_index, 0);
+        assert_eq!(folder.comp[0].start_tick, 0);
+        assert_eq!(folder.comp[0].end_tick, 960);
+    }
+
+    #[test]
+    fn set_active_take_is_a_no_op_for_an_out_of_bounds_index() {
+        let mut folder = TakeFolder::new(0, 960, "take1.wav");
+        let before = folder.comp.clone();
+        folder.set_active_take(5);
+        assert_eq!(
+            folder.comp.len(),
+            before.len(),
+            "comp segment count should be unchanged"
+        );
+        assert_eq!(folder.comp[0].take_index, before[0].take_index);
+    }
+
+    #[test]
+    fn assign_take_to_range_splits_a_single_segment_into_three() {
+        let mut folder = TakeFolder::new(0, 900, "take1.wav");
+        folder.add_take_and_activate("take2.wav");
+        // Whole span is take 1 right now; paint take 0 over the middle third.
+        folder.assign_take_to_range(0, 300, 600);
+        assert_eq!(folder.comp.len(), 3);
+        assert_eq!(folder.comp[0], CompSegment { start_tick: 0, end_tick: 300, take_index: 1 });
+        assert_eq!(folder.comp[1], CompSegment { start_tick: 300, end_tick: 600, take_index: 0 });
+        assert_eq!(folder.comp[2], CompSegment { start_tick: 600, end_tick: 900, take_index: 1 });
+    }
+
+    #[test]
+    fn assign_take_to_range_merges_adjacent_segments_on_the_same_take() {
+        let mut folder = TakeFolder::new(0, 900, "take1.wav");
+        folder.add_take_and_activate("take2.wav");
+        folder.assign_take_to_range(0, 300, 600);
+        // Now paint take 1 back over the same middle third — should merge back into one segment.
+        folder.assign_take_to_range(1, 300, 600);
+        assert_eq!(folder.comp, vec![CompSegment { start_tick: 0, end_tick: 900, take_index: 1 }]);
+    }
+
+    #[test]
+    fn assign_take_to_range_clamps_to_the_folder_span() {
+        let mut folder = TakeFolder::new(0, 900, "take1.wav");
+        folder.add_take_and_activate("take2.wav");
+        folder.assign_take_to_range(0, 600, 5_000);
+        assert_eq!(
+            folder.comp,
+            vec![
+                CompSegment { start_tick: 0, end_tick: 600, take_index: 1 },
+                CompSegment { start_tick: 600, end_tick: 900, take_index: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn assign_take_to_range_is_a_no_op_for_a_backwards_or_empty_range() {
+        let mut folder = TakeFolder::new(0, 900, "take1.wav");
+        let before = folder.comp.clone();
+        folder.assign_take_to_range(0, 600, 600);
+        folder.assign_take_to_range(0, 600, 300);
+        assert_eq!(folder.comp, before);
+    }
+
+    #[test]
+    fn assign_take_to_range_is_a_no_op_for_an_out_of_bounds_take() {
+        let mut folder = TakeFolder::new(0, 900, "take1.wav");
+        let before = folder.comp.clone();
+        folder.assign_take_to_range(5, 100, 200);
+        assert_eq!(folder.comp, before);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_a_take_folder_and_its_comp() {
+        let mut song = Song::demo();
+        let audio_index = song.add_track("Vocals", 5, TrackKind::Audio);
+        let mut folder = TakeFolder::new(48, 960, "take1.wav");
+        folder.add_take_and_activate("take2.wav");
+        folder.gain = 0.7;
+        song.tracks[audio_index].take_folders.push(folder);
+
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-take-folder-{}.json",
+            std::process::id()
+        ));
+        song.save_to_file(&path).unwrap();
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.tracks[audio_index].take_folders.len(), 1);
+        let loaded_folder = &loaded.tracks[audio_index].take_folders[0];
+        assert_eq!(loaded_folder.start_tick, 48);
+        assert_eq!(loaded_folder.length_ticks, 960);
+        assert_eq!(loaded_folder.gain, 0.7);
+        assert_eq!(loaded_folder.takes.len(), 2);
+        assert_eq!(loaded_folder.takes[0].file_path, "take1.wav");
+        assert_eq!(loaded_folder.takes[1].file_path, "take2.wav");
+        assert_eq!(loaded_folder.comp.len(), 1);
+        assert_eq!(loaded_folder.comp[0].take_index, 1);
+        assert!(
+            loaded_folder.takes[0].buffer.is_none(),
+            "decoded audio isn't song data and must not be serialized"
+        );
+    }
+
+    #[test]
+    fn take_folder_from_a_pre_comping_song_file_defaults_to_no_folders() {
+        // A song file saved before comping existed has no `take_folders` key on its tracks at all
+        // — `#[serde(default)]` must fill it with an empty list, not fail to parse. Derived from a
+        // real `Track`'s own JSON (minus the one key under test) so every other field stays valid,
+        // rather than hand-rolling a minimal JSON object that could drift from the real shape.
+        let track = Track::new_audio("Vocals", 5);
+        let mut value = serde_json::to_value(&track).unwrap();
+        value.as_object_mut().unwrap().remove("take_folders");
+        let loaded: Track = serde_json::from_value(value).unwrap();
+        assert!(loaded.take_folders.is_empty());
     }
 
     #[test]

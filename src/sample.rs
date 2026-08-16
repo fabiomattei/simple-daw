@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 
 /// A one-shot audio sample, downmixed to mono and pre-resampled to the
 /// audio engine's output sample rate so playback is just a straight read.
+#[derive(Clone)]
 pub struct SampleBuffer {
     pub sample_rate: u32,
     pub mono: Vec<f32>,
