@@ -4539,6 +4539,7 @@ fn mix_song_to_wav_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::CurveShape;
 
     #[test]
     fn pitch_to_freq_matches_concert_a() {
@@ -5654,8 +5655,8 @@ mod tests {
         song.tracks[0].automation = vec![crate::model::AutomationLane {
             target: crate::model::AutomationTarget::Volume,
             points: vec![
-                crate::model::AutomationPoint { tick: 0, value: 0.0 },
-                crate::model::AutomationPoint { tick: span_ticks, value: 1.0 },
+                crate::model::AutomationPoint { tick: 0, value: 0.0, curve: CurveShape::default() },
+                crate::model::AutomationPoint { tick: span_ticks, value: 1.0, curve: CurveShape::default() },
             ],
         }];
 
@@ -5800,13 +5801,13 @@ mod tests {
                 AutomationLane {
                     target: AutomationTarget::Volume,
                     points: vec![
-                        AutomationPoint { tick: 0, value: 0.0 },
-                        AutomationPoint { tick: 96, value: 1.0 },
+                        AutomationPoint { tick: 0, value: 0.0, curve: CurveShape::default() },
+                        AutomationPoint { tick: 96, value: 1.0, curve: CurveShape::default() },
                     ],
                 },
                 AutomationLane {
                     target: AutomationTarget::Pan,
-                    points: vec![AutomationPoint { tick: 0, value: -1.0 }],
+                    points: vec![AutomationPoint { tick: 0, value: -1.0, curve: CurveShape::default() }],
                 },
             ],
         )]);
@@ -5824,7 +5825,7 @@ mod tests {
             4,
             vec![AutomationLane {
                 target: AutomationTarget::Volume,
-                points: vec![AutomationPoint { tick: 0, value: 0.25 }],
+                points: vec![AutomationPoint { tick: 0, value: 0.25, curve: CurveShape::default() }],
             }],
         )]);
         // Past the region's on-timeline span (4 steps * TICKS_PER_STEP).
@@ -5840,14 +5841,14 @@ mod tests {
             vec![
                 AutomationLane {
                     target: AutomationTarget::SendLevel { send_index: 2 },
-                    points: vec![AutomationPoint { tick: 0, value: 0.6 }],
+                    points: vec![AutomationPoint { tick: 0, value: 0.6, curve: CurveShape::default() }],
                 },
                 AutomationLane {
                     target: AutomationTarget::EffectParam {
                         slot_index: 0,
                         key: EffectParamKey::BuiltIn { param_name: "Mix".to_string() },
                     },
-                    points: vec![AutomationPoint { tick: 0, value: 0.3 }],
+                    points: vec![AutomationPoint { tick: 0, value: 0.3, curve: CurveShape::default() }],
                 },
             ],
         )]);
@@ -5871,14 +5872,14 @@ mod tests {
             vec![
                 AutomationLane {
                     target: AutomationTarget::OtherTrackVolume { track_index: 1 },
-                    points: vec![AutomationPoint { tick: 0, value: 0.4 }],
+                    points: vec![AutomationPoint { tick: 0, value: 0.4, curve: CurveShape::default() }],
                 },
                 AutomationLane {
                     target: AutomationTarget::MasterEffectParam {
                         slot_index: 0,
                         key: EffectParamKey::BuiltIn { param_name: "Mix".to_string() },
                     },
-                    points: vec![AutomationPoint { tick: 0, value: 0.8 }],
+                    points: vec![AutomationPoint { tick: 0, value: 0.8, curve: CurveShape::default() }],
                 },
             ],
         )]);
@@ -5902,8 +5903,8 @@ mod tests {
         song.tracks[0].automation.push(AutomationLane {
             target: AutomationTarget::Volume,
             points: vec![
-                AutomationPoint { tick: 0, value: 0.2 },
-                AutomationPoint { tick: 100, value: 1.0 },
+                AutomationPoint { tick: 0, value: 0.2, curve: CurveShape::default() },
+                AutomationPoint { tick: 100, value: 1.0, curve: CurveShape::default() },
             ],
         });
         // No region at all, let alone one active at tick 50 — the track-wide lane still applies,
@@ -5919,12 +5920,12 @@ mod tests {
             4,
             vec![AutomationLane {
                 target: AutomationTarget::Volume,
-                points: vec![AutomationPoint { tick: 0, value: 0.9 }],
+                points: vec![AutomationPoint { tick: 0, value: 0.9, curve: CurveShape::default() }],
             }],
         )]);
         song.tracks[0].automation.push(AutomationLane {
             target: AutomationTarget::Volume,
-            points: vec![AutomationPoint { tick: 0, value: 0.1 }],
+            points: vec![AutomationPoint { tick: 0, value: 0.1, curve: CurveShape::default() }],
         });
         // Tick 0 is inside the region's on-timeline span — its lane should win over the
         // track-wide one on the same target (Volume), per `Track::automation`'s doc comment.

@@ -10,6 +10,7 @@ Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three bu
 - **Piano roll** — free-form melodic editing on a custom-painted canvas: click-drag to draw notes of any length, drag to move/resize, multi-select (Ctrl/Cmd-click, Shift-drag box select) to move or delete several notes at once, with a per-note velocity lane. See [Using the piano roll](#using-the-piano-roll) below.
 - **Three synth engines, selectable per track** — `Simple` (the original sine-family oscillator + exponential-decay envelope, percussive only), `Trine` (multi-oscillator with a filter/mod matrix), and `Wave` (two wavetable oscillators with position-morph and phase-warp, on the same filter/mod-matrix machinery as `Trine`). A library of built-in factory presets ships for all three.
 - **Playlist / arrangement** — each track owns its own independently positioned `Region`s (step-grid or piano-roll content, Logic/Ableton-style — not a shared FL Studio–style pattern), dragged and resized along a shared song timeline.
+- **Session View** — an Ableton-style clip-launching grid (tracks × rows) as an alternative to the Playlist: right-click an empty slot to assign an already-authored Region or audio clip into it, then click to launch/stop it, quantized to the next bar (or another note value, from the Quantize dropdown). Session View plays at most one clip per track at a time — launching a new one always stops whatever else was playing there. A "▶" button per row launches a whole scene (every track's clip at that row at once, leaving tracks with nothing there untouched). Right-click a filled slot for **Legato** (a launch continues the outgoing clip's playback phase instead of restarting silent-to-beat-one) and **Follow Action…** (auto-trigger another clip — Next/Previous/First/Last/Any/a specific row/itself again — after playing through a set number of times, with two independently-weighted candidate actions like Ableton's own). A toolbar toggle switches the transport between playing the Playlist arrangement and playing Session View — never both at once.
 - **Sample playback** — WAV one-shots via a per-track 32-voice sample player pool, resampled to the output device's rate at load time.
 - **Audio tracks** — record live input straight to a WAV file and drop it on the timeline as a clip, or import an existing WAV the same way. Recordings made from the same playhead position group into a "Take Folder" instead of piling up as overlapping clips (see **Take Folder comping** below).
 - **Non-destructive clip trim and fades** — drag a clip's edges in the Playlist to trim its head/tail or set a fade in/out, without touching the source file.
@@ -22,7 +23,7 @@ Scope is deliberately narrow: step-sequencer + piano-roll MIDI editing, three bu
 - **Effect chains, master bus, per track, per send, and per submix** — mix built-in DSP (delay, reverb, compressor, limiter, channel EQ, and more) with hosted CLAP plugins in any order, on the master bus, any track, any send bus, or any submix bus. New songs start with a default Limiter loaded on the master bus, the way Logic ships an Adaptive Limiter on master by default. CLAP hosting has host-side parameter editing (a generic "Params" window driven by the plugin's declared CLAP parameters) but no plugin GUI and no unload mid-session once a plugin is loaded.
 - **Send buses** — aux buses with their own FX chain; each track gets a per-send level knob (post-fader) on its Mixer channel strip.
 - **Submix buses (Track Stacks / alternate output routing)** — route a track's output into a shared submix bus instead of straight to master, picked from an "Output" dropdown on its Mixer channel strip. A submix has its own fader, Mute/Solo, and FX chain, so a group of tracks can share one compressor/reverb instance and be ridden together with one fader — Logic's Track Stack, minimal version.
-- **Region fades and automation** — drag a Region's corner handles in the Playlist for a fade in/out; every Region also carries its own automation lanes (volume/pan/send-level/effect-param "rides," multi-point, edited under the Piano Roll/Beats grid) scoped to that Region's own track.
+- **Region fades and automation** — drag a Region's corner handles in the Playlist for a fade in/out; every Region also carries its own automation lanes (volume/pan/send-level/effect-param "rides," multi-point, edited under the Piano Roll/Beats grid) scoped to that Region's own track. Each point's segment into the next can be a straight line, an eased curve (Exponential/Logarithmic), or a Hold step — click an existing point to cycle its shape.
 - **Metering** — peak/RMS bar meters and BS.1770-4 LUFS (momentary/short-term/integrated) on every Mixer channel strip, the master strip, and every submix strip.
 - **Quantize, humanize, and groove templates** — snap piano-roll notes to a grid at an adjustable strength, randomly nudge timing/velocity, or apply a built-in swing/accent template (straight, swing 8th/16th, MPC push/lay-back) from the Piano Roll toolbar. Step-grid lanes get the same humanize/groove-template treatment from a per-lane "🎲" menu in the Beats window, including a small per-step timing offset (not just velocity) that the step-grid never had before.
 - **Tap tempo and audio tempo detection** — tap the transport LCD's TAP button in time to set the song's BPM, or use File → Detect Tempo… to estimate a WAV file's BPM from its audio content (best on clearly rhythmic material like a drum loop or click track) and apply it to the song.
@@ -64,6 +65,8 @@ The velocity of each note is set via the velocity lane below the grid: drag a no
 ```bash
 cargo build       # debug build
 cargo run         # launch the GUI app
+cargo run --bin simple-daw
+cargo run --bin simple-daw-mcp
 ```
 
 ### Tests
@@ -80,19 +83,24 @@ Unit tests cover synth/DSP math and the WAV exporter, but can't prove the live a
 - `src/main.rs` — egui/eframe UI. Owns the `Song` behind an `Arc<Mutex<Song>>`, shared with the audio thread. Also has the File menu (Load/Save/Save As/Export), the channel rack, piano roll and step-grid canvases, and the per-engine/per-effect parameter windows.
 - `src/model.rs` — pure data model: `Song` → `Track` → `Region` → `RegionContent` (`Lane` steps or `Note`s). No audio, no UI. Also owns JSON save/load (`serde`/`serde_json`).
 - `src/factory_presets.rs` — the built-in `SynthPreset` catalog shipped with the app, several patches per synth engine.
-- `src/audio.rs` — the real-time engine: cpal stream setup, the step/tick clock and per-track synth voice pools (one per engine, plus a sample-playback pool), master-bus/per-track/per-send/per-submix effect chain processing (CLAP and built-in), submix output routing and mute/solo, region fade/automation evaluation, and the offline WAV exporter.
+- `src/audio.rs` — the real-time engine: cpal stream setup, the step/tick clock and per-track synth voice pools (one per engine, plus a sample-playback pool), master-bus/per-track/per-send/per-submix effect chain processing (CLAP and built-in), submix output routing and mute/solo, region fade/automation evaluation, Session View clip triggering, and the offline WAV exporter.
+- `src/session.rs` — pure Session View clip-slot state machine, launch-quantization, and follow-action resolution logic (no audio, no UI).
+- `src/session_view_ui.rs` — the Session View clip-launching grid UI: launch/stop, scene buttons, and the Legato/Follow Action controls.
 - `src/builtin_fx/` — DSP for the built-in (non-CLAP) effects, one file per effect: delay, bitcrusher, distortion, reverb, chorus, filter, tremolo, compressor, flanger, phaser, ring modulator, noise gate, phase invert, channel EQ, limiter.
 - `src/plugin_host.rs` — CLAP plugin hosting (loading, activating, querying audio-port channel counts and plugin parameters, running audio through a loaded effect).
+- `src/gui_embed/` — per-platform (Cocoa/Win32/X11) native embedding of a CLAP plugin's own GUI into a host window.
 - `src/metering.rs` — peak/RMS/LUFS metering for the Mixer's channel strips.
 - `src/sample.rs` — WAV decoding and resampling for one-shot sample playback.
 - `src/wavetable.rs` — wavetable data and sampling for the `Wave` synth engine.
 - `src/midi_import.rs` — standard MIDI file (`.mid`) import into piano-roll notes.
+- `src/audio_input.rs` — live audio input capture for Audio-track recording.
 - `src/groove.rs` — quantize/humanize/groove-template transforms for piano-roll notes and step-grid lanes.
 - `src/tempo.rs` — tap-tempo BPM averaging.
 - `src/tempo_detection.rs` — estimates a WAV file's BPM from its audio content.
 - `src/transient_detection.rs` — attack/onset detection and silence-gate segmentation, behind a clip's transient markers and "Strip Silence".
 - `src/stretch.rs` — WSOLA time-stretch, behind Flex Time.
 - `src/pitch.rs` — pitch detection and pitch-shifting, behind Flex Pitch.
+- `src/mcp_control.rs` / `src/bin/simple-daw-mcp.rs` — optional (Unix only) MCP server letting an LLM drive a running instance.
 
 ## License
 

@@ -838,6 +838,56 @@ pub enum EffectParamKey {
     BuiltIn { param_name: String },
 }
 
+/// How `AutomationLane::value_at_fractional` interpolates the segment running *from* a point *to*
+/// the next one — a property of the earlier point, not the lane as a whole, so different segments
+/// of the same lane can shape differently (e.g. a fast attack into a held sustain). Fixed shapes
+/// rather than a continuously adjustable curve amount (the way Logic/Cubase let you drag a curve's
+/// bend) — the minimum needed to cover "fades in gently"/"fades in sharply"/"snaps" without a new
+/// per-point drag gesture; `Exponential`/`Logarithmic` are eased power curves (`t*t`/
+/// `1-(1-t)*(1-t)`), not literal `exp`/`log` of the automated value, since a literal log/exp domain
+/// doesn't hold up across every automation target this app has (`Pan` spans negative values, for
+/// one).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CurveShape {
+    #[default]
+    Linear,
+    /// Eases in: slow to leave this point's value, accelerating into the next.
+    Exponential,
+    /// Eases out: quick to leave this point's value, decelerating into the next.
+    Logarithmic,
+    /// Stays at this point's value for the whole segment, then jumps at the very end — a step,
+    /// not a ramp.
+    Hold,
+}
+
+impl CurveShape {
+    /// Warps a linear `0.0..=1.0` segment-progress fraction into this shape's own progress at
+    /// that same point — `value_at_fractional` then interpolates `before.value..after.value` by
+    /// the warped fraction instead of the raw one. `t` is expected already clamped to `0.0..=1.0`
+    /// by the caller; out-of-range input isn't clamped again here. `pub` so
+    /// `automation_lane_graph_ui` (`main.rs`) can draw a faithful curve preview using the exact
+    /// same math playback evaluates, not a decorative approximation of it.
+    pub fn warp(self, t: f32) -> f32 {
+        match self {
+            Self::Linear => t,
+            Self::Exponential => t * t,
+            Self::Logarithmic => 1.0 - (1.0 - t) * (1.0 - t),
+            Self::Hold => 0.0,
+        }
+    }
+
+    /// Cycles to the next shape in menu order — `automation_lane_graph_ui`'s "click an existing
+    /// point to cycle its curve shape" gesture (see `main.rs`).
+    pub fn next(self) -> Self {
+        match self {
+            Self::Linear => Self::Exponential,
+            Self::Exponential => Self::Logarithmic,
+            Self::Logarithmic => Self::Hold,
+            Self::Hold => Self::Linear,
+        }
+    }
+}
+
 /// One (tick, value) point on an `AutomationLane`'s curve — `tick` is relative to the owning
 /// `Region`'s own `start_tick` (this region's local time, like `fade_in_ticks`/`fade_out_ticks`),
 /// not an absolute song position. `value` is in whatever unit `AutomationLane::target` naturally
@@ -847,6 +897,11 @@ pub enum EffectParamKey {
 pub struct AutomationPoint {
     pub tick: usize,
     pub value: f32,
+    /// See `CurveShape`. Shapes the segment from this point to the next one; meaningless on the
+    /// lane's last point (there's no next segment to shape). `#[serde(default)]` so lanes saved
+    /// before curve shapes existed still load as straight lines — unchanged behavior.
+    #[serde(default)]
+    pub curve: CurveShape,
 }
 
 /// A single automated parameter's "ride" over a `Region`'s on-timeline span: a target plus an
@@ -862,11 +917,12 @@ pub struct AutomationLane {
 
 impl AutomationLane {
     /// This lane's value at `tick` (relative to the region's `start_tick`, same convention as
-    /// `AutomationPoint::tick`), linearly interpolated between the two points bracketing it —
-    /// holds the nearest point's value outside the lane's own range. `None` if the lane has no
-    /// points at all, meaning "not automated yet" — callers fall back to the target's static value
-    /// (`Track::volume`, etc.) in that case, the same way an empty `points` list reads as "no
-    /// override" rather than "override to 0".
+    /// `AutomationPoint::tick`), interpolated between the two points bracketing it by the earlier
+    /// point's own `CurveShape` (straight-line by default) — holds the nearest point's value
+    /// outside the lane's own range. `None` if the lane has no points at all, meaning "not
+    /// automated yet" — callers fall back to the target's static value (`Track::volume`, etc.) in
+    /// that case, the same way an empty `points` list reads as "no override" rather than "override
+    /// to 0".
     ///
     /// Takes a fractional tick rather than a whole sequencer tick so a caller evaluating per audio
     /// sample (rather than per sequencer tick) gets a smoothly interpolated value instead of one
@@ -892,7 +948,8 @@ impl AutomationLane {
                 } else {
                     0.0
                 };
-                before.value + (after.value - before.value) * frac as f32
+                let warped = before.curve.warp((frac as f32).clamp(0.0, 1.0));
+                before.value + (after.value - before.value) * warped
             }
             (Some(before), None) => before.value,
             (None, Some(after)) => after.value,
@@ -3072,6 +3129,24 @@ mod tests {
     }
 
     #[test]
+    fn curve_shape_warp_matches_the_line_at_the_segment_endpoints() {
+        for shape in [CurveShape::Linear, CurveShape::Exponential, CurveShape::Logarithmic] {
+            assert_eq!(shape.warp(0.0), 0.0, "{shape:?} should start exactly at the first point");
+            assert!((shape.warp(1.0) - 1.0).abs() < 1e-6, "{shape:?} should end exactly at the next point");
+        }
+        // Hold is the one shape that does *not* reach 1.0 at t=1.0 — see its own doc comment.
+        assert_eq!(CurveShape::Hold.warp(1.0), 0.0);
+    }
+
+    #[test]
+    fn curve_shape_next_cycles_through_every_shape_and_back() {
+        assert_eq!(CurveShape::Linear.next(), CurveShape::Exponential);
+        assert_eq!(CurveShape::Exponential.next(), CurveShape::Logarithmic);
+        assert_eq!(CurveShape::Logarithmic.next(), CurveShape::Hold);
+        assert_eq!(CurveShape::Hold.next(), CurveShape::Linear);
+    }
+
+    #[test]
     fn value_at_is_none_for_an_empty_lane() {
         let lane = AutomationLane { target: AutomationTarget::Volume, points: Vec::new() };
         assert_eq!(lane.value_at_fractional(0.0), None);
@@ -3082,7 +3157,7 @@ mod tests {
     fn value_at_holds_the_single_point_everywhere() {
         let lane = AutomationLane {
             target: AutomationTarget::Volume,
-            points: vec![AutomationPoint { tick: 50, value: 0.75 }],
+            points: vec![AutomationPoint { tick: 50, value: 0.75, curve: CurveShape::default() }],
         };
         assert_eq!(lane.value_at_fractional(0.0), Some(0.75));
         assert_eq!(lane.value_at_fractional(50.0), Some(0.75));
@@ -3094,8 +3169,8 @@ mod tests {
         let lane = AutomationLane {
             target: AutomationTarget::Pan,
             points: vec![
-                AutomationPoint { tick: 0, value: -1.0 },
-                AutomationPoint { tick: 100, value: 1.0 },
+                AutomationPoint { tick: 0, value: -1.0, curve: CurveShape::default() },
+                AutomationPoint { tick: 100, value: 1.0, curve: CurveShape::default() },
             ],
         };
         assert_eq!(lane.value_at_fractional(0.0), Some(-1.0));
@@ -3104,12 +3179,119 @@ mod tests {
     }
 
     #[test]
+    fn value_at_holds_flat_then_jumps_for_a_hold_curve() {
+        let lane = AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![
+                AutomationPoint { tick: 0, value: 0.0, curve: CurveShape::Hold },
+                AutomationPoint { tick: 100, value: 1.0, curve: CurveShape::default() },
+            ],
+        };
+        assert_eq!(lane.value_at_fractional(0.0), Some(0.0));
+        assert_eq!(lane.value_at_fractional(50.0), Some(0.0));
+        assert_eq!(lane.value_at_fractional(99.999), Some(0.0));
+        // Exactly at the next point, that point's own value takes over.
+        assert_eq!(lane.value_at_fractional(100.0), Some(1.0));
+    }
+
+    #[test]
+    fn value_at_eases_in_for_an_exponential_curve() {
+        let lane = AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![
+                AutomationPoint { tick: 0, value: 0.0, curve: CurveShape::Exponential },
+                AutomationPoint { tick: 100, value: 1.0, curve: CurveShape::default() },
+            ],
+        };
+        // Ease-in: stays below the straight-line value for the first half of the segment.
+        let midpoint = lane.value_at_fractional(50.0).unwrap();
+        assert!(midpoint < 0.5, "exponential should ease in below the linear midpoint, got {midpoint}");
+        assert_eq!(lane.value_at_fractional(0.0), Some(0.0));
+        assert_eq!(lane.value_at_fractional(100.0), Some(1.0));
+    }
+
+    #[test]
+    fn value_at_eases_out_for_a_logarithmic_curve() {
+        let lane = AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![
+                AutomationPoint { tick: 0, value: 0.0, curve: CurveShape::Logarithmic },
+                AutomationPoint { tick: 100, value: 1.0, curve: CurveShape::default() },
+            ],
+        };
+        // Ease-out: already past the straight-line value by the first half of the segment.
+        let midpoint = lane.value_at_fractional(50.0).unwrap();
+        assert!(midpoint > 0.5, "logarithmic should ease out above the linear midpoint, got {midpoint}");
+        assert_eq!(lane.value_at_fractional(0.0), Some(0.0));
+        assert_eq!(lane.value_at_fractional(100.0), Some(1.0));
+    }
+
+    #[test]
+    fn a_points_own_curve_shape_round_trips_through_save_and_load() {
+        let mut song = Song::demo();
+        song.tracks[0].automation.push(AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![
+                AutomationPoint { tick: 0, value: 0.2, curve: CurveShape::Exponential },
+                AutomationPoint { tick: 100, value: 0.8, curve: CurveShape::Hold },
+            ],
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-curve-shape-round-trip-{}.json",
+            std::process::id()
+        ));
+        song.save_to_file(&path).unwrap();
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let points = &loaded.tracks[0].automation[0].points;
+        assert_eq!(points[0].curve, CurveShape::Exponential);
+        assert_eq!(points[1].curve, CurveShape::Hold);
+    }
+
+    #[test]
+    fn automation_point_defaults_to_linear_curve_for_pre_existing_song_files() {
+        // A song file saved before curve shapes existed: its automation point has no "curve" key.
+        let json = r#"{
+            "name": "Old Automation Song",
+            "bpm": 120.0,
+            "next_note_id": 0,
+            "tracks": [
+                {
+                    "name": "Lead",
+                    "midi_channel": 1,
+                    "muted": false,
+                    "kind": "PianoRoll",
+                    "default_note_length_ticks": 96,
+                    "automation": [
+                        {
+                            "target": { "kind": "Volume" },
+                            "points": [{ "tick": 0, "value": 0.5 }]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let path = std::env::temp_dir().join(format!(
+            "simple-daw-test-legacy-curve-shape-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = Song::load_from_file(&path, None).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.tracks[0].automation[0].points[0].curve, CurveShape::Linear);
+    }
+
+    #[test]
     fn value_at_fractional_interpolates_between_whole_ticks() {
         let lane = AutomationLane {
             target: AutomationTarget::Pan,
             points: vec![
-                AutomationPoint { tick: 0, value: -1.0 },
-                AutomationPoint { tick: 100, value: 1.0 },
+                AutomationPoint { tick: 0, value: -1.0, curve: CurveShape::default() },
+                AutomationPoint { tick: 100, value: 1.0, curve: CurveShape::default() },
             ],
         };
         assert!((lane.value_at_fractional(25.5).unwrap() - -0.49).abs() < 1e-6);
@@ -3120,8 +3302,8 @@ mod tests {
         let lane = AutomationLane {
             target: AutomationTarget::Volume,
             points: vec![
-                AutomationPoint { tick: 20, value: 0.2 },
-                AutomationPoint { tick: 80, value: 0.8 },
+                AutomationPoint { tick: 20, value: 0.2, curve: CurveShape::default() },
+                AutomationPoint { tick: 80, value: 0.8, curve: CurveShape::default() },
             ],
         };
         assert_eq!(lane.value_at_fractional(0.0), Some(0.2));
@@ -3133,8 +3315,8 @@ mod tests {
         let lane = AutomationLane {
             target: AutomationTarget::Volume,
             points: vec![
-                AutomationPoint { tick: 100, value: 1.0 },
-                AutomationPoint { tick: 0, value: 0.0 },
+                AutomationPoint { tick: 100, value: 1.0, curve: CurveShape::default() },
+                AutomationPoint { tick: 0, value: 0.0, curve: CurveShape::default() },
             ],
         };
         assert!((lane.value_at_fractional(50.0).unwrap() - 0.5).abs() < 1e-6);
@@ -3922,8 +4104,8 @@ mod tests {
         song.tracks[0].automation = vec![AutomationLane {
             target: AutomationTarget::OtherTrackVolume { track_index: 1 },
             points: vec![
-                AutomationPoint { tick: 0, value: 1.0 },
-                AutomationPoint { tick: 480, value: 0.25 },
+                AutomationPoint { tick: 0, value: 1.0, curve: CurveShape::default() },
+                AutomationPoint { tick: 480, value: 0.25, curve: CurveShape::default() },
             ],
         }];
 

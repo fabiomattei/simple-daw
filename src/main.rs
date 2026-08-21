@@ -32,7 +32,7 @@ use factory_presets::factory_presets;
 use groove::GROOVE_TEMPLATES;
 use metering::{MeterHandles, MeterReadings};
 use model::{
-    AudioClip, AutomationLane, AutomationPoint, AutomationTarget, EffectParamKey, EqBandType,
+    AudioClip, AutomationLane, AutomationPoint, AutomationTarget, CurveShape, EffectParamKey, EqBandType,
     FilterMode, FilterRouting, FilterSlope, FilterType, Lane, LfoTarget, MAX_STEP_TIMING_OFFSET_TICKS,
     ModSlot, ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, SendBus, Song,
     StepData, SubmixBus, SynthEngine, SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP,
@@ -508,6 +508,17 @@ enum FxChainKind {
     Submix,
 }
 
+/// Which track's or step-grid lane's instrument + effect chain the always-visible bottom Device
+/// Panel (see `device_panel_contents_ui`) is currently showing — the Bitwig/Ableton-style docked
+/// device rack, replacing the old per-track/per-lane synth-settings windows this app used to open
+/// on a "🎹" click. `Lane` is one level deeper than `Track` since a lane's synth belongs to a
+/// specific region's lane rather than the whole track (see `Lane::synth_override`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceChainFocus {
+    Track(usize),
+    Lane { track_index: usize, region_index: usize, lane_index: usize },
+}
+
 /// What kind of row `track_ui` should draw for one FX chain slot — determined by peeking at the
 /// live `TrackEffectSlots` entry rather than tracking a parallel "kind" array, since that entry is
 /// already the source of truth for what's actually running. `Clap` covers both an already-loaded
@@ -643,15 +654,11 @@ struct SimpleDawApp {
     /// closes whichever one this points at first; floating GUIs aren't tracked here since they're
     /// independent OS windows that can already coexist.
     active_embedded_gui: Option<EffectEditorTarget>,
-    /// Index of the track whose synth-settings window (waveform/attack/decay) is currently open,
-    /// if any. Unlike `effect_editor`, this operates straight on `Song::tracks[..].synth` (model
-    /// data, no live plugin instance to juggle), so its window body just borrows `song` directly.
-    synth_editor: Option<usize>,
-    /// (track index, region index, lane index) of the step-grid lane whose own synth-override
-    /// editor window is open, if any — see `Lane::synth_override`. Same shape/rationale as
-    /// `synth_editor`, one level deeper since a lane's synth belongs to a specific region's lane
-    /// rather than the whole track.
-    lane_synth_editor: Option<(usize, usize, usize)>,
+    /// Which track's or lane's instrument + effect chain the bottom Device Panel is showing, if
+    /// any — see `DeviceChainFocus`. Unlike `effect_editor`, a `Track` focus operates straight on
+    /// `Song::tracks[..].synth`/`.trine`/`.wave` (model data, no live plugin instance to juggle),
+    /// so the panel body just borrows `song` directly for that part.
+    device_chain_focus: Option<DeviceChainFocus>,
     /// Text field backing the "Save as preset" button in the synth editor window — shared across
     /// tracks/sessions like `save_as_path` is for song files, since only one synth editor window
     /// (and thus one preset-name input) can be open at a time.
@@ -918,8 +925,7 @@ impl SimpleDawApp {
             follow_action_editor: None,
             effect_editor: None,
             active_embedded_gui: None,
-            synth_editor: None,
-            lane_synth_editor: None,
+            device_chain_focus: None,
             new_preset_name: String::new(),
             preset_message: None,
             piano_roll_drag: None,
@@ -985,7 +991,7 @@ struct ChannelRackUi<'a> {
     track_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
     track_meters: &'a MeterHandles,
     effect_editor: &'a mut Option<EffectEditorTarget>,
-    synth_editor: &'a mut Option<usize>,
+    device_chain_focus: &'a mut Option<DeviceChainFocus>,
     /// The record-armed `Audio`-kind track (if any) and its chosen input device — see
     /// `SimpleDawApp::record_armed_track`/`selected_input_device`.
     record_armed_track: &'a mut Option<usize>,
@@ -1082,8 +1088,9 @@ fn channel_rack_contents_ui(
                 known_plugins: &song.plugins,
                 track_names: &track_names,
                 editor: &mut *rack.effect_editor,
-                synth_editor: &mut *rack.synth_editor,
+                device_chain_focus: &mut *rack.device_chain_focus,
                 remove_requested: &mut *track_to_remove,
+                inline_params: false,
             };
             channel_rack_row_ui(
                 ui,
@@ -1171,8 +1178,8 @@ fn mixer_contents_ui(
                 // Unused by `fx_chain_ui` itself (only `channel_rack_row_ui`'s own Synth/Remove
                 // buttons touch these) — the Mixer strip has neither button, but `TrackFxUi` needs
                 // somewhere to point since it's shared with the Channel Rack. Same pattern as the
-                // "Plugins" window's master-chain `unused_synth_editor`/`unused_remove_requested`.
-                let mut unused_synth_editor: Option<usize> = None;
+                // "Plugins" window's master-chain `unused_device_chain_focus`/`unused_remove_requested`.
+                let mut unused_device_chain_focus: Option<DeviceChainFocus> = None;
                 let mut unused_remove_requested: Option<usize> = None;
                 let mut fx = TrackFxUi {
                     track_index,
@@ -1186,8 +1193,9 @@ fn mixer_contents_ui(
                     known_plugins: &song.plugins,
                     track_names: &track_names,
                     editor: &mut *mixer.effect_editor,
-                    synth_editor: &mut unused_synth_editor,
+                    device_chain_focus: &mut unused_device_chain_focus,
                     remove_requested: &mut unused_remove_requested,
+                    inline_params: false,
                 };
                 let meter = mixer
                     .track_meters
@@ -1206,7 +1214,7 @@ fn mixer_contents_ui(
                 );
             }
 
-            let mut unused_synth_editor: Option<usize> = None;
+            let mut unused_device_chain_focus: Option<DeviceChainFocus> = None;
             let mut unused_remove_requested: Option<usize> = None;
             let mut master_fx = TrackFxUi {
                 track_index: 0,
@@ -1220,8 +1228,9 @@ fn mixer_contents_ui(
                 known_plugins: &song.plugins,
                 track_names: &track_names,
                 editor: &mut *mixer.effect_editor,
-                synth_editor: &mut unused_synth_editor,
+                device_chain_focus: &mut unused_device_chain_focus,
                 remove_requested: &mut unused_remove_requested,
+                inline_params: false,
             };
             let master_meter = mixer
                 .master_meter
@@ -1234,7 +1243,7 @@ fn mixer_contents_ui(
             ui.separator();
             let mut send_to_remove: Option<usize> = None;
             for (send_index, send) in song.sends.iter_mut().enumerate() {
-                let mut unused_synth_editor: Option<usize> = None;
+                let mut unused_device_chain_focus: Option<DeviceChainFocus> = None;
                 let mut unused_remove_requested: Option<usize> = None;
                 let mut send_fx = TrackFxUi {
                     track_index: send_index,
@@ -1248,8 +1257,9 @@ fn mixer_contents_ui(
                     known_plugins: &song.plugins,
                     track_names: &track_names,
                     editor: &mut *mixer.effect_editor,
-                    synth_editor: &mut unused_synth_editor,
+                    device_chain_focus: &mut unused_device_chain_focus,
                     remove_requested: &mut unused_remove_requested,
+                    inline_params: false,
                 };
                 mixer_send_strip_ui(ui, send, send_index, &mut send_fx, &mut send_to_remove);
             }
@@ -1282,7 +1292,7 @@ fn mixer_contents_ui(
             ui.separator();
             let mut submix_to_remove: Option<usize> = None;
             for (submix_index, submix) in song.submixes.iter_mut().enumerate() {
-                let mut unused_synth_editor: Option<usize> = None;
+                let mut unused_device_chain_focus: Option<DeviceChainFocus> = None;
                 let mut unused_remove_requested: Option<usize> = None;
                 let mut submix_fx = TrackFxUi {
                     track_index: submix_index,
@@ -1296,8 +1306,9 @@ fn mixer_contents_ui(
                     known_plugins: &song.plugins,
                     track_names: &track_names,
                     editor: &mut *mixer.effect_editor,
-                    synth_editor: &mut unused_synth_editor,
+                    device_chain_focus: &mut unused_device_chain_focus,
                     remove_requested: &mut unused_remove_requested,
+                    inline_params: false,
                 };
                 let meter = mixer
                     .submix_meters
@@ -3153,8 +3164,8 @@ fn synth_preset_bar_ui(
 }
 
 /// Renders the waveform picker and attack/decay sliders for a track's built-in synth voice,
-/// shown inside that track's "🎹 Synth" window (see `SimpleDawApp::synth_editor`). Laid out as
-/// two columns (oscillators | envelope/filter/LFO) to keep the window from growing too tall.
+/// shown inside the bottom Device Panel (see `device_panel_contents_ui`). Laid out as two
+/// columns (oscillators | envelope/filter/LFO) to keep the panel from growing too tall.
 fn synth_params_ui(ui: &mut egui::Ui, synth: &mut SynthParams) {
     ui.columns(2, |columns| {
         synth_oscillators_ui(&mut columns[0], synth);
@@ -3850,8 +3861,8 @@ fn waveform_picker_ui(ui: &mut egui::Ui, current: &mut SynthWaveform) {
     });
 }
 
-/// Renders the Trine engine's settings, shown inside a track's synth window when
-/// `Track::synth_engine == SynthEngine::Trine` (see `SimpleDawApp::synth_editor`). Laid out as
+/// Renders the Trine engine's settings, shown inside the bottom Device Panel when
+/// `Track::synth_engine == SynthEngine::Trine` (see `device_panel_contents_ui`). Laid out as
 /// three columns (oscillators | filter + modulation matrix | LFOs + envelopes) so every section
 /// is visible at once instead of stacked behind collapsing headers, mirroring `synth_params_ui`'s
 /// two-column layout but wider since Trine has considerably more surface.
@@ -6935,7 +6946,7 @@ impl eframe::App for SimpleDawApp {
                     // Unused by `fx_chain_ui` itself (only `channel_rack_row_ui`'s own buttons
                     // touch these) — the master bus has no synth to open and can't be deleted, but
                     // `TrackFxUi` needs somewhere to point since it's shared with tracks.
-                    let mut unused_synth_editor: Option<usize> = None;
+                    let mut unused_device_chain_focus: Option<DeviceChainFocus> = None;
                     let mut unused_remove_requested: Option<usize> = None;
                     let track_names: Vec<String> =
                         song.tracks.iter().map(|t| t.name.clone()).collect();
@@ -6951,8 +6962,9 @@ impl eframe::App for SimpleDawApp {
                         known_plugins: &song.plugins,
                         track_names: &track_names,
                         editor: &mut self.effect_editor,
-                        synth_editor: &mut unused_synth_editor,
+                        device_chain_focus: &mut unused_device_chain_focus,
                         remove_requested: &mut unused_remove_requested,
+                        inline_params: false,
                     };
                     fx_chain_ui(ui, &mut master_fx);
                 });
@@ -7251,183 +7263,6 @@ impl eframe::App for SimpleDawApp {
             &mut self.flex_note_drag,
         );
 
-        if let Some(index) = self.synth_editor {
-            let mut open = true;
-            // Trine/Wave's three-column layouts need more room than Simple Synth's two columns
-            // to avoid each column getting squeezed; only affects the window's *first* open for
-            // a given track (afterwards egui remembers whatever size the user left it at).
-            let default_width = match song.tracks.get(index).map(|t| t.synth_engine) {
-                Some(SynthEngine::Trine) | Some(SynthEngine::Wave) => 900.0,
-                _ => 560.0,
-            };
-            egui::Window::new(format!("Track {} Synth", index + 1))
-                .id(egui::Id::new(("synth-editor", index)))
-                .collapsible(false)
-                .resizable(true)
-                .default_width(default_width)
-                .open(&mut open)
-                .show(ui.ctx(), |ui| {
-                    if index >= song.tracks.len() {
-                        ui.weak("Track no longer exists.");
-                        return;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Engine:");
-                        let track = &mut song.tracks[index];
-                        if ui
-                            .selectable_label(
-                                track.synth_engine == SynthEngine::Simple,
-                                "Simple Synth",
-                            )
-                            .clicked()
-                        {
-                            track.synth_engine = SynthEngine::Simple;
-                        }
-                        if ui
-                            .selectable_label(track.synth_engine == SynthEngine::Trine, "Trine")
-                            .clicked()
-                        {
-                            track.synth_engine = SynthEngine::Trine;
-                        }
-                        if ui
-                            .selectable_label(track.synth_engine == SynthEngine::Wave, "Wave")
-                            .clicked()
-                        {
-                            track.synth_engine = SynthEngine::Wave;
-                        }
-                    });
-                    ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        match song.tracks[index].synth_engine {
-                            SynthEngine::Simple => {
-                                synth_preset_bar_ui(
-                                    ui,
-                                    song,
-                                    index,
-                                    &mut self.new_preset_name,
-                                    &mut self.preset_message,
-                                );
-                                synth_params_ui(ui, &mut song.tracks[index].synth);
-                            }
-                            SynthEngine::Trine => {
-                                synth_preset_bar_ui(
-                                    ui,
-                                    song,
-                                    index,
-                                    &mut self.new_preset_name,
-                                    &mut self.preset_message,
-                                );
-                                trine_params_ui(ui, &mut song.tracks[index].trine);
-                            }
-                            SynthEngine::Wave => {
-                                synth_preset_bar_ui(
-                                    ui,
-                                    song,
-                                    index,
-                                    &mut self.new_preset_name,
-                                    &mut self.preset_message,
-                                );
-                                wave_params_ui(ui, &mut song.tracks[index].wave);
-                            }
-                        }
-                    });
-                });
-            if !open {
-                self.synth_editor = None;
-            }
-        }
-
-        if let Some((track_index, region_index, lane_index)) = self.lane_synth_editor {
-            let mut open = true;
-            let lane_engine = song
-                .tracks
-                .get(track_index)
-                .and_then(|t| t.regions.get(region_index))
-                .and_then(|r| match &r.content {
-                    RegionContent::StepGrid(lanes) => lanes.get(lane_index),
-                    _ => None,
-                })
-                .map(|lane| lane.synth_engine);
-            // Same rationale as `synth_editor`'s `default_width`: Trine/Wave need more room than
-            // Simple Synth's two columns.
-            let default_width = match lane_engine {
-                Some(SynthEngine::Trine) | Some(SynthEngine::Wave) => 900.0,
-                _ => 560.0,
-            };
-            egui::Window::new(format!("Lane {} Synth", lane_index + 1))
-                .id(egui::Id::new((
-                    "lane-synth-editor",
-                    track_index,
-                    region_index,
-                    lane_index,
-                )))
-                .collapsible(false)
-                .resizable(true)
-                .default_width(default_width)
-                .open(&mut open)
-                .show(ui.ctx(), |ui| {
-                    let lane = song
-                        .tracks
-                        .get_mut(track_index)
-                        .and_then(|t| t.regions.get_mut(region_index))
-                        .and_then(|r| match &mut r.content {
-                            RegionContent::StepGrid(lanes) => lanes.get_mut(lane_index),
-                            _ => None,
-                        });
-                    let Some(lane) = lane else {
-                        ui.weak("Lane no longer exists.");
-                        return;
-                    };
-                    ui.checkbox(
-                        &mut lane.synth_override,
-                        "Override the track synth for this lane",
-                    );
-                    if !lane.sample_path.trim().is_empty() {
-                        ui.weak(
-                            "This lane has a sample loaded — the sample takes priority and \
-                             plays instead of any synth until it's cleared.",
-                        );
-                    }
-                    if !lane.synth_override {
-                        ui.weak("Unchecked: this lane plays the track's own synth.");
-                        return;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Engine:");
-                        if ui
-                            .selectable_label(
-                                lane.synth_engine == SynthEngine::Simple,
-                                "Simple Synth",
-                            )
-                            .clicked()
-                        {
-                            lane.synth_engine = SynthEngine::Simple;
-                        }
-                        if ui
-                            .selectable_label(lane.synth_engine == SynthEngine::Trine, "Trine")
-                            .clicked()
-                        {
-                            lane.synth_engine = SynthEngine::Trine;
-                        }
-                        if ui
-                            .selectable_label(lane.synth_engine == SynthEngine::Wave, "Wave")
-                            .clicked()
-                        {
-                            lane.synth_engine = SynthEngine::Wave;
-                        }
-                    });
-                    ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| match lane.synth_engine {
-                        SynthEngine::Simple => synth_params_ui(ui, &mut lane.synth),
-                        SynthEngine::Trine => trine_params_ui(ui, &mut lane.trine),
-                        SynthEngine::Wave => wave_params_ui(ui, &mut lane.wave),
-                    });
-                });
-            if !open {
-                self.lane_synth_editor = None;
-            }
-        }
-
         let current_tick = playing.then(|| self.transport.current_tick());
         let engine_config = self.engine.as_ref().ok().map(|e| {
             (
@@ -7458,7 +7293,7 @@ impl eframe::App for SimpleDawApp {
             track_effect_messages: &mut self.track_effect_messages,
             track_meters: &self.track_meters,
             effect_editor: &mut self.effect_editor,
-            synth_editor: &mut self.synth_editor,
+            device_chain_focus: &mut self.device_chain_focus,
             record_armed_track: &mut self.record_armed_track,
             selected_input_device: &mut self.selected_input_device,
         };
@@ -7516,8 +7351,13 @@ impl eframe::App for SimpleDawApp {
             if matches!(self.effect_editor, Some(EffectEditorTarget::Track(t, _)) if t == index) {
                 self.effect_editor = None;
             }
-            if self.synth_editor == Some(index) {
-                self.synth_editor = None;
+            let focus_points_at_removed_track = match self.device_chain_focus {
+                Some(DeviceChainFocus::Track(t)) => t == index,
+                Some(DeviceChainFocus::Lane { track_index, .. }) => track_index == index,
+                None => false,
+            };
+            if focus_points_at_removed_track {
+                self.device_chain_focus = None;
             }
             remove_track_effects(
                 &self.track_effect_slots,
@@ -7662,6 +7502,36 @@ impl eframe::App for SimpleDawApp {
             }
         }
 
+        let device_panel_frame = || {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(30, 30, 30))
+                .inner_margin(egui::Margin::same(8))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(12, 12, 12)))
+        };
+        let mut device_panel = DevicePanelUi {
+            focus: &mut self.device_chain_focus,
+            track_effect_slots: &self.track_effect_slots,
+            track_effect_instances: &mut self.track_effect_instances,
+            track_effect_guis: &mut self.track_effect_guis,
+            track_effect_paths: &mut self.track_effect_paths,
+            track_effect_messages: &mut self.track_effect_messages,
+            effect_editor: &mut self.effect_editor,
+            new_preset_name: &mut self.new_preset_name,
+            preset_message: &mut self.preset_message,
+        };
+        egui::Panel::bottom("device_panel")
+            .resizable(true)
+            .default_size(220.0)
+            .size_range(120.0..=480.0)
+            .frame(device_panel_frame())
+            .show(ui, |ui| {
+                ui.heading("Device Panel");
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    device_panel_contents_ui(ui, song, engine_config, &mut device_panel);
+                });
+            });
+
         let piano_roll_open = self
             .selected_track
             .filter(|&i| i < song.tracks.len())
@@ -7733,7 +7603,7 @@ impl eframe::App for SimpleDawApp {
             let selected_beats_track = self.selected_beats_track;
             let sample_rate = self.sample_rate;
             let beats_region = &mut self.beats_region;
-            let lane_synth_editor = &mut self.lane_synth_editor;
+            let device_chain_focus = &mut self.device_chain_focus;
             let track_effect_slots = &self.track_effect_slots;
             let send_effect_slots = &self.send_effect_slots;
             let master_effect_slots = &self.master_effect_slots;
@@ -7762,7 +7632,7 @@ impl eframe::App for SimpleDawApp {
                                 sample_rate,
                                 selected_beats_track,
                                 beats_region,
-                                lane_synth_editor,
+                                device_chain_focus,
                                 track_effect_slots,
                                 send_effect_slots,
                                 master_effect_slots,
@@ -7858,13 +7728,20 @@ struct TrackFxUi<'a> {
     /// which chain (a track's, a send's, a submix's, or the master's) is being edited.
     track_names: &'a [String],
     editor: &'a mut Option<EffectEditorTarget>,
-    /// Set by channel_rack_row_ui's "🎹" button to open that track's synth-settings window.
+    /// Set by channel_rack_row_ui's "🎹" button to focus the bottom Device Panel on that track.
     /// Unused (and meaningless) for the master bus, which has no synth.
-    synth_editor: &'a mut Option<usize>,
+    device_chain_focus: &'a mut Option<DeviceChainFocus>,
     /// Set by channel_rack_row_ui's "🗑" button; applied by the caller after the track loop ends
     /// (can't remove from `song.tracks` mid-iteration since it's borrowed via `iter_mut`). Unused
     /// for the master bus, which can't be deleted.
     remove_requested: &'a mut Option<usize>,
+    /// Whether `fx_chain_ui` should draw a built-in effect's own knobs right under its slot row
+    /// (only set by the bottom Device Panel — see `device_panel_track_fx_chain_ui`) rather than
+    /// requiring the separate "FX Params" window every other caller of `fx_chain_ui` still uses.
+    /// A CLAP plugin's params still only open in that window even here — inlining those would need
+    /// the embedded/floating-GUI machinery `effect_editor`'s window already carries (window handle,
+    /// `active_embedded_gui`), which the Device Panel doesn't have access to.
+    inline_params: bool,
 }
 
 /// This chain's `fx.editor` target for `slot_index` — `Master`/`Track`/`Send` per `fx.chain_kind`,
@@ -8015,8 +7892,14 @@ fn channel_rack_row_ui(
                 }
 
                 if !is_audio {
-                    if ui.small_button("🎹").on_hover_text("Synth").clicked() {
-                        *fx.synth_editor = Some(fx.track_index);
+                    let is_focused =
+                        *fx.device_chain_focus == Some(DeviceChainFocus::Track(fx.track_index));
+                    if ui
+                        .add(egui::Button::new("🎹").small().selected(is_focused))
+                        .on_hover_text("Show this track's instrument + FX chain in the Device Panel")
+                        .clicked()
+                    {
+                        *fx.device_chain_focus = Some(DeviceChainFocus::Track(fx.track_index));
                     }
                 }
                 if is_audio {
@@ -8183,7 +8066,7 @@ fn step_grid_lanes_ui(
     color: egui::Color32,
     track_index: usize,
     region_index: usize,
-    lane_synth_editor: &mut Option<(usize, usize, usize)>,
+    device_chain_focus: &mut Option<DeviceChainFocus>,
     groove: &mut StepGrooveUi,
 ) -> Option<usize> {
     let mut remove_lane = None;
@@ -8203,13 +8086,16 @@ fn step_grid_lanes_ui(
                     "Pitch (synth lanes only) — {}",
                     note_name(lane.pitch)
                 ));
-            let synth_button = egui::Button::new("🎹").selected(lane.synth_override);
+            let is_focused = *device_chain_focus
+                == Some(DeviceChainFocus::Lane { track_index, region_index, lane_index });
+            let synth_button = egui::Button::new("🎹").selected(lane.synth_override || is_focused);
             if ui
                 .add(synth_button)
-                .on_hover_text("This lane's own synth (overrides the track synth)")
+                .on_hover_text("Show this lane's own synth (overrides the track synth) in the Device Panel")
                 .clicked()
             {
-                *lane_synth_editor = Some((track_index, region_index, lane_index));
+                *device_chain_focus =
+                    Some(DeviceChainFocus::Lane { track_index, region_index, lane_index });
             }
             step_grid_lane_groove_menu_ui(ui, lane_index, lane, groove);
             lane_sample_controls(ui, lane, sample_rate);
@@ -8256,7 +8142,7 @@ fn beats_contents_ui(
     sample_rate: Option<u32>,
     selected_beats_track: Option<usize>,
     editing_region_index: &mut Option<usize>,
-    lane_synth_editor: &mut Option<(usize, usize, usize)>,
+    device_chain_focus: &mut Option<DeviceChainFocus>,
     track_effect_slots: &TrackEffectSlots,
     send_effect_slots: &SendEffectSlots,
     master_effect_slots: &MasterEffectSlots,
@@ -8365,7 +8251,7 @@ fn beats_contents_ui(
                     color,
                     index,
                     region_index,
-                    lane_synth_editor,
+                    device_chain_focus,
                     groove,
                 );
             }
@@ -8398,9 +8284,180 @@ fn beats_contents_ui(
     }
 }
 
+/// Bundles the bottom Device Panel's mutable app-state borrows (see `device_panel_contents_ui`),
+/// the panel counterpart of `ChannelRackUi`/`MixerUi` — a plain struct rather than a dozen
+/// positional parameters, for the same reason those have one.
+struct DevicePanelUi<'a> {
+    focus: &'a mut Option<DeviceChainFocus>,
+    track_effect_slots: &'a TrackEffectSlots,
+    track_effect_instances: &'a mut Vec<Vec<Option<PluginInstance<DawHost>>>>,
+    track_effect_guis: &'a mut Vec<Vec<Option<PluginGuiHandle>>>,
+    track_effect_paths: &'a mut Vec<Vec<String>>,
+    track_effect_messages: &'a mut Vec<Vec<Option<(bool, String)>>>,
+    effect_editor: &'a mut Option<EffectEditorTarget>,
+    new_preset_name: &'a mut String,
+    preset_message: &'a mut Option<(bool, String)>,
+}
+
+/// The always-visible bottom Device Panel's contents — whichever track's or step-grid lane's
+/// instrument + effect chain `panel.focus` (see `DeviceChainFocus`) currently points at, laid out
+/// inline rather than behind a separate window/menu (Bitwig/Ableton's docked device-rack pattern).
+/// Shows a placeholder until a track/lane's "🎹" button is clicked at least once.
+fn device_panel_contents_ui(
+    ui: &mut egui::Ui,
+    song: &mut Song,
+    engine_config: Option<(f64, u32, u32)>,
+    panel: &mut DevicePanelUi,
+) {
+    let Some(focus) = *panel.focus else {
+        ui.weak("Click a track's or step-grid lane's 🎹 button to show its instrument and effects here.");
+        return;
+    };
+    match focus {
+        DeviceChainFocus::Track(index) => {
+            let Some(track) = song.tracks.get(index) else {
+                *panel.focus = None;
+                return;
+            };
+            if track.kind == TrackKind::Audio {
+                ui.weak("Audio track — no instrument.");
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Engine:");
+                    let track = &mut song.tracks[index];
+                    if ui
+                        .selectable_label(track.synth_engine == SynthEngine::Simple, "Simple Synth")
+                        .clicked()
+                    {
+                        track.synth_engine = SynthEngine::Simple;
+                    }
+                    if ui
+                        .selectable_label(track.synth_engine == SynthEngine::Trine, "Trine")
+                        .clicked()
+                    {
+                        track.synth_engine = SynthEngine::Trine;
+                    }
+                    if ui
+                        .selectable_label(track.synth_engine == SynthEngine::Wave, "Wave")
+                        .clicked()
+                    {
+                        track.synth_engine = SynthEngine::Wave;
+                    }
+                });
+                match song.tracks[index].synth_engine {
+                    SynthEngine::Simple => {
+                        synth_preset_bar_ui(ui, song, index, panel.new_preset_name, panel.preset_message);
+                        synth_params_ui(ui, &mut song.tracks[index].synth);
+                    }
+                    SynthEngine::Trine => {
+                        synth_preset_bar_ui(ui, song, index, panel.new_preset_name, panel.preset_message);
+                        trine_params_ui(ui, &mut song.tracks[index].trine);
+                    }
+                    SynthEngine::Wave => {
+                        synth_preset_bar_ui(ui, song, index, panel.new_preset_name, panel.preset_message);
+                        wave_params_ui(ui, &mut song.tracks[index].wave);
+                    }
+                }
+            }
+            ui.separator();
+            device_panel_track_fx_chain_ui(ui, song, index, engine_config, panel);
+        }
+        DeviceChainFocus::Lane { track_index, region_index, lane_index } => {
+            let lane = song
+                .tracks
+                .get_mut(track_index)
+                .and_then(|t| t.regions.get_mut(region_index))
+                .and_then(|r| match &mut r.content {
+                    RegionContent::StepGrid(lanes) => lanes.get_mut(lane_index),
+                    _ => None,
+                });
+            let Some(lane) = lane else {
+                *panel.focus = None;
+                ui.weak("Lane no longer exists.");
+                return;
+            };
+            ui.checkbox(&mut lane.synth_override, "Override the track synth for this lane");
+            if !lane.sample_path.trim().is_empty() {
+                ui.weak(
+                    "This lane has a sample loaded — the sample takes priority and plays \
+                     instead of any synth until it's cleared.",
+                );
+            }
+            if lane.synth_override {
+                ui.horizontal(|ui| {
+                    ui.label("Engine:");
+                    if ui
+                        .selectable_label(lane.synth_engine == SynthEngine::Simple, "Simple Synth")
+                        .clicked()
+                    {
+                        lane.synth_engine = SynthEngine::Simple;
+                    }
+                    if ui
+                        .selectable_label(lane.synth_engine == SynthEngine::Trine, "Trine")
+                        .clicked()
+                    {
+                        lane.synth_engine = SynthEngine::Trine;
+                    }
+                    if ui
+                        .selectable_label(lane.synth_engine == SynthEngine::Wave, "Wave")
+                        .clicked()
+                    {
+                        lane.synth_engine = SynthEngine::Wave;
+                    }
+                });
+                match lane.synth_engine {
+                    SynthEngine::Simple => synth_params_ui(ui, &mut lane.synth),
+                    SynthEngine::Trine => trine_params_ui(ui, &mut lane.trine),
+                    SynthEngine::Wave => wave_params_ui(ui, &mut lane.wave),
+                }
+            } else {
+                ui.weak("Unchecked: this lane plays the track's own synth.");
+            }
+            ui.separator();
+            // A lane has no effect chain of its own — effects are track-scoped — so the panel
+            // shows the owning track's chain too, since that's still part of the sound being heard.
+            device_panel_track_fx_chain_ui(ui, song, track_index, engine_config, panel);
+        }
+    }
+}
+
+/// The `fx_chain_ui` slice of the Device Panel, shared by both a `Track` focus and a `Lane`
+/// focus (a lane's sound also passes through its track's own chain — see the caller).
+fn device_panel_track_fx_chain_ui(
+    ui: &mut egui::Ui,
+    song: &mut Song,
+    track_index: usize,
+    engine_config: Option<(f64, u32, u32)>,
+    panel: &mut DevicePanelUi,
+) {
+    if track_index >= song.tracks.len() || track_index >= panel.track_effect_paths.len() {
+        return;
+    }
+    let mut unused_remove_requested: Option<usize> = None;
+    let track_names: Vec<String> = song.tracks.iter().map(|t| t.name.clone()).collect();
+    let mut fx = TrackFxUi {
+        track_index,
+        chain_kind: FxChainKind::Track,
+        paths: &mut panel.track_effect_paths[track_index],
+        messages: &mut panel.track_effect_messages[track_index],
+        slots: panel.track_effect_slots.clone(),
+        instances: &mut panel.track_effect_instances[track_index],
+        guis: &mut panel.track_effect_guis[track_index],
+        engine_config,
+        known_plugins: &song.plugins,
+        track_names: &track_names,
+        editor: &mut *panel.effect_editor,
+        device_chain_focus: &mut *panel.focus,
+        remove_requested: &mut unused_remove_requested,
+        inline_params: true,
+    };
+    fx_chain_ui(ui, &mut fx);
+}
+
 /// Renders the "+ Add Effect" menu and the ordered list of the track's effect-chain slots
 /// (CLAP path/Load or built-in label, Params button, status message, remove button). Opened
-/// from each Channel Rack row's "FX" popup menu (see `channel_rack_row_ui`).
+/// from each Channel Rack row's "FX" popup menu, the Mixer's per-strip "FX" menu, and the bottom
+/// Device Panel (see `channel_rack_row_ui`/`device_panel_track_fx_chain_ui`).
 fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
     ui.label("FX chain:");
     ui.menu_button("+ Add Effect", |ui| {
@@ -8600,6 +8657,20 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
                 fx_slot_to_remove = Some(slot_index);
             }
         });
+        // Bitwig/Ableton-style inline knobs, only for the Device Panel (see `TrackFxUi::inline_params`'s
+        // doc comment for why a CLAP slot's params still only open in the separate "FX Params" window).
+        if fx.inline_params
+            && let FxSlotKind::BuiltIn(_) = slot_kind
+        {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                if let Ok(mut slots) = fx.slots.lock()
+                    && let Some(chain) = slots.get_mut(fx.track_index)
+                    && let Some(Some(EffectInstance::BuiltIn(effect))) = chain.get_mut(slot_index)
+                {
+                    built_in_effect_params_ui(ui, effect);
+                }
+            });
+        }
     }
     if let Some(slot_index) = fx_slot_to_remove {
         fx.paths.remove(slot_index);
@@ -11301,8 +11372,9 @@ const TAKE_LANE_HEIGHT: f32 = 48.0;
 /// span; the current `comp` is drawn as a bright outline over whichever lane/stretch it currently
 /// points at. Dragging horizontally within a lane reassigns that stretch to that lane's take, live,
 /// via `TakeFolder::assign_take_to_range` — mirrors the window-open/close and canvas-drag patterns
-/// already used elsewhere (`self.synth_editor`'s `egui::Window`, `handle_audio_clip_interaction`'s
-/// live-drag-then-`drag_stopped()` pattern), rather than introducing a new one.
+/// already used elsewhere (`self.effect_editor`'s "FX Params" `egui::Window`,
+/// `handle_audio_clip_interaction`'s live-drag-then-`drag_stopped()` pattern), rather than
+/// introducing a new one.
 fn take_folder_editor_window_ui(
     ctx: &egui::Context,
     song: &mut Song,
@@ -11510,6 +11582,10 @@ const AUTOMATION_LANE_HEIGHT: f32 = 44.0;
 /// Pixel radius of an automation point's drawn dot and its click/drag hit-test — matches
 /// `RESIZE_HANDLE_PX`'s role for the Playlist's region-edge/fade handles.
 const AUTOMATION_POINT_RADIUS: f32 = 4.0;
+/// How many line segments approximate one non-linear `CurveShape` segment's preview — coarse
+/// enough to be cheap to redraw every frame, fine enough that `Exponential`/`Logarithmic`'s curve
+/// reads as smooth rather than faceted at any zoom level this canvas is drawn at.
+const AUTOMATION_CURVE_PREVIEW_SAMPLES: usize = 16;
 
 /// Human label for an effect chain slot's kind, straight from its saved config (no live instance
 /// needed) — the automation target picker's counterpart to `BuiltInEffect::label()`, which only
@@ -11728,6 +11804,10 @@ fn automation_lane_graph_ui(
         egui::vec2(canvas_width, AUTOMATION_LANE_HEIGHT),
         egui::Sense::click_and_drag(),
     );
+    let response = response.on_hover_text(
+        "Click empty space: add a point  ·  Click a point: cycle its curve shape (Linear → \
+         Exponential → Logarithmic → Hold)  ·  Drag: move a point  ·  Right-click: delete",
+    );
     let rect = response.rect;
     painter.rect_filled(rect, 0u8, ui.visuals().extreme_bg_color);
 
@@ -11746,9 +11826,28 @@ fn automation_lane_graph_ui(
 
     let mut sorted_points: Vec<AutomationPoint> = lane.points.clone();
     sorted_points.sort_by_key(|p| p.tick);
-    if sorted_points.len() >= 2 {
-        let line: Vec<egui::Pos2> = sorted_points.iter().map(point_pos).collect();
-        painter.add(egui::Shape::line(line, egui::Stroke::new(1.5, FL_ACCENT_GREEN)));
+    for pair in sorted_points.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let (pos_a, pos_b) = (point_pos(a), point_pos(b));
+        if a.curve == CurveShape::Linear {
+            // The common case, and the one every pre-curve-shapes lane already looks like —
+            // drawn as a single straight segment rather than a coarse polyline through it.
+            painter.add(egui::Shape::line_segment([pos_a, pos_b], egui::Stroke::new(1.5, FL_ACCENT_GREEN)));
+            continue;
+        }
+        // A short polyline sampling `CurveShape::warp` rather than a closed-form curve shape —
+        // `value_at_fractional` (the actual playback-time interpolation) evaluates the same
+        // `warp` function, so this is a faithful preview, not just decoration. `Hold`'s constant
+        // `warp` traces a flat line that stops short of `pos_b` — reading as "held, then jumps"
+        // without needing an explicit vertical stroke to the next point's own marker.
+        let segment: Vec<egui::Pos2> = (0..=AUTOMATION_CURVE_PREVIEW_SAMPLES)
+            .map(|i| {
+                let t = i as f32 / AUTOMATION_CURVE_PREVIEW_SAMPLES as f32;
+                let value = a.value + (b.value - a.value) * a.curve.warp(t);
+                egui::pos2(pos_a.x + (pos_b.x - pos_a.x) * t, value_to_y(value))
+            })
+            .collect();
+        painter.add(egui::Shape::line(segment, egui::Stroke::new(1.5, FL_ACCENT_GREEN)));
     }
     for point in &lane.points {
         painter.circle_filled(point_pos(point), AUTOMATION_POINT_RADIUS, egui::Color32::WHITE);
@@ -11790,11 +11889,21 @@ fn automation_lane_graph_ui(
         }
     }
 
-    if response.clicked() && drag.is_none() && point_near(lane, response.interact_pointer_pos().unwrap_or_default()).is_none() {
-        if let Some(pos) = response.interact_pointer_pos() {
+    if response.clicked()
+        && drag.is_none()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        if let Some(point_index) = point_near(lane, pos) {
+            // Cycling rather than a menu: the common case (nudging one point a step or two)
+            // stays a single click, and the curve preview drawn above gives instant feedback
+            // on where in the cycle it landed — see this canvas's hover text.
+            if let Some(point) = lane.points.get_mut(point_index) {
+                point.curve = point.curve.next();
+            }
+        } else {
             let tick = x_to_tick((pos.x - rect.left()).max(0.0), zoom).min(span_ticks);
             let value = y_to_value(pos.y).clamp(min, max);
-            lane.points.push(AutomationPoint { tick, value });
+            lane.points.push(AutomationPoint { tick, value, curve: CurveShape::default() });
         }
     }
     if response.secondary_clicked() {
