@@ -500,7 +500,7 @@ enum EffectEditorTarget {
 /// "Params" button opens (see `fx_chain_ui`), so each location's editor state doesn't collide with
 /// the others'. The chain's own index within `slots` (a real track's index, or a send bus's index;
 /// meaningless — always 0 — for `Master`) still comes from `TrackFxUi::track_index`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum FxChainKind {
     Track,
     Master,
@@ -8454,6 +8454,145 @@ fn device_panel_track_fx_chain_ui(
     fx_chain_ui(ui, &mut fx);
 }
 
+/// One slot's row (CLAP path/Load or built-in label, sidechain picker, Params button, status
+/// message, remove button) plus — only when `fx.inline_params` is set (the Device Panel) — that
+/// built-in effect's own knobs directly beneath it. Shared by `fx_chain_ui`'s two container
+/// shapes (a plain vertical list for the Channel Rack/Mixer "FX" menus, a row of boxed device
+/// columns for the Device Panel) so the slot-editing logic itself only exists once.
+fn fx_chain_slot_ui(
+    ui: &mut egui::Ui,
+    fx: &mut TrackFxUi,
+    slot_index: usize,
+    fx_slot_to_remove: &mut Option<usize>,
+) {
+    let slot_kind = fx
+        .slots
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            let slot = guard.get(fx.track_index)?.get(slot_index)?.as_ref();
+            Some(match slot {
+                Some(EffectInstance::BuiltIn(effect)) => FxSlotKind::BuiltIn(effect.label()),
+                Some(EffectInstance::Clap(_)) | None => FxSlotKind::Clap,
+            })
+        })
+        .unwrap_or(FxSlotKind::Clap);
+    ui.horizontal(|ui| {
+        // Drag handle for reordering — see `fx_chain_ui`'s `dnd_drop_zone` wrapping each slot,
+        // which is what actually applies the reorder once this is dropped onto another slot.
+        let drag_id =
+            egui::Id::new(("fx_chain_device_drag", fx.chain_kind, fx.track_index, slot_index));
+        ui.dnd_drag_source(drag_id, slot_index, |ui| {
+            ui.label("⠿");
+        })
+        .response
+        .on_hover_text("Drag to reorder");
+        ui.weak(format!("{}.", slot_index + 1));
+        match slot_kind {
+            FxSlotKind::Clap => {
+                ui.add_sized(
+                    [150.0, 20.0],
+                    egui::TextEdit::singleline(&mut fx.paths[slot_index]).hint_text("effect.clap"),
+                );
+                if !fx.known_plugins.is_empty() {
+                    ui.menu_button("📁", |ui| {
+                        for plugin in fx.known_plugins {
+                            if ui.button(&plugin.name).clicked() {
+                                fx.paths[slot_index] = plugin.path.clone();
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Pick from the project's imported plugins");
+                }
+                let can_load =
+                    fx.engine_config.is_some() && !fx.paths[slot_index].trim().is_empty();
+                if ui
+                    .add_enabled(can_load, egui::Button::new("Load"))
+                    .clicked()
+                {
+                    if let Some((sample_rate, min_frames, max_frames)) = fx.engine_config {
+                        let path = std::path::Path::new(fx.paths[slot_index].trim());
+                        let result = plugin_host::load_and_activate(
+                            path,
+                            sample_rate,
+                            min_frames,
+                            max_frames,
+                        );
+                        fx.messages[slot_index] = Some(match result {
+                            Ok((instance, effect, gui)) => {
+                                fx.instances[slot_index] = Some(instance);
+                                fx.guis[slot_index] = Some(gui);
+                                if let Ok(mut slots) = fx.slots.lock() {
+                                    if let Some(chain) = slots.get_mut(fx.track_index) {
+                                        if let Some(entry) = chain.get_mut(slot_index) {
+                                            *entry = Some(EffectInstance::Clap(effect));
+                                        }
+                                    }
+                                }
+                                (true, format!("Loaded {}", path.display()))
+                            }
+                            Err(err) => (false, format!("{err:#}")),
+                        });
+                    }
+                }
+            }
+            FxSlotKind::BuiltIn(label) => {
+                ui.label(label);
+            }
+        }
+        // Sidechain key-source picker — only rendered for a slot kind that actually carries a
+        // `sidechain_source` (a loaded CLAP plugin, Compressor, or NoiseGate; see
+        // `plugin_host::EffectInstance::sidechain_source_mut`). Reads/writes the live runtime
+        // effect directly, same as every other per-effect parameter in this UI.
+        if let Ok(mut slots) = fx.slots.lock()
+            && let Some(chain) = slots.get_mut(fx.track_index)
+            && let Some(Some(instance)) = chain.get_mut(slot_index)
+            && let Some(source) = instance.sidechain_source_mut()
+        {
+            let selected_label = source
+                .and_then(|index| fx.track_names.get(index))
+                .map(String::as_str)
+                .unwrap_or("None");
+            egui::ComboBox::from_id_salt(("sidechain_source", fx.track_index, slot_index))
+                .selected_text(format!("SC: {selected_label}"))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(source, None, "None");
+                    for (index, name) in fx.track_names.iter().enumerate() {
+                        ui.selectable_value(source, Some(index), name);
+                    }
+                });
+        }
+        if ui.small_button("Params").clicked() {
+            *fx.editor = Some(fx_editor_target(fx, slot_index));
+        }
+        if let Some((ok, message)) = fx.messages[slot_index].as_ref() {
+            let color = if *ok {
+                egui::Color32::from_rgb(120, 220, 140)
+            } else {
+                egui::Color32::RED
+            };
+            ui.colored_label(color, message);
+        }
+        if ui
+            .small_button("🗑")
+            .on_hover_text("Remove this effect from the chain")
+            .clicked()
+        {
+            *fx_slot_to_remove = Some(slot_index);
+        }
+    });
+    if fx.inline_params
+        && let FxSlotKind::BuiltIn(_) = slot_kind
+        && let Ok(mut slots) = fx.slots.lock()
+        && let Some(chain) = slots.get_mut(fx.track_index)
+        && let Some(Some(EffectInstance::BuiltIn(effect))) = chain.get_mut(slot_index)
+    {
+        built_in_effect_params_ui(ui, effect);
+    }
+}
+
 /// Renders the "+ Add Effect" menu and the ordered list of the track's effect-chain slots
 /// (CLAP path/Load or built-in label, Params button, status message, remove button). Opened
 /// from each Channel Rack row's "FX" popup menu, the Mixer's per-strip "FX" menu, and the bottom
@@ -8546,131 +8685,49 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
         }
     });
     let mut fx_slot_to_remove: Option<usize> = None;
-    for slot_index in 0..fx.paths.len() {
-        let slot_kind = fx
-            .slots
-            .lock()
-            .ok()
-            .and_then(|guard| {
-                let slot = guard.get(fx.track_index)?.get(slot_index)?.as_ref();
-                Some(match slot {
-                    Some(EffectInstance::BuiltIn(effect)) => FxSlotKind::BuiltIn(effect.label()),
-                    Some(EffectInstance::Clap(_)) | None => FxSlotKind::Clap,
-                })
-            })
-            .unwrap_or(FxSlotKind::Clap);
-        ui.horizontal(|ui| {
-            ui.weak(format!("{}.", slot_index + 1));
-            match slot_kind {
-                FxSlotKind::Clap => {
-                    ui.add_sized(
-                        [150.0, 20.0],
-                        egui::TextEdit::singleline(&mut fx.paths[slot_index])
-                            .hint_text("effect.clap"),
-                    );
-                    if !fx.known_plugins.is_empty() {
-                        ui.menu_button("📁", |ui| {
-                            for plugin in fx.known_plugins {
-                                if ui.button(&plugin.name).clicked() {
-                                    fx.paths[slot_index] = plugin.path.clone();
-                                    ui.close();
-                                }
-                            }
-                        })
-                        .response
-                        .on_hover_text("Pick from the project's imported plugins");
-                    }
-                    let can_load =
-                        fx.engine_config.is_some() && !fx.paths[slot_index].trim().is_empty();
-                    if ui
-                        .add_enabled(can_load, egui::Button::new("Load"))
-                        .clicked()
-                    {
-                        if let Some((sample_rate, min_frames, max_frames)) = fx.engine_config {
-                            let path = std::path::Path::new(fx.paths[slot_index].trim());
-                            let result = plugin_host::load_and_activate(
-                                path,
-                                sample_rate,
-                                min_frames,
-                                max_frames,
-                            );
-                            fx.messages[slot_index] = Some(match result {
-                                Ok((instance, effect, gui)) => {
-                                    fx.instances[slot_index] = Some(instance);
-                                    fx.guis[slot_index] = Some(gui);
-                                    if let Ok(mut slots) = fx.slots.lock() {
-                                        if let Some(chain) = slots.get_mut(fx.track_index) {
-                                            if let Some(entry) = chain.get_mut(slot_index) {
-                                                *entry = Some(EffectInstance::Clap(effect));
-                                            }
-                                        }
-                                    }
-                                    (true, format!("Loaded {}", path.display()))
-                                }
-                                Err(err) => (false, format!("{err:#}")),
-                            });
+    // Set when a slot's "⠿" drag handle (see `fx_chain_slot_ui`) is dropped onto another slot's
+    // `dnd_drop_zone` below — applied once, after the loop, the same "compute during the loop,
+    // apply after" shape `fx_slot_to_remove` already uses (mutating `fx.paths` etc. mid-loop would
+    // desync the zero-indexed `slot_index` every remaining iteration is still relying on).
+    let mut reorder: Option<(usize, usize)> = None;
+    if fx.inline_params {
+        // Bitwig/Ableton-style device rack: one boxed column per device, side by side, rather
+        // than the plain vertical list every other `fx_chain_ui` caller (Channel Rack/Mixer "FX"
+        // dropdown menus) still uses — those have no inline knobs to box up (see
+        // `TrackFxUi::inline_params`), so a vertical list is still the right shape there.
+        egui::ScrollArea::horizontal()
+            .id_salt(("device_rack_scroll", fx.track_index))
+            .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    for slot_index in 0..fx.paths.len() {
+                        let (_, dropped) = ui.dnd_drop_zone::<usize, _>(
+                            egui::Frame::group(ui.style()),
+                            |ui| {
+                                ui.set_width(240.0);
+                                ui.vertical(|ui| {
+                                    fx_chain_slot_ui(ui, fx, slot_index, &mut fx_slot_to_remove);
+                                });
+                            },
+                        );
+                        if let Some(dragged_from) = dropped {
+                            reorder = Some((*dragged_from, slot_index));
                         }
                     }
-                }
-                FxSlotKind::BuiltIn(label) => {
-                    ui.label(label);
-                }
-            }
-            // Sidechain key-source picker — only rendered for a slot kind that actually carries a
-            // `sidechain_source` (a loaded CLAP plugin, Compressor, or NoiseGate; see
-            // `plugin_host::EffectInstance::sidechain_source_mut`). Reads/writes the live runtime
-            // effect directly, same as every other per-effect parameter in this UI.
-            if let Ok(mut slots) = fx.slots.lock()
-                && let Some(chain) = slots.get_mut(fx.track_index)
-                && let Some(Some(instance)) = chain.get_mut(slot_index)
-                && let Some(source) = instance.sidechain_source_mut()
-            {
-                let selected_label = source
-                    .and_then(|index| fx.track_names.get(index))
-                    .map(String::as_str)
-                    .unwrap_or("None");
-                egui::ComboBox::from_id_salt(("sidechain_source", fx.track_index, slot_index))
-                    .selected_text(format!("SC: {selected_label}"))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(source, None, "None");
-                        for (index, name) in fx.track_names.iter().enumerate() {
-                            ui.selectable_value(source, Some(index), name);
-                        }
-                    });
-            }
-            if ui.small_button("Params").clicked() {
-                *fx.editor = Some(fx_editor_target(fx, slot_index));
-            }
-            if let Some((ok, message)) = fx.messages[slot_index].as_ref() {
-                let color = if *ok {
-                    egui::Color32::from_rgb(120, 220, 140)
-                } else {
-                    egui::Color32::RED
-                };
-                ui.colored_label(color, message);
-            }
-            if ui
-                .small_button("🗑")
-                .on_hover_text("Remove this effect from the chain")
-                .clicked()
-            {
-                fx_slot_to_remove = Some(slot_index);
-            }
-        });
-        // Bitwig/Ableton-style inline knobs, only for the Device Panel (see `TrackFxUi::inline_params`'s
-        // doc comment for why a CLAP slot's params still only open in the separate "FX Params" window).
-        if fx.inline_params
-            && let FxSlotKind::BuiltIn(_) = slot_kind
-        {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                if let Ok(mut slots) = fx.slots.lock()
-                    && let Some(chain) = slots.get_mut(fx.track_index)
-                    && let Some(Some(EffectInstance::BuiltIn(effect))) = chain.get_mut(slot_index)
-                {
-                    built_in_effect_params_ui(ui, effect);
-                }
+                });
             });
+    } else {
+        for slot_index in 0..fx.paths.len() {
+            let (_, dropped) = ui.dnd_drop_zone::<usize, _>(egui::Frame::new(), |ui| {
+                fx_chain_slot_ui(ui, fx, slot_index, &mut fx_slot_to_remove);
+            });
+            if let Some(dragged_from) = dropped {
+                reorder = Some((*dragged_from, slot_index));
+            }
         }
+    }
+    if let Some((from, to)) = reorder {
+        reorder_fx_slot(fx, from, to);
     }
     if let Some(slot_index) = fx_slot_to_remove {
         fx.paths.remove(slot_index);
@@ -8691,6 +8748,33 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
             *fx.editor = None;
         }
     }
+}
+
+/// Moves the effect at `from` to `to` within one chain — every parallel `Vec` `TrackFxUi` carries
+/// (`paths`/`instances`/`guis`/`messages`) plus the live `slots` chain, kept in the same order by
+/// construction (see `TrackFxUi`'s fields) so they must all move together. Drops any open "FX
+/// Params" window for this chain rather than trying to track which slot it should now follow —
+/// same simplification `fx_chain_ui`'s slot-removal already makes.
+fn reorder_fx_slot(fx: &mut TrackFxUi, from: usize, to: usize) {
+    if from == to || from >= fx.paths.len() || to >= fx.paths.len() {
+        return;
+    }
+    let path = fx.paths.remove(from);
+    fx.paths.insert(to, path);
+    let instance = fx.instances.remove(from);
+    fx.instances.insert(to, instance);
+    let gui = fx.guis.remove(from);
+    fx.guis.insert(to, gui);
+    let message = fx.messages.remove(from);
+    fx.messages.insert(to, message);
+    if let Ok(mut slots) = fx.slots.lock()
+        && let Some(chain) = slots.get_mut(fx.track_index)
+        && from < chain.len()
+    {
+        let entry = chain.remove(from);
+        chain.insert(to.min(chain.len()), entry);
+    }
+    *fx.editor = None;
 }
 
 /// A proper piano roll: notes are drawn and edited freely (click-drag to draw,

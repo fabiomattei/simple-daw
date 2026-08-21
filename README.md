@@ -63,10 +63,9 @@ The velocity of each note is set via the velocity lane below the grid: drag a no
 ### Build & run
 
 ```bash
-cargo build       # debug build
-cargo run         # launch the GUI app
-cargo run --bin simple-daw
-cargo run --bin simple-daw-mcp
+cargo build                       # debug build
+cargo run --bin simple-daw        # launch the GUI app
+cargo run --bin simple-daw-mcp    # launch the mcp server
 ```
 
 ### Tests
