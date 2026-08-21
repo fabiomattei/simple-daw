@@ -8516,42 +8516,67 @@ fn device_panel_contents_ui(
             if track.kind == TrackKind::Audio {
                 ui.weak("Audio track — no instrument.");
             } else {
-                ui.horizontal(|ui| {
-                    ui.label("Engine:");
-                    let track = &mut song.tracks[index];
-                    if ui
-                        .selectable_label(track.synth_engine == SynthEngine::Simple, "Simple Synth")
-                        .clicked()
-                    {
-                        track.synth_engine = SynthEngine::Simple;
-                    }
-                    if ui
-                        .selectable_label(track.synth_engine == SynthEngine::Trine, "Trine")
-                        .clicked()
-                    {
-                        track.synth_engine = SynthEngine::Trine;
-                    }
-                    if ui
-                        .selectable_label(track.synth_engine == SynthEngine::Wave, "Wave")
-                        .clicked()
-                    {
-                        track.synth_engine = SynthEngine::Wave;
-                    }
-                });
-                match song.tracks[index].synth_engine {
-                    SynthEngine::Simple => {
-                        synth_preset_bar_ui(ui, song, index, panel.new_preset_name, panel.preset_message);
-                        synth_params_ui(ui, &mut song.tracks[index].synth);
-                    }
-                    SynthEngine::Trine => {
-                        synth_preset_bar_ui(ui, song, index, panel.new_preset_name, panel.preset_message);
-                        trine_params_ui(ui, &mut song.tracks[index].trine);
-                    }
-                    SynthEngine::Wave => {
-                        synth_preset_bar_ui(ui, song, index, panel.new_preset_name, panel.preset_message);
-                        wave_params_ui(ui, &mut song.tracks[index].wave);
-                    }
-                }
+                egui::CollapsingHeader::new("Synth")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Engine:");
+                            let track = &mut song.tracks[index];
+                            if ui
+                                .selectable_label(
+                                    track.synth_engine == SynthEngine::Simple,
+                                    "Simple Synth",
+                                )
+                                .clicked()
+                            {
+                                track.synth_engine = SynthEngine::Simple;
+                            }
+                            if ui
+                                .selectable_label(track.synth_engine == SynthEngine::Trine, "Trine")
+                                .clicked()
+                            {
+                                track.synth_engine = SynthEngine::Trine;
+                            }
+                            if ui
+                                .selectable_label(track.synth_engine == SynthEngine::Wave, "Wave")
+                                .clicked()
+                            {
+                                track.synth_engine = SynthEngine::Wave;
+                            }
+                        });
+                        match song.tracks[index].synth_engine {
+                            SynthEngine::Simple => {
+                                synth_preset_bar_ui(
+                                    ui,
+                                    song,
+                                    index,
+                                    panel.new_preset_name,
+                                    panel.preset_message,
+                                );
+                                synth_params_ui(ui, &mut song.tracks[index].synth);
+                            }
+                            SynthEngine::Trine => {
+                                synth_preset_bar_ui(
+                                    ui,
+                                    song,
+                                    index,
+                                    panel.new_preset_name,
+                                    panel.preset_message,
+                                );
+                                trine_params_ui(ui, &mut song.tracks[index].trine);
+                            }
+                            SynthEngine::Wave => {
+                                synth_preset_bar_ui(
+                                    ui,
+                                    song,
+                                    index,
+                                    panel.new_preset_name,
+                                    panel.preset_message,
+                                );
+                                wave_params_ui(ui, &mut song.tracks[index].wave);
+                            }
+                        }
+                    });
             }
             ui.separator();
             device_panel_track_fx_chain_ui(ui, song, index, engine_config, panel);
@@ -8578,32 +8603,39 @@ fn device_panel_contents_ui(
                 );
             }
             if lane.synth_override {
-                ui.horizontal(|ui| {
-                    ui.label("Engine:");
-                    if ui
-                        .selectable_label(lane.synth_engine == SynthEngine::Simple, "Simple Synth")
-                        .clicked()
-                    {
-                        lane.synth_engine = SynthEngine::Simple;
-                    }
-                    if ui
-                        .selectable_label(lane.synth_engine == SynthEngine::Trine, "Trine")
-                        .clicked()
-                    {
-                        lane.synth_engine = SynthEngine::Trine;
-                    }
-                    if ui
-                        .selectable_label(lane.synth_engine == SynthEngine::Wave, "Wave")
-                        .clicked()
-                    {
-                        lane.synth_engine = SynthEngine::Wave;
-                    }
-                });
-                match lane.synth_engine {
-                    SynthEngine::Simple => synth_params_ui(ui, &mut lane.synth),
-                    SynthEngine::Trine => trine_params_ui(ui, &mut lane.trine),
-                    SynthEngine::Wave => wave_params_ui(ui, &mut lane.wave),
-                }
+                egui::CollapsingHeader::new("Synth")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Engine:");
+                            if ui
+                                .selectable_label(
+                                    lane.synth_engine == SynthEngine::Simple,
+                                    "Simple Synth",
+                                )
+                                .clicked()
+                            {
+                                lane.synth_engine = SynthEngine::Simple;
+                            }
+                            if ui
+                                .selectable_label(lane.synth_engine == SynthEngine::Trine, "Trine")
+                                .clicked()
+                            {
+                                lane.synth_engine = SynthEngine::Trine;
+                            }
+                            if ui
+                                .selectable_label(lane.synth_engine == SynthEngine::Wave, "Wave")
+                                .clicked()
+                            {
+                                lane.synth_engine = SynthEngine::Wave;
+                            }
+                        });
+                        match lane.synth_engine {
+                            SynthEngine::Simple => synth_params_ui(ui, &mut lane.synth),
+                            SynthEngine::Trine => trine_params_ui(ui, &mut lane.trine),
+                            SynthEngine::Wave => wave_params_ui(ui, &mut lane.wave),
+                        }
+                    });
             } else {
                 ui.weak("Unchecked: this lane plays the track's own synth.");
             }
