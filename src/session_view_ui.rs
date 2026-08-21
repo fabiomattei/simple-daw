@@ -79,6 +79,7 @@ pub fn session_view_contents_ui(
     session_slots: &SessionSlotHandles,
     quantize: &mut SessionQuantize,
     follow_action_editor: &mut Option<(usize, usize)>,
+    detached: &mut bool,
 ) {
     ui.horizontal(|ui| {
         let session_mode = transport.is_session_mode();
@@ -106,6 +107,12 @@ pub fn session_view_contents_ui(
                 }
             });
         transport.set_session_quantize_ticks(quantize.ticks(song));
+        if ui
+            .small_button(if *detached { "⏷ Dock" } else { "⧉ Detach" })
+            .clicked()
+        {
+            *detached = !*detached;
+        }
     });
     ui.separator();
 

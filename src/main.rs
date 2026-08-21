@@ -719,23 +719,39 @@ struct SimpleDawApp {
     /// section that was actually clicked rather than always at the start. Consumed (cleared) by
     /// `piano_roll_ui` once applied, so it doesn't fight manual scrolling afterward.
     piano_roll_scroll_to: Option<usize>,
+    /// Whether the (open) Piano Roll is docked into the central area (alongside Playlist/Session
+    /// View/Beats, taking priority over them while it's open — see the `ui` central-area block in
+    /// `impl eframe::App for SimpleDawApp`) instead of its own native OS window. Defaults to `true`
+    /// to preserve this window's original always-floating behavior.
+    piano_roll_detached: bool,
     /// Index of the track whose Beats window is open — same lifecycle as `selected_track`, but
     /// for step-grid tracks.
     selected_beats_track: Option<usize>,
     /// Which of `selected_beats_track`'s own `regions` the Beats window is showing/editing — the
     /// Beats counterpart of `piano_roll_region`.
     beats_region: Option<usize>,
+    /// Whether the (open) Beats window is docked into the central area instead of its own native
+    /// OS window — see `piano_roll_detached`. When both Piano Roll and Beats are open and docked
+    /// at once, Piano Roll takes priority for the shared central area.
+    beats_detached: bool,
     /// Whether the Channel Rack is popped out into its own native OS window (via
     /// `egui::Context::show_viewport_immediate`) instead of docked as the left `egui::Panel`.
     channel_rack_detached: bool,
-    /// Whether the Playlist (arrangement timeline) window is open — toggled from the toolbar,
-    /// always detached like the Piano Roll/Beats windows (no docked mode).
+    /// Whether the Playlist (arrangement timeline) window is open — toggled from the toolbar.
     playlist_open: bool,
+    /// Whether the (open) Playlist is popped out into its own native OS window instead of docked
+    /// into the central area — same dock/detach split as the Channel Rack, see
+    /// `channel_rack_detached`. Mutually exclusive with `session_view_detached` the same way
+    /// `playlist_open`/`session_view_open` are: only one central-area view detaches at a time.
+    playlist_detached: bool,
     /// Whether Session View (the clip-launching grid) is showing in the central area instead of
     /// the Playlist — toggled from the toolbar, mutually exclusive with `playlist_open` (both want
     /// the same central area; unlike Playlist vs. Mixer, which dock to different regions and can
     /// coexist). See `session_view_ui::session_view_contents_ui`.
     session_view_open: bool,
+    /// Whether the (open) Session View is popped out into its own native OS window instead of
+    /// docked into the central area — see `playlist_detached`.
+    session_view_detached: bool,
     /// Whether the Mixer (classic vertical channel-strip view — one strip per track plus a Master
     /// strip) is visible at all, toggled from the toolbar. Same dock/detach split as the Channel
     /// Rack (see `mixer_detached`), but unlike the Channel Rack it can be hidden entirely, since
@@ -744,6 +760,9 @@ struct SimpleDawApp {
     /// Whether the (visible) Mixer is popped out into its own native OS window instead of docked
     /// as a bottom `egui::Panel` — see `channel_rack_detached`.
     mixer_detached: bool,
+    /// Whether the Device Panel is popped out into its own native OS window instead of docked as
+    /// a bottom `egui::Panel` — see `channel_rack_detached`.
+    device_panel_detached: bool,
     /// Zoom for the Playlist timeline, independent of `piano_roll_zoom` since it's a separate view.
     playlist_zoom: f32,
     /// At most one Playlist clip is being dragged at a time — see `piano_roll_drag`.
@@ -943,13 +962,18 @@ impl SimpleDawApp {
             selected_track: None,
             piano_roll_region: None,
             piano_roll_scroll_to: None,
+            piano_roll_detached: true,
             selected_beats_track: None,
             beats_region: None,
+            beats_detached: true,
             channel_rack_detached: false,
             playlist_open: true,
+            playlist_detached: false,
             session_view_open: false,
+            session_view_detached: false,
             mixer_open: false,
             mixer_detached: false,
+            device_panel_detached: false,
             playlist_zoom: 1.0,
             playlist_drag: None,
             audio_clip_drag: None,
@@ -1716,6 +1740,8 @@ fn mixer_submix_strip_ui(
 
 /// Bundles the Piano Roll's mutable app-state borrows for the same reason as `ChannelRackUi`.
 struct PianoRollPanelUi<'a> {
+    /// See `SimpleDawApp::piano_roll_detached`.
+    detached: &'a mut bool,
     selected_track: Option<usize>,
     piano_roll_drag: &'a mut Option<PianoRollDrag>,
     selected_notes: &'a mut HashSet<u64>,
@@ -1846,12 +1872,13 @@ fn piano_roll_quantize_humanize_groove_ui(
     ui.separator();
 }
 
-/// The Piano Roll's header (selected track name/mute badge) and note grid, rendered inside the
-/// always-detached Piano Roll window (see `ui` in `impl eframe::App for SimpleDawApp`). Unlike
-/// the Channel Rack, the Piano Roll has no docked mode: it only exists when a piano-roll track is
-/// selected, and closing its window clears the selection instead of re-docking it. There's no
-/// picker here to switch regions — double-click a different region in the Playlist instead (see
-/// `PlaylistEditorTargets`).
+/// The Piano Roll's header (selected track name/mute badge, dock/detach toggle) and note grid,
+/// rendered either inside its own OS window or docked into the central area (see
+/// `piano_roll_detached`/`piano_roll_docked` in `ui`, `impl eframe::App for SimpleDawApp`) — same
+/// dock/detach split as the Channel Rack, except it only exists when a piano-roll track is
+/// selected, and closing its window clears the selection instead of leaving it docked-but-empty.
+/// There's no picker here to switch regions — double-click a different region in the Playlist
+/// instead (see `PlaylistEditorTargets`).
 fn piano_roll_contents_ui(
     ui: &mut egui::Ui,
     song: &mut Song,
@@ -1886,6 +1913,12 @@ fn piano_roll_contents_ui(
             ui.heading("Piano Roll");
         }
     });
+    if ui
+        .small_button(if *panel.detached { "⏷ Dock" } else { "⧉ Detach" })
+        .clicked()
+    {
+        *panel.detached = !*panel.detached;
+    }
     ui.horizontal(|ui| {
         ui.label("Zoom");
         ui.add(
@@ -7509,6 +7542,7 @@ impl eframe::App for SimpleDawApp {
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(12, 12, 12)))
         };
         let mut device_panel = DevicePanelUi {
+            detached: &mut self.device_panel_detached,
             focus: &mut self.device_chain_focus,
             track_effect_slots: &self.track_effect_slots,
             track_effect_instances: &mut self.track_effect_instances,
@@ -7519,24 +7553,51 @@ impl eframe::App for SimpleDawApp {
             new_preset_name: &mut self.new_preset_name,
             preset_message: &mut self.preset_message,
         };
-        egui::Panel::bottom("device_panel")
-            .resizable(true)
-            .default_size(220.0)
-            .size_range(120.0..=480.0)
-            .frame(device_panel_frame())
-            .show(ui, |ui| {
-                ui.heading("Device Panel");
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    device_panel_contents_ui(ui, song, engine_config, &mut device_panel);
+        if *device_panel.detached {
+            let ctx = ui.ctx().clone();
+            let mut still_open = true;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("device_panel_viewport"),
+                egui::ViewportBuilder::default()
+                    .with_title("Device Panel")
+                    .with_inner_size(egui::vec2(420.0, 480.0)),
+                |ui, _class| {
+                    egui::CentralPanel::default()
+                        .frame(device_panel_frame())
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                device_panel_contents_ui(ui, song, engine_config, &mut device_panel);
+                            });
+                        });
+                    if ui.ctx().input(|i| i.viewport().close_requested()) {
+                        still_open = false;
+                    }
+                },
+            );
+            if !still_open {
+                *device_panel.detached = false;
+            }
+        } else {
+            egui::Panel::bottom("device_panel")
+                .resizable(true)
+                .default_size(220.0)
+                .size_range(120.0..=480.0)
+                .frame(device_panel_frame())
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        device_panel_contents_ui(ui, song, engine_config, &mut device_panel);
+                    });
                 });
-            });
+        }
 
         let piano_roll_open = self
             .selected_track
             .filter(|&i| i < song.tracks.len())
             .filter(|&i| song.tracks[i].kind == TrackKind::PianoRoll)
             .is_some();
+        // Whether the (open) Piano Roll claims the shared central-area slot this frame — it always
+        // wins that slot over a docked Beats window, see `beats_docked` below.
+        let piano_roll_docked = piano_roll_open && !self.piano_roll_detached;
 
         if piano_roll_open {
             let piano_roll_frame = || {
@@ -7545,6 +7606,7 @@ impl eframe::App for SimpleDawApp {
                     .inner_margin(egui::Margin::same(8))
             };
             let mut panel = PianoRollPanelUi {
+                detached: &mut self.piano_roll_detached,
                 selected_track: self.selected_track,
                 piano_roll_drag: &mut self.piano_roll_drag,
                 selected_notes: &mut self.selected_notes,
@@ -7564,27 +7626,33 @@ impl eframe::App for SimpleDawApp {
                 automation_drag: &mut self.automation_drag,
                 track_automation_drag: &mut self.track_automation_drag,
             };
-            let ctx = ui.ctx().clone();
-            let mut still_open = true;
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("piano_roll_viewport"),
-                egui::ViewportBuilder::default()
-                    .with_title("Piano Roll")
-                    .with_inner_size(egui::vec2(900.0, 500.0)),
-                |ui, _class| {
-                    egui::CentralPanel::default()
-                        .frame(piano_roll_frame())
-                        .show(ui, |ui| {
-                            piano_roll_contents_ui(ui, song, current_tick, &mut panel);
-                        });
-                    if ui.ctx().input(|i| i.viewport().close_requested()) {
-                        still_open = false;
-                    }
-                },
-            );
-            if !still_open {
-                self.selected_track = None;
-                self.piano_roll_region = None;
+            if *panel.detached {
+                let ctx = ui.ctx().clone();
+                let mut still_open = true;
+                ctx.show_viewport_immediate(
+                    egui::ViewportId::from_hash_of("piano_roll_viewport"),
+                    egui::ViewportBuilder::default()
+                        .with_title("Piano Roll")
+                        .with_inner_size(egui::vec2(900.0, 500.0)),
+                    |ui, _class| {
+                        egui::CentralPanel::default()
+                            .frame(piano_roll_frame())
+                            .show(ui, |ui| {
+                                piano_roll_contents_ui(ui, song, current_tick, &mut panel);
+                            });
+                        if ui.ctx().input(|i| i.viewport().close_requested()) {
+                            still_open = false;
+                        }
+                    },
+                );
+                if !still_open {
+                    self.selected_track = None;
+                    self.piano_roll_region = None;
+                }
+            } else {
+                piano_roll_frame().show(ui, |ui| {
+                    piano_roll_contents_ui(ui, song, current_tick, &mut panel);
+                });
             }
         }
 
@@ -7593,6 +7661,10 @@ impl eframe::App for SimpleDawApp {
             .filter(|&i| i < song.tracks.len())
             .filter(|&i| song.tracks[i].kind == TrackKind::StepGrid)
             .is_some();
+        // If Piano Roll already claimed the shared central-area slot this frame, a docked Beats
+        // window temporarily renders as a floating window instead of disappearing — its own
+        // `beats_detached` flag is left untouched, so it docks again as soon as the slot frees up.
+        let beats_docked = beats_open && !self.beats_detached && !piano_roll_docked;
 
         if beats_open {
             let beats_frame = || {
@@ -7614,60 +7686,125 @@ impl eframe::App for SimpleDawApp {
                 humanize_velocity: &mut self.groove_humanize_velocity,
                 template_index: &mut self.groove_template_index,
             };
-            let ctx = ui.ctx().clone();
-            let mut still_open = true;
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("beats_viewport"),
-                egui::ViewportBuilder::default()
-                    .with_title("Beats")
-                    .with_inner_size(egui::vec2(1000.0, 650.0)),
-                |ui, _class| {
-                    egui::CentralPanel::default()
-                        .frame(beats_frame())
-                        .show(ui, |ui| {
-                            beats_contents_ui(
-                                ui,
-                                song,
-                                current_tick,
-                                sample_rate,
-                                selected_beats_track,
-                                beats_region,
-                                device_chain_focus,
-                                track_effect_slots,
-                                send_effect_slots,
-                                master_effect_slots,
-                                automation_drag,
-                                track_automation_drag,
-                                &mut groove,
-                            );
-                        });
-                    if ui.ctx().input(|i| i.viewport().close_requested()) {
-                        still_open = false;
-                    }
-                },
-            );
-            if !still_open {
-                self.selected_beats_track = None;
-                self.beats_region = None;
+            let beats_detached = &mut self.beats_detached;
+            if beats_docked {
+                beats_frame().show(ui, |ui| {
+                    beats_contents_ui(
+                        ui,
+                        song,
+                        current_tick,
+                        sample_rate,
+                        selected_beats_track,
+                        beats_region,
+                        device_chain_focus,
+                        track_effect_slots,
+                        send_effect_slots,
+                        master_effect_slots,
+                        automation_drag,
+                        track_automation_drag,
+                        &mut groove,
+                        beats_detached,
+                    );
+                });
+            } else {
+                let ctx = ui.ctx().clone();
+                let mut still_open = true;
+                ctx.show_viewport_immediate(
+                    egui::ViewportId::from_hash_of("beats_viewport"),
+                    egui::ViewportBuilder::default()
+                        .with_title("Beats")
+                        .with_inner_size(egui::vec2(1000.0, 650.0)),
+                    |ui, _class| {
+                        egui::CentralPanel::default()
+                            .frame(beats_frame())
+                            .show(ui, |ui| {
+                                beats_contents_ui(
+                                    ui,
+                                    song,
+                                    current_tick,
+                                    sample_rate,
+                                    selected_beats_track,
+                                    beats_region,
+                                    device_chain_focus,
+                                    track_effect_slots,
+                                    send_effect_slots,
+                                    master_effect_slots,
+                                    automation_drag,
+                                    track_automation_drag,
+                                    &mut groove,
+                                    beats_detached,
+                                );
+                            });
+                        if ui.ctx().input(|i| i.viewport().close_requested()) {
+                            still_open = false;
+                        }
+                    },
+                );
+                if !still_open {
+                    self.selected_beats_track = None;
+                    self.beats_region = None;
+                }
             }
         }
 
-        if self.playlist_open {
+        // Piano Roll/Beats already rendered themselves above (either into their own floating
+        // window or straight into this central area) when docked — Playlist/Session View only get
+        // the shared central-area slot when neither of them is occupying it.
+        if piano_roll_docked || beats_docked {
+            // Nothing left to draw here this frame.
+        } else if self.playlist_open {
             // Docked into the main window's remaining central area (to the right of the Channel
-            // Rack panel), rather than an always-detached viewport like Piano Roll/Beats — the
-            // Playlist is the song-arrangement overview, so it reads best as part of the main
-            // screen instead of a window you have to keep finding and re-positioning.
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(30, 30, 30))
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    let mut editor_targets = PlaylistEditorTargets {
-                        selected_track: &mut self.selected_track,
-                        piano_roll_region: &mut self.piano_roll_region,
-                        piano_roll_scroll_to: &mut self.piano_roll_scroll_to,
-                        selected_beats_track: &mut self.selected_beats_track,
-                        beats_region: &mut self.beats_region,
-                    };
+            // Rack panel) by default, or popped into its own OS window via `playlist_detached` —
+            // same dock/detach split as the Channel Rack/Mixer.
+            let playlist_frame = || {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(30, 30, 30))
+                    .inner_margin(egui::Margin::same(8))
+            };
+            let mut editor_targets = PlaylistEditorTargets {
+                selected_track: &mut self.selected_track,
+                piano_roll_region: &mut self.piano_roll_region,
+                piano_roll_scroll_to: &mut self.piano_roll_scroll_to,
+                selected_beats_track: &mut self.selected_beats_track,
+                beats_region: &mut self.beats_region,
+            };
+            if self.playlist_detached {
+                let ctx = ui.ctx().clone();
+                let mut still_open = true;
+                ctx.show_viewport_immediate(
+                    egui::ViewportId::from_hash_of("playlist_viewport"),
+                    egui::ViewportBuilder::default()
+                        .with_title("Playlist")
+                        .with_inner_size(egui::vec2(1000.0, 500.0)),
+                    |ui, _class| {
+                        egui::CentralPanel::default()
+                            .frame(playlist_frame())
+                            .show(ui, |ui| {
+                                playlist_contents_ui(
+                                    ui,
+                                    song,
+                                    current_tick,
+                                    &mut self.playlist_zoom,
+                                    &mut self.playlist_drag,
+                                    &mut self.audio_clip_drag,
+                                    &mut self.audio_clip_context_menu,
+                                    &mut self.take_folder_context_menu,
+                                    &mut self.take_folder_editor,
+                                    &mut self.flex_editor,
+                                    &mut editor_targets,
+                                    &mut self.playlist_detached,
+                                );
+                            });
+                        if ui.ctx().input(|i| i.viewport().close_requested()) {
+                            still_open = false;
+                        }
+                    },
+                );
+                if !still_open {
+                    self.playlist_detached = false;
+                }
+            } else {
+                playlist_frame().show(ui, |ui| {
                     playlist_contents_ui(
                         ui,
                         song,
@@ -7680,13 +7817,48 @@ impl eframe::App for SimpleDawApp {
                         &mut self.take_folder_editor,
                         &mut self.flex_editor,
                         &mut editor_targets,
+                        &mut self.playlist_detached,
                     );
                 });
+            }
         } else if self.session_view_open {
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(30, 30, 30))
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
+            let session_frame = || {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(30, 30, 30))
+                    .inner_margin(egui::Margin::same(8))
+            };
+            if self.session_view_detached {
+                let ctx = ui.ctx().clone();
+                let mut still_open = true;
+                ctx.show_viewport_immediate(
+                    egui::ViewportId::from_hash_of("session_view_viewport"),
+                    egui::ViewportBuilder::default()
+                        .with_title("Session View")
+                        .with_inner_size(egui::vec2(900.0, 500.0)),
+                    |ui, _class| {
+                        egui::CentralPanel::default()
+                            .frame(session_frame())
+                            .show(ui, |ui| {
+                                session_view_ui::session_view_contents_ui(
+                                    ui,
+                                    song,
+                                    &self.transport,
+                                    &self.session_slots,
+                                    &mut self.session_quantize,
+                                    &mut self.follow_action_editor,
+                                    &mut self.session_view_detached,
+                                );
+                            });
+                        if ui.ctx().input(|i| i.viewport().close_requested()) {
+                            still_open = false;
+                        }
+                    },
+                );
+                if !still_open {
+                    self.session_view_detached = false;
+                }
+            } else {
+                session_frame().show(ui, |ui| {
                     session_view_ui::session_view_contents_ui(
                         ui,
                         song,
@@ -7694,8 +7866,10 @@ impl eframe::App for SimpleDawApp {
                         &self.session_slots,
                         &mut self.session_quantize,
                         &mut self.follow_action_editor,
+                        &mut self.session_view_detached,
                     );
                 });
+            }
         }
     }
 }
@@ -8130,10 +8304,11 @@ fn step_grid_lanes_ui(
     remove_lane
 }
 
-/// The Beats window's header (selected track name/mute badge) and step grid, rendered inside the
-/// always-detached Beats window (see `ui` in `impl eframe::App for SimpleDawApp`) — the step-grid
-/// counterpart of `piano_roll_contents_ui`, including the "no in-window picker, double-click a
-/// region in the Playlist instead" behavior.
+/// The Beats window's header (selected track name/mute badge, dock/detach toggle) and step grid,
+/// rendered either inside its own OS window or docked into the central area (see `beats_detached`/
+/// `beats_docked` in `ui`, `impl eframe::App for SimpleDawApp`) — the step-grid counterpart of
+/// `piano_roll_contents_ui`, including the "no in-window picker, double-click a region in the
+/// Playlist instead" behavior.
 #[allow(clippy::too_many_arguments)]
 fn beats_contents_ui(
     ui: &mut egui::Ui,
@@ -8149,6 +8324,7 @@ fn beats_contents_ui(
     automation_drag: &mut Option<AutomationDrag>,
     track_automation_drag: &mut Option<AutomationDrag>,
     groove: &mut StepGrooveUi,
+    detached: &mut bool,
 ) {
     let selected = selected_beats_track
         .filter(|&i| i < song.tracks.len())
@@ -8177,6 +8353,12 @@ fn beats_contents_ui(
             ui.heading("Beats");
         }
     });
+    if ui
+        .small_button(if *detached { "⏷ Dock" } else { "⧉ Detach" })
+        .clicked()
+    {
+        *detached = !*detached;
+    }
     ui.separator();
 
     if let Some(index) = selected {
@@ -8288,6 +8470,7 @@ fn beats_contents_ui(
 /// the panel counterpart of `ChannelRackUi`/`MixerUi` — a plain struct rather than a dozen
 /// positional parameters, for the same reason those have one.
 struct DevicePanelUi<'a> {
+    detached: &'a mut bool,
     focus: &'a mut Option<DeviceChainFocus>,
     track_effect_slots: &'a TrackEffectSlots,
     track_effect_instances: &'a mut Vec<Vec<Option<PluginInstance<DawHost>>>>,
@@ -8309,6 +8492,17 @@ fn device_panel_contents_ui(
     engine_config: Option<(f64, u32, u32)>,
     panel: &mut DevicePanelUi,
 ) {
+    ui.horizontal(|ui| {
+        ui.heading("Device Panel");
+        if ui
+            .small_button(if *panel.detached { "⏷ Dock" } else { "⧉ Detach" })
+            .clicked()
+        {
+            *panel.detached = !*panel.detached;
+        }
+    });
+    ui.separator();
+
     let Some(focus) = *panel.focus else {
         ui.weak("Click a track's or step-grid lane's 🎹 button to show its instrument and effects here.");
         return;
@@ -8483,7 +8677,7 @@ fn fx_chain_slot_ui(
         let drag_id =
             egui::Id::new(("fx_chain_device_drag", fx.chain_kind, fx.track_index, slot_index));
         ui.dnd_drag_source(drag_id, slot_index, |ui| {
-            ui.label("⠿");
+            ui.label("☰");
         })
         .response
         .on_hover_text("Drag to reorder");
@@ -8542,6 +8736,12 @@ fn fx_chain_slot_ui(
                 ui.label(label);
             }
         }
+    });
+    // Second row — sidechain picker, Params/remove buttons, status message — kept off the name
+    // row above so a narrow Device Panel column (see `fx_chain_ui`'s boxed-device layout) doesn't
+    // force that row wider than the column itself; costs an extra row in the plain vertical list
+    // (Channel Rack/Mixer "FX" menus) too, but that has room to spare.
+    ui.horizontal(|ui| {
         // Sidechain key-source picker — only rendered for a slot kind that actually carries a
         // `sidechain_source` (a loaded CLAP plugin, Compressor, or NoiseGate; see
         // `plugin_host::EffectInstance::sidechain_source_mut`). Reads/writes the live runtime
@@ -8557,6 +8757,7 @@ fn fx_chain_slot_ui(
                 .unwrap_or("None");
             egui::ComboBox::from_id_salt(("sidechain_source", fx.track_index, slot_index))
                 .selected_text(format!("SC: {selected_label}"))
+                .width(90.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(source, None, "None");
                     for (index, name) in fx.track_names.iter().enumerate() {
@@ -8567,6 +8768,13 @@ fn fx_chain_slot_ui(
         if ui.small_button("Params").clicked() {
             *fx.editor = Some(fx_editor_target(fx, slot_index));
         }
+        if ui
+            .small_button("🗑")
+            .on_hover_text("Remove this effect from the chain")
+            .clicked()
+        {
+            *fx_slot_to_remove = Some(slot_index);
+        }
         if let Some((ok, message)) = fx.messages[slot_index].as_ref() {
             let color = if *ok {
                 egui::Color32::from_rgb(120, 220, 140)
@@ -8574,13 +8782,6 @@ fn fx_chain_slot_ui(
                 egui::Color32::RED
             };
             ui.colored_label(color, message);
-        }
-        if ui
-            .small_button("🗑")
-            .on_hover_text("Remove this effect from the chain")
-            .clicked()
-        {
-            *fx_slot_to_remove = Some(slot_index);
         }
     });
     if fx.inline_params
@@ -8685,7 +8886,7 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
         }
     });
     let mut fx_slot_to_remove: Option<usize> = None;
-    // Set when a slot's "⠿" drag handle (see `fx_chain_slot_ui`) is dropped onto another slot's
+    // Set when a slot's "☰" drag handle (see `fx_chain_slot_ui`) is dropped onto another slot's
     // `dnd_drop_zone` below — applied once, after the loop, the same "compute during the loop,
     // apply after" shape `fx_slot_to_remove` already uses (mutating `fx.paths` etc. mid-loop would
     // desync the zero-indexed `slot_index` every remaining iteration is still relying on).
@@ -8702,9 +8903,10 @@ fn fx_chain_ui(ui: &mut egui::Ui, fx: &mut TrackFxUi) {
                 ui.horizontal_top(|ui| {
                     for slot_index in 0..fx.paths.len() {
                         let (_, dropped) = ui.dnd_drop_zone::<usize, _>(
-                            egui::Frame::group(ui.style()),
+                            egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(8, 6)),
                             |ui| {
-                                ui.set_width(240.0);
+                                ui.set_width(190.0);
+                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 3.0);
                                 ui.vertical(|ui| {
                                     fx_chain_slot_ui(ui, fx, slot_index, &mut fx_slot_to_remove);
                                 });
@@ -9532,10 +9734,11 @@ fn handle_piano_roll_interaction(
 /// `draw_playlist_row_header`) on the left — one row per track, `StepGrid`/`PianoRoll` tracks
 /// first (their own independent `regions`) then `Audio` tracks (their `audio_clips`) — beside a
 /// horizontally-scrolling canvas where each row draws that one track's own clips, positioned/sized
-/// by `start_tick`/`loop_length_steps` (or the audio equivalent). Docked into the main window's
-/// central area, toggled by `playlist_open` (see `ui` in `impl eframe::App for SimpleDawApp`) —
-/// unlike Piano Roll/Beats, this isn't a detached viewport. This is also the *only* place a region
-/// gets opened for editing: double-click one to open it in Piano Roll/Beats (see
+/// by `start_tick`/`loop_length_steps` (or the audio equivalent). Toggled by `playlist_open`, and
+/// either docked into the main window's central area or popped into its own OS window via
+/// `playlist_detached` (see `ui` in `impl eframe::App for SimpleDawApp`) — same dock/detach split
+/// as the Channel Rack. This is also the *only* place a region gets opened for editing:
+/// double-click one to open it in Piano Roll/Beats (see
 /// `PlaylistEditorTargets`) — there's no Channel Rack button or in-window picker for it.
 /// Draws a small preview of a region's musical content inside its Playlist clip rect — thin bars
 /// for piano-roll notes (stacked by pitch) or step-grid hits (stacked by lane row). Tiled across
@@ -9810,6 +10013,7 @@ fn playlist_contents_ui(
     take_folder_editor: &mut Option<(usize, usize)>,
     flex_editor: &mut Option<(usize, usize)>,
     editor_targets: &mut PlaylistEditorTargets,
+    detached: &mut bool,
 ) {
     ui.horizontal(|ui| {
         ui.heading("Playlist");
@@ -9820,6 +10024,12 @@ fn playlist_contents_ui(
                 .fixed_decimals(2)
                 .suffix("x"),
         );
+        if ui
+            .small_button(if *detached { "⏷ Dock" } else { "⧉ Detach" })
+            .clicked()
+        {
+            *detached = !*detached;
+        }
     });
     ui.weak(
         "Click empty space on a track's row to create a region there; drag its right edge to \
