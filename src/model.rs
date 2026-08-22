@@ -1025,6 +1025,60 @@ pub enum FollowAction {
     Other(usize),
 }
 
+/// How a Session View slot responds to being launched — Ableton's four launch modes. `Toggle`
+/// matches this app's original (pre-launch-mode) behavior exactly, so it's the default every
+/// existing `SessionClip` keeps on load (`#[serde(default)]`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaunchMode {
+    /// Click starts the clip; clicking it again while playing/queued stops it.
+    #[default]
+    Toggle,
+    /// Click (re)starts the clip; clicking it again while playing retriggers it from the top
+    /// rather than stopping it — stopping needs an explicit "Stop" (context menu, scene, or
+    /// another exclusive launch on the same track).
+    Trigger,
+    /// Plays only while held down; releasing stops it immediately, bypassing launch
+    /// quantization on the way out (matching a physical gate). Driven by
+    /// `SessionLaunchRequest::held`, not `SessionLaunchRequest::intent`.
+    Gate,
+    /// Like `Gate`, but retriggers the clip from the top every time the launch-quantize
+    /// boundary is crossed while still held — a stutter/roll effect.
+    Repeat,
+}
+
+/// How many ticks a Session View launch/stop snaps forward to — see
+/// `session::next_quantize_boundary`. `None` acts immediately, at the current tick. The grid-wide
+/// setting lives as live UI state (`SimpleDawApp::session_quantize`), resolved to raw ticks once
+/// per frame (`audio::Transport::session_quantize_ticks`) since that resolution already needs
+/// `Song::steps_per_bar`; `SessionClip::quantize_override` reuses this same enum, not a raw tick
+/// count, so a per-clip override stays correct across a time-signature change too instead of
+/// freezing in whatever tick count happened to be true when it was set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionQuantize {
+    None,
+    QuarterBar,
+    HalfBar,
+    #[default]
+    OneBar,
+    TwoBar,
+    FourBar,
+}
+
+impl SessionQuantize {
+    /// Ticks per quantize unit at `song`'s own time signature — see `Song::steps_per_bar`.
+    pub fn ticks(self, song: &Song) -> usize {
+        let bar_ticks = song.steps_per_bar() * TICKS_PER_STEP;
+        match self {
+            Self::None => 0,
+            Self::QuarterBar => bar_ticks / 4,
+            Self::HalfBar => bar_ticks / 2,
+            Self::OneBar => bar_ticks,
+            Self::TwoBar => bar_ticks * 2,
+            Self::FourBar => bar_ticks * 4,
+        }
+    }
+}
+
 /// A Session View slot's follow action — see `FollowAction`. Ableton's model: two independent
 /// candidate actions, picked by weighted random choice each time the follow action fires (not
 /// picked once and fixed), after the clip has played through `times` times.
@@ -1068,12 +1122,21 @@ pub struct SessionClip {
     /// legato existed still load with it off (unchanged restart-at-0 behavior).
     #[serde(default)]
     pub legato: bool,
+    /// See `LaunchMode`. `#[serde(default)]` so session clips saved before launch modes existed
+    /// still load as `Toggle` — this app's original click-to-start/click-to-stop behavior.
+    #[serde(default)]
+    pub launch_mode: LaunchMode,
+    /// Overrides the Session View grid's own quantize setting for this clip alone, when set —
+    /// see `SessionQuantize`. `#[serde(default)]` so session clips saved before this existed
+    /// still load as `None` (always follow the grid-wide setting, unchanged prior behavior).
+    #[serde(default)]
+    pub quantize_override: Option<SessionQuantize>,
 }
 
 impl SessionClip {
-    /// Copies `region`'s content into a new session clip — Session View's v1 authoring path is
-    /// assigning already-authored Playlist content into a slot, not composing fresh content in
-    /// place (see `session_view_ui::handle_session_interaction`'s "Assign from Playlist" menu).
+    /// Copies `region`'s content into a new session clip — one of two ways a slot gets `Region`
+    /// content, alongside composing fresh content in place (see `new_piano_roll`/`to_region` for
+    /// the reverse direction). See `session_view_ui`'s "Assign from Playlist" menu.
     pub fn from_region(region: &Region) -> Self {
         Self {
             name: region.name.clone(),
@@ -1084,6 +1147,8 @@ impl SessionClip {
             },
             follow_action: FollowActionConfig::default(),
             legato: false,
+            launch_mode: LaunchMode::default(),
+            quantize_override: None,
         }
     }
 
@@ -1098,7 +1163,74 @@ impl SessionClip {
             content: SessionClipContent::Audio(clip),
             follow_action: FollowActionConfig::default(),
             legato: false,
+            launch_mode: LaunchMode::default(),
+            quantize_override: None,
         }
+    }
+
+    /// A blank, freshly-composed piano-roll session clip — the Session View counterpart of
+    /// `Track::add_region` for a `PianoRoll`-kind track, used by a slot's "Compose New Region…"
+    /// instead of copying already-authored Playlist content (see `from_region`). `length_steps`
+    /// is both the clip's initial content and loop length, matching `add_region`'s own default of
+    /// one bar.
+    pub fn new_piano_roll(name: impl Into<String>, length_steps: usize) -> Self {
+        Self {
+            name: name.into(),
+            content: SessionClipContent::Region {
+                content: RegionContent::PianoRoll(Vec::new()),
+                content_length_steps: length_steps,
+                loop_length_steps: length_steps,
+            },
+            follow_action: FollowActionConfig::default(),
+            legato: false,
+            launch_mode: LaunchMode::default(),
+            quantize_override: None,
+        }
+    }
+
+    /// A blank, freshly-composed step-grid session clip — the `StepGrid`-track counterpart of
+    /// `new_piano_roll`, used by a slot's "Compose New Beats Lane…". Starts with no lanes at all
+    /// (same as `Track::add_region`'s own `StepGrid` default when the track has no existing
+    /// region to copy a lane layout from) — lanes are added from the Beats window's own "+ Lane"
+    /// button once the slot is open for editing.
+    pub fn new_step_grid(name: impl Into<String>, length_steps: usize) -> Self {
+        Self {
+            name: name.into(),
+            content: SessionClipContent::Region {
+                content: RegionContent::StepGrid(Vec::new()),
+                content_length_steps: length_steps,
+                loop_length_steps: length_steps,
+            },
+            follow_action: FollowActionConfig::default(),
+            legato: false,
+            launch_mode: LaunchMode::default(),
+            quantize_override: None,
+        }
+    }
+
+    /// Converts this clip's own `Region` content into a new Playlist `Region` at `start_tick` —
+    /// the reverse of `from_region`, used by a slot's "Send to Playlist" action. A copy, not a
+    /// move (the slot keeps its own content afterward), matching Ableton's own "drag a Session
+    /// clip into the Arrangement" behavior — the two become independent from that point on. `None`
+    /// for `Audio` content (out of scope for this action — Session View has no timeline position
+    /// to place an audio clip's own fades/trim against the way a `PianoRoll`/`StepGrid` region's
+    /// content ports over directly).
+    pub fn to_region(&self, start_tick: usize) -> Option<Region> {
+        let SessionClipContent::Region { content, content_length_steps, loop_length_steps } =
+            &self.content
+        else {
+            return None;
+        };
+        Some(Region {
+            name: self.name.clone(),
+            start_tick,
+            content_length_steps: *content_length_steps,
+            loop_length_steps: *loop_length_steps,
+            content: content.clone(),
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            automation: Vec::new(),
+        })
     }
 
     /// This clip's loop length in ticks — the audio engine's session playhead wraps modulo this.
@@ -1119,14 +1251,19 @@ impl SessionClip {
 /// A pending user click on a Session View slot, communicated from the UI thread to the audio
 /// thread through the same per-callback `Song` snapshot everything else here rides on (see
 /// `audio::build_playback_stream`'s snapshot-clone). Not song data — never persisted (see
-/// `Track::session_launch_requests`). `generation` is bumped on every click; the audio thread's
-/// own long-lived `Sequencer` state (untouched by the snapshot clone) remembers the last
-/// generation it's seen per slot and only acts when this one has moved on, since a cloned
-/// snapshot has no other way to signal "this changed since last buffer."
+/// `Track::session_launch_requests`). `generation`/`intent` drive `LaunchMode::Toggle`/`Trigger`:
+/// `generation` is bumped on every click, and the audio thread's own long-lived `Sequencer` state
+/// (untouched by the snapshot clone) remembers the last generation it's seen per slot, only
+/// acting when this one has moved on, since a cloned snapshot has no other way to signal "this
+/// changed since last buffer." `held` instead drives `LaunchMode::Gate`/`Repeat`: it's a level
+/// (not edge) signal, read fresh from whatever the latest snapshot carries every buffer — no
+/// generation needed, since "is the button currently down" doesn't have a discrete "moment" to
+/// miss the way a click does.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SessionLaunchRequest {
     pub generation: u64,
     pub intent: LaunchIntent,
+    pub held: bool,
 }
 
 /// See `SessionLaunchRequest`.
@@ -2333,6 +2470,18 @@ impl Track {
             automation: Vec::new(),
         });
         self.regions.len() - 1
+    }
+
+    /// The tick just past the end of this track's furthest-out region — `0` if it has none. Used
+    /// by Session View's "Send to Playlist" action (`SessionClip::to_region`) to place a new
+    /// region after everything already on this track's Playlist, rather than needing an
+    /// interactive placement UI.
+    pub fn end_of_regions_tick(&self) -> usize {
+        self.regions
+            .iter()
+            .map(|region| region.start_tick + region.loop_length_steps * TICKS_PER_STEP)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Appends a new lane to every `StepGrid` region on this track, keeping lanes index-aligned
@@ -4319,6 +4468,97 @@ mod tests {
         let slot = loaded.tracks[0].session_clips[0].as_ref().unwrap();
         assert!(!slot.legato);
         assert_eq!(slot.follow_action, FollowActionConfig::default());
+    }
+
+    #[test]
+    fn new_piano_roll_session_clip_starts_blank_with_matching_content_and_loop_length() {
+        let clip = SessionClip::new_piano_roll("New Region", 16);
+        assert_eq!(clip.name, "New Region");
+        match &clip.content {
+            SessionClipContent::Region { content, content_length_steps, loop_length_steps } => {
+                assert!(matches!(content, RegionContent::PianoRoll(notes) if notes.is_empty()));
+                assert_eq!(*content_length_steps, 16);
+                assert_eq!(*loop_length_steps, 16);
+            }
+            SessionClipContent::Audio(_) => panic!("expected Region content"),
+        }
+    }
+
+    #[test]
+    fn new_step_grid_session_clip_starts_with_no_lanes_and_matching_content_and_loop_length() {
+        let clip = SessionClip::new_step_grid("New Beats Lane", 16);
+        assert_eq!(clip.name, "New Beats Lane");
+        match &clip.content {
+            SessionClipContent::Region { content, content_length_steps, loop_length_steps } => {
+                assert!(matches!(content, RegionContent::StepGrid(lanes) if lanes.is_empty()));
+                assert_eq!(*content_length_steps, 16);
+                assert_eq!(*loop_length_steps, 16);
+            }
+            SessionClipContent::Audio(_) => panic!("expected Region content"),
+        }
+    }
+
+    #[test]
+    fn to_region_copies_a_step_grid_clips_content_at_the_given_start_tick() {
+        let mut clip = SessionClip::new_step_grid("Drums", 4);
+        if let SessionClipContent::Region { content: RegionContent::StepGrid(lanes), .. } =
+            &mut clip.content
+        {
+            lanes.push(Lane::new("Kick", 36, 4));
+        }
+
+        let region = clip.to_region(240).expect("step-grid content should convert");
+        assert_eq!(region.name, "Drums");
+        assert_eq!(region.start_tick, 240);
+        assert_eq!(region.content_length_steps, 4);
+        assert_eq!(region.loop_length_steps, 4);
+        assert!(matches!(&region.content, RegionContent::StepGrid(lanes) if lanes.len() == 1));
+        assert!(region.automation.is_empty());
+    }
+
+    #[test]
+    fn to_region_copies_a_piano_roll_clips_content_at_the_given_start_tick() {
+        let mut clip = SessionClip::new_piano_roll("Melody", 8);
+        if let SessionClipContent::Region { content: RegionContent::PianoRoll(notes), .. } =
+            &mut clip.content
+        {
+            notes.push(crate::model::Note {
+                id: 0,
+                pitch: 60,
+                start_tick: 0,
+                length_ticks: TICKS_PER_STEP,
+                velocity: 100,
+            });
+        }
+
+        let region = clip.to_region(480).expect("piano-roll content should convert");
+        assert_eq!(region.name, "Melody");
+        assert_eq!(region.start_tick, 480);
+        assert_eq!(region.content_length_steps, 8);
+        assert_eq!(region.loop_length_steps, 8);
+        assert!(matches!(&region.content, RegionContent::PianoRoll(notes) if notes.len() == 1));
+        assert!(region.automation.is_empty());
+    }
+
+    #[test]
+    fn to_region_returns_none_for_audio_content() {
+        let clip = SessionClip::from_audio_clip(&AudioClip::new(0, "test.wav"));
+        assert!(clip.to_region(0).is_none());
+    }
+
+    #[test]
+    fn end_of_regions_tick_is_the_furthest_regions_own_end() {
+        let mut track = Track::new_piano_roll("Lead", 1);
+        assert_eq!(track.end_of_regions_tick(), 0, "an empty track has nothing to be past");
+
+        track.add_region(0, 16);
+        let second = track.add_region(32, 16);
+        track.regions[second].loop_length_steps = 4;
+
+        // Region 0: start_tick 0, loop_length_steps 16 -> ends at 16 steps.
+        // Region 1 (shortened): start_tick 32 steps, loop_length_steps 4 -> ends at 36 steps.
+        let expected = (32 + 4) * TICKS_PER_STEP;
+        assert_eq!(track.end_of_regions_tick(), expected);
     }
 
     #[test]

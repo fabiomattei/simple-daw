@@ -3,7 +3,7 @@
 //! `model::FollowAction`/`model::FollowActionConfig` and plain tick counts; called from
 //! `audio::Sequencer::process`'s session-mode trigger loop and unit-tested here in isolation.
 
-use crate::model::{FollowAction, FollowActionConfig, LaunchIntent};
+use crate::model::{FollowAction, FollowActionConfig, LaunchIntent, LaunchMode};
 
 /// One Session View slot's playback state, owned by `audio::Sequencer` (not `Song` — see
 /// `model::SessionLaunchRequest`'s doc comment on why click intent and playback state live on
@@ -39,22 +39,37 @@ pub fn next_quantize_boundary(current_tick: usize, quantize_ticks: usize) -> usi
     current_tick.div_ceil(quantize_ticks) * quantize_ticks
 }
 
-/// The click handler's pure core: folds a new `LaunchIntent` into `state`, queuing a start/stop
-/// at the next quantize boundary rather than acting instantly (unless `quantize_ticks == 0`, in
-/// which case the boundary is `tick_now` and the transition below still applies on the very next
-/// `advance_slot` call). A `Play` click while already `Playing`/`Queued`, or a `Stop` click while
-/// already `Stopped`, is a no-op — already on its way there. A `Stop` click on a `Queued` slot
+/// The click handler's pure core for `LaunchMode::Toggle`/`Trigger` (see `advance_held_slot` for
+/// `Gate`/`Repeat`, which are driven by a continuous held signal instead of discrete clicks like
+/// this). Folds a new `LaunchIntent` into `state`, queuing a start/stop at the next quantize
+/// boundary rather than acting instantly (unless `quantize_ticks == 0`, in which case the
+/// boundary is `tick_now` and the transition below still applies on the very next `advance_slot`
+/// call). A `Stop` click while already `Stopped` is a no-op. A `Stop` click on a `Queued` slot
 /// cancels the queued launch outright (it never started, so there's nothing to fade out of); a
 /// `Play` click on a `QueuedStop` slot un-queues the stop and keeps playing from where it is.
+///
+/// `mode` only changes the `Playing`+`Play` case: under `Toggle` it's a no-op (already playing,
+/// nothing to do — the UI instead sends `Stop` for a second click in `Toggle` mode); under
+/// `Trigger`/`Repeat` it retriggers the clip from the top at the next boundary, matching
+/// Ableton's own Trigger-mode "click again to restart" behavior rather than requiring a separate
+/// stop first. `Gate` never reaches this function (see `advance_held_slot`), but is accepted here
+/// too, behaving like `Trigger`, so a stray `Play` click on a Gate-mode clip (e.g. from a MIDI
+/// controller that only sends discrete clicks) still does something sensible.
 pub fn apply_launch_request(
     state: SlotState,
     intent: LaunchIntent,
+    mode: LaunchMode,
     tick_now: usize,
     quantize_ticks: usize,
 ) -> SlotState {
     let boundary = next_quantize_boundary(tick_now, quantize_ticks);
     match (state, intent) {
         (SlotState::Stopped, LaunchIntent::Play) => SlotState::Queued { launch_tick: boundary },
+        (SlotState::Playing { .. }, LaunchIntent::Play)
+            if matches!(mode, LaunchMode::Trigger | LaunchMode::Repeat | LaunchMode::Gate) =>
+        {
+            SlotState::Queued { launch_tick: boundary }
+        }
         (SlotState::Playing { local_tick, .. }, LaunchIntent::Stop) => {
             SlotState::QueuedStop { local_tick, stop_tick: boundary }
         }
@@ -63,6 +78,42 @@ pub fn apply_launch_request(
             SlotState::Playing { local_tick, loop_count: 0 }
         }
         (unchanged, _) => unchanged,
+    }
+}
+
+/// The continuous-hold counterpart of `apply_launch_request`, driving `LaunchMode::Gate`/
+/// `Repeat` from `SessionLaunchRequest::held` rather than a discrete click — read fresh every
+/// tick from whatever the latest snapshot carries (see that field's doc comment). Returns the new
+/// state plus whether this call should force a fresh content trigger (a mid-hold `Repeat`
+/// retrigger doesn't go through `Stopped`/`Queued` on its way back to `Playing`, so
+/// `just_started_playing` alone can't detect it the way an ordinary launch does).
+///
+/// Releasing (`held == false`) stops immediately, bypassing quantization entirely — a physical
+/// gate/key doesn't wait for the next bar to let go. Holding while `Stopped` queues a start at
+/// the next boundary like any other launch. `Repeat` additionally retriggers from the top every
+/// time `tick_now` lands exactly on a quantize boundary while still `Playing` and held —
+/// `quantize_ticks == 0` disables this (no boundary to land on), leaving `Repeat` behaving like
+/// plain `Gate` in that case.
+pub fn advance_held_slot(
+    state: SlotState,
+    held: bool,
+    mode: LaunchMode,
+    tick_now: usize,
+    quantize_ticks: usize,
+) -> (SlotState, bool) {
+    if !held {
+        return (SlotState::Stopped, false);
+    }
+    match state {
+        SlotState::Stopped => {
+            (SlotState::Queued { launch_tick: next_quantize_boundary(tick_now, quantize_ticks) }, false)
+        }
+        SlotState::Playing { .. }
+            if mode == LaunchMode::Repeat && quantize_ticks > 0 && tick_now.is_multiple_of(quantize_ticks) =>
+        {
+            (SlotState::Playing { local_tick: 0, loop_count: 0 }, true)
+        }
+        other => (other, false),
     }
 }
 
@@ -215,39 +266,97 @@ mod tests {
 
     #[test]
     fn play_click_on_stopped_slot_queues_at_next_boundary() {
-        let state = apply_launch_request(SlotState::Stopped, LaunchIntent::Play, 10, 96);
+        let state = apply_launch_request(SlotState::Stopped, LaunchIntent::Play, LaunchMode::Toggle, 10, 96);
         assert_eq!(state, SlotState::Queued { launch_tick: 96 });
     }
 
     #[test]
     fn stop_click_on_playing_slot_queues_a_stop_at_next_boundary() {
         let playing = SlotState::Playing { local_tick: 40, loop_count: 3 };
-        let state = apply_launch_request(playing, LaunchIntent::Stop, 10, 96);
+        let state = apply_launch_request(playing, LaunchIntent::Stop, LaunchMode::Toggle, 10, 96);
         assert_eq!(state, SlotState::QueuedStop { local_tick: 40, stop_tick: 96 });
     }
 
     #[test]
     fn stop_click_on_queued_slot_cancels_the_launch() {
         let queued = SlotState::Queued { launch_tick: 96 };
-        let state = apply_launch_request(queued, LaunchIntent::Stop, 10, 96);
+        let state = apply_launch_request(queued, LaunchIntent::Stop, LaunchMode::Toggle, 10, 96);
         assert_eq!(state, SlotState::Stopped);
     }
 
     #[test]
     fn play_click_on_queued_stop_slot_resumes_without_stopping() {
         let queued_stop = SlotState::QueuedStop { local_tick: 40, stop_tick: 96 };
-        let state = apply_launch_request(queued_stop, LaunchIntent::Play, 10, 96);
+        let state = apply_launch_request(queued_stop, LaunchIntent::Play, LaunchMode::Toggle, 10, 96);
         assert_eq!(state, SlotState::Playing { local_tick: 40, loop_count: 0 });
     }
 
     #[test]
-    fn redundant_clicks_are_no_ops() {
+    fn redundant_clicks_are_no_ops_in_toggle_mode() {
         let playing = SlotState::Playing { local_tick: 5, loop_count: 1 };
-        assert_eq!(apply_launch_request(playing, LaunchIntent::Play, 10, 96), playing);
         assert_eq!(
-            apply_launch_request(SlotState::Stopped, LaunchIntent::Stop, 10, 96),
+            apply_launch_request(playing, LaunchIntent::Play, LaunchMode::Toggle, 10, 96),
+            playing
+        );
+        assert_eq!(
+            apply_launch_request(SlotState::Stopped, LaunchIntent::Stop, LaunchMode::Toggle, 10, 96),
             SlotState::Stopped
         );
+    }
+
+    #[test]
+    fn trigger_mode_play_click_while_playing_retriggers_at_next_boundary() {
+        let playing = SlotState::Playing { local_tick: 40, loop_count: 3 };
+        let state = apply_launch_request(playing, LaunchIntent::Play, LaunchMode::Trigger, 10, 96);
+        assert_eq!(state, SlotState::Queued { launch_tick: 96 });
+    }
+
+    #[test]
+    fn gate_mode_holding_from_stopped_queues_a_start() {
+        let (state, forced) = advance_held_slot(SlotState::Stopped, true, LaunchMode::Gate, 10, 96);
+        assert_eq!(state, SlotState::Queued { launch_tick: 96 });
+        assert!(!forced);
+    }
+
+    #[test]
+    fn releasing_a_held_slot_stops_immediately_ignoring_quantization() {
+        let playing = SlotState::Playing { local_tick: 40, loop_count: 3 };
+        let (state, forced) = advance_held_slot(playing, false, LaunchMode::Gate, 10, 96);
+        assert_eq!(state, SlotState::Stopped);
+        assert!(!forced);
+
+        let queued = SlotState::Queued { launch_tick: 96 };
+        let (state, _) = advance_held_slot(queued, false, LaunchMode::Repeat, 10, 96);
+        assert_eq!(state, SlotState::Stopped);
+    }
+
+    #[test]
+    fn repeat_mode_retriggers_exactly_on_quantize_boundaries_while_held() {
+        let playing = SlotState::Playing { local_tick: 40, loop_count: 3 };
+        let (state, forced) = advance_held_slot(playing, true, LaunchMode::Repeat, 96, 96);
+        assert_eq!(state, SlotState::Playing { local_tick: 0, loop_count: 0 });
+        assert!(forced);
+
+        // Off a boundary, Repeat behaves like plain Gate: no retrigger.
+        let (state, forced) = advance_held_slot(playing, true, LaunchMode::Repeat, 100, 96);
+        assert_eq!(state, playing);
+        assert!(!forced);
+    }
+
+    #[test]
+    fn gate_mode_never_retriggers_mid_hold() {
+        let playing = SlotState::Playing { local_tick: 40, loop_count: 3 };
+        let (state, forced) = advance_held_slot(playing, true, LaunchMode::Gate, 96, 96);
+        assert_eq!(state, playing);
+        assert!(!forced);
+    }
+
+    #[test]
+    fn repeat_mode_with_zero_quantize_never_retriggers() {
+        let playing = SlotState::Playing { local_tick: 40, loop_count: 3 };
+        let (state, forced) = advance_held_slot(playing, true, LaunchMode::Repeat, 96, 0);
+        assert_eq!(state, playing);
+        assert!(!forced);
     }
 
     #[test]

@@ -8,9 +8,9 @@ use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, Stream, StreamConf
 use crate::metering::{LoudnessMeter, MeterHandles};
 use crate::model::{
     AutomationLane, AutomationTarget, EffectParamKey, FilterRouting, FilterSlope, FilterType, FollowAction,
-    Lane, LfoTarget, ModSlot, ModSource, ModTarget, Note, RegionContent, SessionClip, SessionClipContent,
-    Song, StepData, SynthEngine, SynthParams, SynthWaveform, TICKS_PER_STEP, Track, TrackKind, TrackOutput,
-    TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams,
+    Lane, LaunchIntent, LaunchMode, LfoTarget, ModSlot, ModSource, ModTarget, Note, RegionContent, SessionClip,
+    SessionClipContent, Song, StepData, SynthEngine, SynthParams, SynthWaveform, TICKS_PER_STEP, Track,
+    TrackKind, TrackOutput, TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams,
 };
 use crate::plugin_host::{
     self, MasterEffectSlots, SendEffectSlots, SubmixEffectSlots, TrackEffectSlots,
@@ -2619,16 +2619,57 @@ impl Sequencer {
             for (slot_index, maybe_clip) in track.session_clips.iter().enumerate() {
                 let Some(clip) = maybe_clip else { continue };
 
+                // A clip's own `quantize_override` (if set) replaces the grid-wide quantize
+                // setting for every boundary this slot resolves below — see that field's doc
+                // comment on why it's stored as the `SessionQuantize` enum rather than raw ticks
+                // (so it stays correct across a mid-song time-signature change too).
+                let quantize_ticks = clip
+                    .quantize_override
+                    .map(|quantize| quantize.ticks(snapshot))
+                    .unwrap_or(session_quantize_ticks);
+
                 let mut state = self.session_slots[track_index][slot_index];
-                if let Some(request) = track.session_launch_requests.get(slot_index) {
+                let mut forced_retrigger = false;
+
+                if matches!(clip.launch_mode, LaunchMode::Gate | LaunchMode::Repeat) {
+                    // Gate/Repeat are driven by the continuous `held` signal, not a discrete
+                    // click — see `SessionLaunchRequest::held`'s doc comment. An explicit Stop
+                    // (e.g. the slot's context-menu "Stop" entry) is still honored on top of
+                    // that, the same generation-edge check the click path below uses, so there's
+                    // always a way to force-stop a held slot even if the UI's hold signal gets
+                    // stuck (e.g. losing the pointer-up event).
+                    let held = track
+                        .session_launch_requests
+                        .get(slot_index)
+                        .is_some_and(|request| request.held);
+                    let (new_state, force) = session::advance_held_slot(
+                        state,
+                        held,
+                        clip.launch_mode,
+                        tick_now,
+                        quantize_ticks,
+                    );
+                    state = new_state;
+                    forced_retrigger = force;
+                    if let Some(request) = track.session_launch_requests.get(slot_index) {
+                        let seen = &mut self.session_last_seen_generation[track_index][slot_index];
+                        if request.generation != *seen {
+                            *seen = request.generation;
+                            if request.intent == LaunchIntent::Stop {
+                                state = SlotState::Stopped;
+                            }
+                        }
+                    }
+                } else if let Some(request) = track.session_launch_requests.get(slot_index) {
                     let seen = &mut self.session_last_seen_generation[track_index][slot_index];
                     if request.generation != *seen {
                         *seen = request.generation;
                         state = session::apply_launch_request(
                             state,
                             request.intent,
+                            clip.launch_mode,
                             tick_now,
-                            session_quantize_ticks,
+                            quantize_ticks,
                         );
                     }
                 }
@@ -2673,7 +2714,7 @@ impl Sequencer {
                     slot_index,
                     clip,
                     local_tick,
-                    session::just_started_playing(before, after),
+                    session::just_started_playing(before, after) || forced_retrigger,
                     ticks_per_second,
                     samples_per_tick,
                 );
@@ -6382,10 +6423,13 @@ mod tests {
             },
             follow_action: crate::model::FollowActionConfig::default(),
             legato: false,
+            launch_mode: LaunchMode::Toggle,
+            quantize_override: None,
         }));
         track.session_launch_requests.push(crate::model::SessionLaunchRequest {
             generation: 1,
             intent: crate::model::LaunchIntent::Play,
+            ..Default::default()
         });
 
         let song = crate::model::Song {
@@ -6425,6 +6469,72 @@ mod tests {
     }
 
     #[test]
+    fn session_mode_quantize_override_launches_immediately_despite_a_huge_grid_quantize() {
+        let mut track = crate::model::Track::new_step_grid("Drums", 1);
+        let mut lane = crate::model::Lane::new("Kick", 60, 4);
+        lane.set_step(0, 127);
+        track.session_clips.push(Some(crate::model::SessionClip {
+            name: "Slot".to_string(),
+            content: crate::model::SessionClipContent::Region {
+                content: RegionContent::StepGrid(vec![lane]),
+                content_length_steps: 4,
+                loop_length_steps: 4,
+            },
+            follow_action: crate::model::FollowActionConfig::default(),
+            legato: false,
+            launch_mode: LaunchMode::Toggle,
+            // Overrides the grid-wide quantize below with "None" (immediate) — without this,
+            // the launch would never resolve within this test's short processed window.
+            quantize_override: Some(crate::model::SessionQuantize::None),
+        }));
+        track.session_launch_requests.push(crate::model::SessionLaunchRequest {
+            generation: 1,
+            intent: crate::model::LaunchIntent::Play,
+            ..Default::default()
+        });
+
+        let song = crate::model::Song {
+            name: "session view quantize override test".to_string(),
+            bpm: 120.0,
+            tempo_map: Vec::new(),
+            tracks: vec![track],
+            next_note_id: 0,
+            master_effects: Vec::new(),
+            plugins: Vec::new(),
+            synth_presets: Vec::new(),
+            time_signature_numerator: 4,
+            time_signature_denominator: 4,
+            sends: Vec::new(),
+            submixes: Vec::new(),
+        };
+
+        let mut sequencer = Sequencer::new(48_000.0);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        sequencer.process(
+            &song,
+            4096,
+            &mut track_out_l,
+            &mut track_out_r,
+            false,
+            &mut metronome_out,
+            true,      // session_mode
+            1_000_000, // grid-wide quantize: far beyond this test's window if not overridden
+        );
+
+        assert!(
+            matches!(sequencer.session_slots[0][0], SlotState::Playing { .. }),
+            "the clip's own quantize_override should have launched it immediately, got {:?}",
+            sequencer.session_slots[0][0]
+        );
+        assert!(
+            track_out_l[0].iter().any(|&s| s != 0.0),
+            "the launched step-grid session slot should be audible"
+        );
+    }
+
+    #[test]
     fn session_mode_looping_audio_clip_stops_hard_when_the_slot_is_stopped() {
         let sample_rate = 48_000u32;
         // A short clip so it wraps (loops) several times within one process() call.
@@ -6438,10 +6548,13 @@ mod tests {
             content: crate::model::SessionClipContent::Audio(audio_clip),
             follow_action: crate::model::FollowActionConfig::default(),
             legato: false,
+            launch_mode: LaunchMode::Toggle,
+            quantize_override: None,
         }));
         track.session_launch_requests.push(crate::model::SessionLaunchRequest {
             generation: 1,
             intent: crate::model::LaunchIntent::Play,
+            ..Default::default()
         });
 
         let song = crate::model::Song {
@@ -6537,6 +6650,8 @@ mod tests {
                 chance_b: 0.0,
             },
             legato: false,
+            launch_mode: LaunchMode::Toggle,
+            quantize_override: None,
         }));
         track.session_clips.push(Some(crate::model::SessionClip {
             name: "Slot 1".to_string(),
@@ -6547,10 +6662,13 @@ mod tests {
             },
             follow_action: crate::model::FollowActionConfig::default(),
             legato: false,
+            launch_mode: LaunchMode::Toggle,
+            quantize_override: None,
         }));
         track.session_launch_requests.push(crate::model::SessionLaunchRequest {
             generation: 1,
             intent: crate::model::LaunchIntent::Play,
+            ..Default::default()
         });
 
         let song = session_song(track);
@@ -6589,11 +6707,14 @@ mod tests {
                 },
                 follow_action: crate::model::FollowActionConfig::default(),
                 legato: true,
+                launch_mode: LaunchMode::Toggle,
+                quantize_override: None,
             }));
         }
         track.session_launch_requests.push(crate::model::SessionLaunchRequest {
             generation: 1,
             intent: crate::model::LaunchIntent::Play,
+            ..Default::default()
         });
 
         let song = session_song(track);
@@ -6615,6 +6736,7 @@ mod tests {
         song_launch_slot_1.tracks[0].session_launch_requests.push(crate::model::SessionLaunchRequest {
             generation: 1,
             intent: crate::model::LaunchIntent::Play,
+            ..Default::default()
         });
         sequencer.process(
             &song_launch_slot_1,

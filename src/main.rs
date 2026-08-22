@@ -34,8 +34,8 @@ use metering::{MeterHandles, MeterReadings};
 use model::{
     AudioClip, AutomationLane, AutomationPoint, AutomationTarget, CurveShape, EffectParamKey, EqBandType,
     FilterMode, FilterRouting, FilterSlope, FilterType, Lane, LfoTarget, MAX_STEP_TIMING_OFFSET_TICKS,
-    ModSlot, ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, SendBus, Song,
-    StepData, SubmixBus, SynthEngine, SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP,
+    ModSlot, ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, SendBus, SessionClipContent,
+    SessionQuantize, Song, StepData, SubmixBus, SynthEngine, SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP,
     TakeFolder, Track, TrackEffectConfig, TrackKind,
     TrackOutput, TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams, add_note,
     clear_overlaps, find_note_mut, remove_note,
@@ -367,6 +367,21 @@ struct PlaylistDrag {
     mode: PlaylistDragMode,
 }
 
+/// What the Piano Roll or Beats window is currently bound to — a Playlist `Region`
+/// (`Track::regions`, addressed by index) or a Session View slot's own `RegionContent`
+/// (`Track::session_clips`, addressed by slot index) — see `SimpleDawApp::piano_roll_region`/
+/// `beats_region`. `piano_roll_contents_ui`/`beats_contents_ui` each branch on the variant
+/// directly (not through a shared abstraction) since the two live in differently-shaped
+/// containers: `Region` has its own top-level `content`/`content_length_steps`/
+/// `loop_length_steps`/`automation` fields, while a session slot's equivalents nest inside
+/// `SessionClipContent::Region` and it has no `automation` of its own yet (see the Session View
+/// parity plan's "per-clip envelopes" item).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegionEditTarget {
+    Region(usize),
+    SessionSlot(usize),
+}
+
 /// The Piano Roll's/Beats' "which region is open" state, bundled so `handle_playlist_interaction`
 /// can set either pair on a double-click without a long individual-borrow parameter list. Setting
 /// `selected_track`/`piano_roll_region` (or the Beats equivalent) is the *only* way either editor
@@ -374,12 +389,12 @@ struct PlaylistDrag {
 /// Rack has no "open editor" button; see `playlist_contents_ui`'s doc comment.
 struct PlaylistEditorTargets<'a> {
     selected_track: &'a mut Option<usize>,
-    piano_roll_region: &'a mut Option<usize>,
+    piano_roll_region: &'a mut Option<RegionEditTarget>,
     /// See `SimpleDawApp::piano_roll_scroll_to`. Set alongside `piano_roll_region` on a
     /// double-click, to the content-local tick under the click.
     piano_roll_scroll_to: &'a mut Option<usize>,
     selected_beats_track: &'a mut Option<usize>,
-    beats_region: &'a mut Option<usize>,
+    beats_region: &'a mut Option<RegionEditTarget>,
 }
 
 /// What the currently in-progress audio-clip drag (if any) is doing — the `AudioClip` counterpart
@@ -511,12 +526,15 @@ enum FxChainKind {
 /// Which track's or step-grid lane's instrument + effect chain the always-visible bottom Device
 /// Panel (see `device_panel_contents_ui`) is currently showing — the Bitwig/Ableton-style docked
 /// device rack, replacing the old per-track/per-lane synth-settings windows this app used to open
-/// on a "🎹" click. `Lane` is one level deeper than `Track` since a lane's synth belongs to a
-/// specific region's lane rather than the whole track (see `Lane::synth_override`).
+/// on a "🎹" click. `Lane`/`SessionSlotLane` are one level deeper than `Track` since a lane's
+/// synth belongs to a specific region's (or session slot's) own lane rather than the whole track
+/// (see `Lane::synth_override`) — the two are separate variants, not `RegionEditTarget`-addressed,
+/// since a lane's device focus can outlive whichever editor window opened it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeviceChainFocus {
     Track(usize),
     Lane { track_index: usize, region_index: usize, lane_index: usize },
+    SessionSlotLane { track_index: usize, slot_index: usize, lane_index: usize },
 }
 
 /// What kind of row `track_ui` should draw for one FX chain slot — determined by peeking at the
@@ -639,10 +657,11 @@ struct SimpleDawApp {
     /// (the audio thread resizes it to match `Song::tracks`/`Track::session_clips` itself), unlike
     /// `track_meters`, so there's no `resize_session_slots` counterpart to call on track add/remove.
     session_slots: audio::SessionSlotHandles,
-    /// Session View's launch-quantize setting (e.g. "1 Bar") — live UI state, not song data, read
-    /// each frame to compute `Transport::session_quantize_ticks` from the current song's own
-    /// `Song::steps_per_bar`. See `session_view_ui::SessionQuantize`.
-    session_quantize: session_view_ui::SessionQuantize,
+    /// Session View's grid-wide launch-quantize setting (e.g. "1 Bar") — live UI state, not song
+    /// data, read each frame to compute `Transport::session_quantize_ticks` from the current
+    /// song's own `Song::steps_per_bar`. A `SessionClip::quantize_override` can override this per
+    /// clip. See `model::SessionQuantize`.
+    session_quantize: SessionQuantize,
     /// Which Session View slot's Follow Action editor window is open, if any: `(track_index,
     /// slot_index)` — same `Option<(usize, usize)>`-keyed-window idiom as `take_folder_editor`.
     follow_action_editor: Option<(usize, usize)>,
@@ -710,10 +729,10 @@ struct SimpleDawApp {
     /// closed. `None` means no Piano Roll window is open. Only meaningful when it points at a
     /// piano-roll track.
     selected_track: Option<usize>,
-    /// Which of `selected_track`'s own `regions` the Piano Roll is showing/editing — the region
-    /// counterpart of `selected_track` picking the track. `None` (or pointing past the end after
-    /// the region was deleted) shows a "double-click a region in the Playlist" placeholder instead.
-    piano_roll_region: Option<usize>,
+    /// Which of `selected_track`'s own regions or Session View slots the Piano Roll is showing/
+    /// editing — see `RegionEditTarget`. `None` (or pointing past the end after the target was
+    /// deleted) shows a "double-click a region in the Playlist" placeholder instead.
+    piano_roll_region: Option<RegionEditTarget>,
     /// A content-local tick the Piano Roll should scroll to on its next render, set alongside
     /// `piano_roll_region`/`selected_track` by a Playlist double-click so the grid opens on the
     /// section that was actually clicked rather than always at the start. Consumed (cleared) by
@@ -727,9 +746,9 @@ struct SimpleDawApp {
     /// Index of the track whose Beats window is open — same lifecycle as `selected_track`, but
     /// for step-grid tracks.
     selected_beats_track: Option<usize>,
-    /// Which of `selected_beats_track`'s own `regions` the Beats window is showing/editing — the
-    /// Beats counterpart of `piano_roll_region`.
-    beats_region: Option<usize>,
+    /// Which of `selected_beats_track`'s own regions or Session View slots the Beats window is
+    /// showing/editing — the Beats counterpart of `piano_roll_region`. See `RegionEditTarget`.
+    beats_region: Option<RegionEditTarget>,
     /// Whether the (open) Beats window is docked into the central area instead of its own native
     /// OS window — see `piano_roll_detached`. When both Piano Roll and Beats are open and docked
     /// at once, Piano Roll takes priority for the shared central area.
@@ -801,6 +820,24 @@ struct SimpleDawApp {
     /// In-progress "drag this detected note's target pitch" drag in the Flex editor's Pitch tab —
     /// see `FlexNoteDrag`.
     flex_note_drag: Option<FlexNoteDrag>,
+    /// Session View's counterpart of `flex_editor`: which slot's own `AudioClip` (inside a
+    /// `SessionClipContent::Audio` slot) has its Flex Time/Pitch editor window open, if any —
+    /// `(track_index, slot_index)` into `Track::session_clips`. A fully separate window/state
+    /// (not widened addressing on `flex_editor` itself) since a Playlist clip and a session
+    /// slot's own clip are independent things that can each have their own editor window open at
+    /// once — see `session_flex_editor_window_ui`.
+    session_flex_editor: Option<(usize, usize)>,
+    /// Time vs. Pitch tab within the open Session View Flex editor window.
+    session_flex_editor_mode: FlexEditorMode,
+    /// The Session View Flex editor's own independently-decoded raw buffer — same reasoning as
+    /// `flex_editor_raw`, just keyed by `(track_index, slot_index)` instead.
+    session_flex_editor_raw: Option<((usize, usize), Arc<SampleBuffer>)>,
+    /// In-progress warp-marker drag in the Session View Flex editor's Time tab — see
+    /// `flex_marker_drag`.
+    session_flex_marker_drag: Option<FlexMarkerDrag>,
+    /// In-progress pitch-correction drag in the Session View Flex editor's Pitch tab — see
+    /// `flex_note_drag`.
+    session_flex_note_drag: Option<FlexNoteDrag>,
     /// Index of the `Audio`-kind track armed for recording, if any — set from the Channel Rack's
     /// record-arm toggle, cleared if that track is deleted. Session/UI state, not song data (see
     /// `RecordingSession`).
@@ -940,7 +977,7 @@ impl SimpleDawApp {
             master_meter,
             submix_meters,
             session_slots,
-            session_quantize: session_view_ui::SessionQuantize::default(),
+            session_quantize: SessionQuantize::default(),
             follow_action_editor: None,
             effect_editor: None,
             active_embedded_gui: None,
@@ -986,6 +1023,11 @@ impl SimpleDawApp {
             flex_editor_raw: None,
             flex_marker_drag: None,
             flex_note_drag: None,
+            session_flex_editor: None,
+            session_flex_editor_mode: FlexEditorMode::Time,
+            session_flex_editor_raw: None,
+            session_flex_marker_drag: None,
+            session_flex_note_drag: None,
             record_armed_track: None,
             selected_input_device: None,
             recording: None,
@@ -1757,9 +1799,8 @@ struct PianoRollPanelUi<'a> {
     scale_root: &'a mut u8,
     /// See `SimpleDawApp::piano_roll_scale`.
     scale: &'a mut PianoRollScale,
-    /// Which of `selected_track`'s own `regions` to show/edit — see
-    /// `SimpleDawApp::piano_roll_region`. Set only by double-clicking a region in the Playlist.
-    editing_region_index: &'a mut Option<usize>,
+    /// See `SimpleDawApp::piano_roll_region`/`RegionEditTarget`.
+    editing_target: &'a mut Option<RegionEditTarget>,
     /// See `SimpleDawApp::piano_roll_scroll_to`.
     scroll_to: &'a mut Option<usize>,
     /// The open region's own track's live effect chain — read by `automation_lanes_ui`'s "+ Add
@@ -1889,9 +1930,25 @@ fn piano_roll_contents_ui(
         .selected_track
         .filter(|&i| i < song.tracks.len())
         .filter(|&i| song.tracks[i].kind == TrackKind::PianoRoll);
-    let region = selected.and_then(|index| {
-        let region_index = (*panel.editing_region_index)?;
-        (region_index < song.tracks[index].regions.len()).then_some((index, region_index))
+    // Resolves `panel.editing_target` against `selected`'s track, validating the target still
+    // exists (a region/slot can be deleted out from under an open editor) — and, for a session
+    // slot, that its content is still `PianoRoll`-shaped (see `RegionEditTarget`'s doc comment
+    // on why a session slot has to be checked this way rather than just indexed).
+    let region = selected.and_then(|index| match (*panel.editing_target)? {
+        RegionEditTarget::Region(region_index) => (region_index
+            < song.tracks[index].regions.len())
+        .then_some((index, RegionEditTarget::Region(region_index))),
+        RegionEditTarget::SessionSlot(slot_index) => song.tracks[index]
+            .session_clips
+            .get(slot_index)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|clip| {
+                matches!(
+                    clip.content,
+                    SessionClipContent::Region { content: RegionContent::PianoRoll(_), .. }
+                )
+            })
+            .then_some((index, RegionEditTarget::SessionSlot(slot_index))),
     });
 
     ui.horizontal(|ui| match selected {
@@ -1904,9 +1961,20 @@ fn piano_roll_contents_ui(
             if song.tracks[index].muted {
                 ui.colored_label(FL_ACCENT_ORANGE, "MUTED");
             }
-            if let Some((_, region_index)) = region {
+            if let Some((_, target)) = region {
                 ui.separator();
-                ui.weak(&song.tracks[index].regions[region_index].name);
+                match target {
+                    RegionEditTarget::Region(region_index) => {
+                        ui.weak(&song.tracks[index].regions[region_index].name);
+                    }
+                    RegionEditTarget::SessionSlot(slot_index) => {
+                        let name = song.tracks[index].session_clips[slot_index]
+                            .as_ref()
+                            .map(|clip| clip.name.as_str())
+                            .unwrap_or_default();
+                        ui.weak(format!("{name} (Session View)"));
+                    }
+                }
             }
         }
         None => {
@@ -1974,7 +2042,7 @@ fn piano_roll_contents_ui(
                 ui.weak("Double-click a region in the Playlist to edit it here.");
             });
         }
-        Some((index, region_index)) => {
+        Some((index, RegionEditTarget::Region(region_index))) => {
             let color = track_color(index);
             // Reserve room below the note grid for the automation panel (header + roughly one
             // lane's graph; more lanes than that scroll within their own area instead of pushing
@@ -2040,6 +2108,50 @@ fn piano_roll_contents_ui(
                         panel.automation_drag,
                     );
                 },
+            );
+        }
+        Some((index, RegionEditTarget::SessionSlot(slot_index))) => {
+            let color = track_color(index);
+            // No automation panel for a session slot yet (see this function's doc comment on
+            // `RegionEditTarget`), so the note grid gets to keep the space that panel would
+            // otherwise reserve — just a small margin for the note below it.
+            let visible_height = (ui.available_height() - 40.0).max(PIANO_ROLL_HEIGHT_MIN);
+            let steps_per_bar = song.steps_per_bar();
+            let steps_per_beat = song.steps_per_beat();
+            let next_note_id = &mut song.next_note_id;
+            let track = &mut song.tracks[index];
+            let default_note_length_ticks = &mut track.default_note_length_ticks;
+            let Some(Some(clip)) = track.session_clips.get_mut(slot_index) else {
+                ui.weak("Clip no longer exists.");
+                return;
+            };
+            if let SessionClipContent::Region { content, content_length_steps, .. } = &mut clip.content
+                && let RegionContent::PianoRoll(notes) = content
+            {
+                piano_roll_quantize_humanize_groove_ui(ui, notes, panel);
+                piano_roll_ui(
+                    ui,
+                    notes,
+                    next_note_id,
+                    default_note_length_ticks,
+                    content_length_steps,
+                    current_tick,
+                    panel.piano_roll_drag,
+                    panel.selected_notes,
+                    *panel.piano_roll_zoom,
+                    visible_height,
+                    color,
+                    panel.scroll_to,
+                    steps_per_bar,
+                    steps_per_beat,
+                    panel.scale_root,
+                    panel.scale,
+                );
+            }
+            ui.separator();
+            ui.weak(
+                "Per-clip automation isn't available for Session View slots yet — use \"Send to \
+                 Playlist\" to place this clip as a Region, where automation is supported.",
             );
         }
     }
@@ -7296,6 +7408,17 @@ impl eframe::App for SimpleDawApp {
             &mut self.flex_note_drag,
         );
 
+        session_flex_editor_window_ui(
+            ui.ctx(),
+            song,
+            self.sample_rate,
+            &mut self.session_flex_editor,
+            &mut self.session_flex_editor_mode,
+            &mut self.session_flex_editor_raw,
+            &mut self.session_flex_marker_drag,
+            &mut self.session_flex_note_drag,
+        );
+
         let current_tick = playing.then(|| self.transport.current_tick());
         let engine_config = self.engine.as_ref().ok().map(|e| {
             (
@@ -7386,7 +7509,10 @@ impl eframe::App for SimpleDawApp {
             }
             let focus_points_at_removed_track = match self.device_chain_focus {
                 Some(DeviceChainFocus::Track(t)) => t == index,
-                Some(DeviceChainFocus::Lane { track_index, .. }) => track_index == index,
+                Some(
+                    DeviceChainFocus::Lane { track_index, .. }
+                    | DeviceChainFocus::SessionSlotLane { track_index, .. },
+                ) => track_index == index,
                 None => false,
             };
             if focus_points_at_removed_track {
@@ -7618,7 +7744,7 @@ impl eframe::App for SimpleDawApp {
                 piano_roll_zoom: &mut self.piano_roll_zoom,
                 scale_root: &mut self.piano_roll_scale_root,
                 scale: &mut self.piano_roll_scale,
-                editing_region_index: &mut self.piano_roll_region,
+                editing_target: &mut self.piano_roll_region,
                 scroll_to: &mut self.piano_roll_scroll_to,
                 track_effect_slots: &self.track_effect_slots,
                 send_effect_slots: &self.send_effect_slots,
@@ -7846,6 +7972,11 @@ impl eframe::App for SimpleDawApp {
                                     &self.session_slots,
                                     &mut self.session_quantize,
                                     &mut self.follow_action_editor,
+                                    &mut self.session_flex_editor,
+                                    &mut self.selected_track,
+                                    &mut self.piano_roll_region,
+                                    &mut self.selected_beats_track,
+                                    &mut self.beats_region,
                                     &mut self.session_view_detached,
                                 );
                             });
@@ -7866,6 +7997,11 @@ impl eframe::App for SimpleDawApp {
                         &self.session_slots,
                         &mut self.session_quantize,
                         &mut self.follow_action_editor,
+                        &mut self.session_flex_editor,
+                        &mut self.selected_track,
+                        &mut self.piano_roll_region,
+                        &mut self.selected_beats_track,
+                        &mut self.beats_region,
                         &mut self.session_view_detached,
                     );
                 });
@@ -8232,6 +8368,23 @@ fn step_grid_lane_groove_menu_ui(
 /// one place.
 /// Draws every lane's row and returns the index of a lane the user clicked "🗑" on, if any —
 /// the caller applies the removal via `Song::remove_lane` so it stays in sync across patterns.
+/// The `DeviceChainFocus` a click on `lane_index`'s "🎹" button should set — `Lane` for a
+/// Playlist region, `SessionSlotLane` for a Session View slot, matching `edit_target`.
+fn device_chain_focus_for_lane(
+    track_index: usize,
+    edit_target: RegionEditTarget,
+    lane_index: usize,
+) -> DeviceChainFocus {
+    match edit_target {
+        RegionEditTarget::Region(region_index) => {
+            DeviceChainFocus::Lane { track_index, region_index, lane_index }
+        }
+        RegionEditTarget::SessionSlot(slot_index) => {
+            DeviceChainFocus::SessionSlotLane { track_index, slot_index, lane_index }
+        }
+    }
+}
+
 fn step_grid_lanes_ui(
     ui: &mut egui::Ui,
     lanes: &mut [Lane],
@@ -8239,7 +8392,7 @@ fn step_grid_lanes_ui(
     sample_rate: Option<u32>,
     color: egui::Color32,
     track_index: usize,
-    region_index: usize,
+    edit_target: RegionEditTarget,
     device_chain_focus: &mut Option<DeviceChainFocus>,
     groove: &mut StepGrooveUi,
 ) -> Option<usize> {
@@ -8260,16 +8413,15 @@ fn step_grid_lanes_ui(
                     "Pitch (synth lanes only) — {}",
                     note_name(lane.pitch)
                 ));
-            let is_focused = *device_chain_focus
-                == Some(DeviceChainFocus::Lane { track_index, region_index, lane_index });
+            let this_lane_focus = device_chain_focus_for_lane(track_index, edit_target, lane_index);
+            let is_focused = *device_chain_focus == Some(this_lane_focus);
             let synth_button = egui::Button::new("🎹").selected(lane.synth_override || is_focused);
             if ui
                 .add(synth_button)
                 .on_hover_text("Show this lane's own synth (overrides the track synth) in the Device Panel")
                 .clicked()
             {
-                *device_chain_focus =
-                    Some(DeviceChainFocus::Lane { track_index, region_index, lane_index });
+                *device_chain_focus = Some(this_lane_focus);
             }
             step_grid_lane_groove_menu_ui(ui, lane_index, lane, groove);
             lane_sample_controls(ui, lane, sample_rate);
@@ -8316,7 +8468,7 @@ fn beats_contents_ui(
     current_tick: Option<usize>,
     sample_rate: Option<u32>,
     selected_beats_track: Option<usize>,
-    editing_region_index: &mut Option<usize>,
+    editing_target: &mut Option<RegionEditTarget>,
     device_chain_focus: &mut Option<DeviceChainFocus>,
     track_effect_slots: &TrackEffectSlots,
     send_effect_slots: &SendEffectSlots,
@@ -8329,9 +8481,23 @@ fn beats_contents_ui(
     let selected = selected_beats_track
         .filter(|&i| i < song.tracks.len())
         .filter(|&i| song.tracks[i].kind == TrackKind::StepGrid);
-    let region = selected.and_then(|index| {
-        let region_index = (*editing_region_index)?;
-        (region_index < song.tracks[index].regions.len()).then_some((index, region_index))
+    // Resolves `editing_target` against `selected`'s track, validating the target still exists —
+    // same reasoning as `piano_roll_contents_ui`'s equivalent (see `RegionEditTarget`'s doc
+    // comment); for a session slot, its content must still be `StepGrid`-shaped.
+    let region = selected.and_then(|index| match (*editing_target)? {
+        RegionEditTarget::Region(region_index) => (region_index < song.tracks[index].regions.len())
+            .then_some((index, RegionEditTarget::Region(region_index))),
+        RegionEditTarget::SessionSlot(slot_index) => song.tracks[index]
+            .session_clips
+            .get(slot_index)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|clip| {
+                matches!(
+                    clip.content,
+                    SessionClipContent::Region { content: RegionContent::StepGrid(_), .. }
+                )
+            })
+            .then_some((index, RegionEditTarget::SessionSlot(slot_index))),
     });
 
     ui.horizontal(|ui| match selected {
@@ -8344,9 +8510,20 @@ fn beats_contents_ui(
             if song.tracks[index].muted {
                 ui.colored_label(FL_ACCENT_ORANGE, "MUTED");
             }
-            if let Some((_, region_index)) = region {
+            if let Some((_, target)) = region {
                 ui.separator();
-                ui.weak(&song.tracks[index].regions[region_index].name);
+                match target {
+                    RegionEditTarget::Region(region_index) => {
+                        ui.weak(&song.tracks[index].regions[region_index].name);
+                    }
+                    RegionEditTarget::SessionSlot(slot_index) => {
+                        let name = song.tracks[index].session_clips[slot_index]
+                            .as_ref()
+                            .map(|clip| clip.name.as_str())
+                            .unwrap_or_default();
+                        ui.weak(format!("{name} (Session View)"));
+                    }
+                }
             }
         }
         None => {
@@ -8406,7 +8583,7 @@ fn beats_contents_ui(
                 ui.weak("Double-click a region in the Playlist to edit it here.");
             });
         }
-        Some((index, region_index)) => {
+        Some((index, RegionEditTarget::Region(region_index))) => {
             let color = track_color(index);
             if ui.small_button("+ Lane").clicked() {
                 let lane_count = match &song.tracks[index].regions[region_index].content {
@@ -8432,7 +8609,7 @@ fn beats_contents_ui(
                     sample_rate,
                     color,
                     index,
-                    region_index,
+                    RegionEditTarget::Region(region_index),
                     device_chain_focus,
                     groove,
                 );
@@ -8462,6 +8639,50 @@ fn beats_contents_ui(
             if let Some(lane_index) = lane_to_remove {
                 song.tracks[index].remove_lane(lane_index);
             }
+        }
+        Some((index, RegionEditTarget::SessionSlot(slot_index))) => {
+            let color = track_color(index);
+            // Unlike `Track::add_lane`/`remove_lane` (which apply to every region on the track at
+            // once — see their doc comments), a session slot's lanes are its own independent list,
+            // so lane add/remove here just mutates this one slot's `Vec<Lane>` directly.
+            let Some(Some(clip)) = song.tracks[index].session_clips.get_mut(slot_index) else {
+                ui.weak("Clip no longer exists.");
+                return;
+            };
+            let SessionClipContent::Region { content, content_length_steps, .. } = &mut clip.content
+            else {
+                ui.weak("Clip no longer exists.");
+                return;
+            };
+            let RegionContent::StepGrid(lanes) = content else {
+                ui.weak("Clip no longer exists.");
+                return;
+            };
+            if ui.small_button("+ Lane").clicked() {
+                let lane_count = lanes.len();
+                lanes.push(Lane::new(format!("Lane {}", lane_count + 1), 60, *content_length_steps));
+            }
+            let lane_to_remove = step_grid_lanes_ui(
+                ui,
+                lanes,
+                current_tick,
+                sample_rate,
+                color,
+                index,
+                RegionEditTarget::SessionSlot(slot_index),
+                device_chain_focus,
+                groove,
+            );
+            if let Some(lane_index) = lane_to_remove
+                && lane_index < lanes.len()
+            {
+                lanes.remove(lane_index);
+            }
+            ui.separator();
+            ui.weak(
+                "Per-clip automation isn't available for Session View slots yet — use \"Send to \
+                 Playlist\" to place this clip as a Region, where automation is supported.",
+            );
         }
     }
 }
@@ -8595,55 +8816,70 @@ fn device_panel_contents_ui(
                 ui.weak("Lane no longer exists.");
                 return;
             };
-            ui.checkbox(&mut lane.synth_override, "Override the track synth for this lane");
-            if !lane.sample_path.trim().is_empty() {
-                ui.weak(
-                    "This lane has a sample loaded — the sample takes priority and plays \
-                     instead of any synth until it's cleared.",
-                );
-            }
-            if lane.synth_override {
-                egui::CollapsingHeader::new("Synth")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Engine:");
-                            if ui
-                                .selectable_label(
-                                    lane.synth_engine == SynthEngine::Simple,
-                                    "Simple Synth",
-                                )
-                                .clicked()
-                            {
-                                lane.synth_engine = SynthEngine::Simple;
-                            }
-                            if ui
-                                .selectable_label(lane.synth_engine == SynthEngine::Trine, "Trine")
-                                .clicked()
-                            {
-                                lane.synth_engine = SynthEngine::Trine;
-                            }
-                            if ui
-                                .selectable_label(lane.synth_engine == SynthEngine::Wave, "Wave")
-                                .clicked()
-                            {
-                                lane.synth_engine = SynthEngine::Wave;
-                            }
-                        });
-                        match lane.synth_engine {
-                            SynthEngine::Simple => synth_params_ui(ui, &mut lane.synth),
-                            SynthEngine::Trine => trine_params_ui(ui, &mut lane.trine),
-                            SynthEngine::Wave => wave_params_ui(ui, &mut lane.wave),
-                        }
-                    });
-            } else {
-                ui.weak("Unchecked: this lane plays the track's own synth.");
-            }
+            lane_synth_ui(ui, lane);
             ui.separator();
             // A lane has no effect chain of its own — effects are track-scoped — so the panel
             // shows the owning track's chain too, since that's still part of the sound being heard.
             device_panel_track_fx_chain_ui(ui, song, track_index, engine_config, panel);
         }
+        DeviceChainFocus::SessionSlotLane { track_index, slot_index, lane_index } => {
+            let lane = song
+                .tracks
+                .get_mut(track_index)
+                .and_then(|t| t.session_clips.get_mut(slot_index))
+                .and_then(|slot| slot.as_mut())
+                .and_then(|clip| match &mut clip.content {
+                    SessionClipContent::Region { content: RegionContent::StepGrid(lanes), .. } => {
+                        lanes.get_mut(lane_index)
+                    }
+                    _ => None,
+                });
+            let Some(lane) = lane else {
+                *panel.focus = None;
+                ui.weak("Lane no longer exists.");
+                return;
+            };
+            lane_synth_ui(ui, lane);
+            ui.separator();
+            device_panel_track_fx_chain_ui(ui, song, track_index, engine_config, panel);
+        }
+    }
+}
+
+/// A lane's own synth-override editor — the "Override the track synth for this lane" checkbox
+/// plus, when checked, the engine picker and that engine's params. Shared by `DeviceChainFocus::
+/// Lane`/`SessionSlotLane`, which differ only in how they resolve `lane` (a Playlist region's vs.
+/// a session slot's own lane list).
+fn lane_synth_ui(ui: &mut egui::Ui, lane: &mut Lane) {
+    ui.checkbox(&mut lane.synth_override, "Override the track synth for this lane");
+    if !lane.sample_path.trim().is_empty() {
+        ui.weak(
+            "This lane has a sample loaded — the sample takes priority and plays instead of any \
+             synth until it's cleared.",
+        );
+    }
+    if lane.synth_override {
+        egui::CollapsingHeader::new("Synth").default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Engine:");
+                if ui.selectable_label(lane.synth_engine == SynthEngine::Simple, "Simple Synth").clicked() {
+                    lane.synth_engine = SynthEngine::Simple;
+                }
+                if ui.selectable_label(lane.synth_engine == SynthEngine::Trine, "Trine").clicked() {
+                    lane.synth_engine = SynthEngine::Trine;
+                }
+                if ui.selectable_label(lane.synth_engine == SynthEngine::Wave, "Wave").clicked() {
+                    lane.synth_engine = SynthEngine::Wave;
+                }
+            });
+            match lane.synth_engine {
+                SynthEngine::Simple => synth_params_ui(ui, &mut lane.synth),
+                SynthEngine::Trine => trine_params_ui(ui, &mut lane.trine),
+                SynthEngine::Wave => wave_params_ui(ui, &mut lane.wave),
+            }
+        });
+    } else {
+        ui.weak("Unchecked: this lane plays the track's own synth.");
     }
 }
 
@@ -10584,13 +10820,15 @@ fn handle_playlist_interaction(
                             let content_length_steps = region.content_length_steps.max(1);
                             let local_step = step.saturating_sub(start_step) % content_length_steps;
                             *editor_targets.selected_track = Some(track_index);
-                            *editor_targets.piano_roll_region = Some(region_index);
+                            *editor_targets.piano_roll_region =
+                                Some(RegionEditTarget::Region(region_index));
                             *editor_targets.piano_roll_scroll_to =
                                 Some(local_step * TICKS_PER_STEP);
                         }
                         TrackKind::StepGrid => {
                             *editor_targets.selected_beats_track = Some(track_index);
-                            *editor_targets.beats_region = Some(region_index);
+                            *editor_targets.beats_region =
+                                Some(RegionEditTarget::Region(region_index));
                         }
                         TrackKind::Audio => {}
                     }
@@ -11245,6 +11483,114 @@ fn flex_editor_window_ui(
                 .tracks
                 .get_mut(track_index)
                 .and_then(|t| t.audio_clips.get_mut(clip_index))
+            else {
+                ui.weak("Clip no longer exists.");
+                return;
+            };
+            let raw_len = raw_buffer.mono.len();
+
+            ui.horizontal(|ui| {
+                if ui.selectable_label(*mode == FlexEditorMode::Time, "Time").clicked() {
+                    *mode = FlexEditorMode::Time;
+                }
+                if ui.selectable_label(*mode == FlexEditorMode::Pitch, "Pitch").clicked() {
+                    *mode = FlexEditorMode::Pitch;
+                }
+            });
+
+            match *mode {
+                FlexEditorMode::Time => {
+                    ui.weak(
+                        "Click a yellow transient tick to add a warp point; drag an orange point \
+                         to stretch the audio around it. Right-click a point to remove it.",
+                    );
+                    if ui.button("Reset (remove all warp points)").clicked() {
+                        clip.warp_markers.clear();
+                        clip.load(sample_rate.unwrap_or(48_000));
+                    }
+                    flex_time_tab_ui(ui, clip, &raw_buffer, raw_len, sample_rate, marker_drag);
+                }
+                FlexEditorMode::Pitch => {
+                    ui.weak("Drag a detected note up/down to retarget its pitch.");
+                    if ui.button("Reset (remove all pitch corrections)").clicked() {
+                        clip.pitch_corrections.clear();
+                        clip.load(sample_rate.unwrap_or(48_000));
+                    }
+                    flex_pitch_tab_ui(ui, clip, &raw_buffer, sample_rate, note_drag);
+                }
+            }
+        });
+    if !open {
+        *editor_target = None;
+        *marker_drag = None;
+        *note_drag = None;
+    }
+}
+
+/// Session View's counterpart of `flex_editor_window_ui` — same window shell and the exact same
+/// `flex_time_tab_ui`/`flex_pitch_tab_ui` tab-rendering (both already operate on a plain
+/// `&mut AudioClip`, addressing-agnostic), just resolving `editor_target`'s `(track_index,
+/// slot_index)` into `Track::session_clips[slot_index]`'s `SessionClipContent::Audio` clip
+/// instead of a Playlist `Track::audio_clips` entry. Opened from that slot's right-click "Flex
+/// Time / Pitch…" context-menu entry (see `session_view_ui::session_slot_cell_ui`) — never shown
+/// for a `SessionClipContent::Region` slot, which has no `AudioClip` to edit.
+#[allow(clippy::too_many_arguments)]
+fn session_flex_editor_window_ui(
+    ctx: &egui::Context,
+    song: &mut Song,
+    sample_rate: Option<u32>,
+    editor_target: &mut Option<(usize, usize)>,
+    mode: &mut FlexEditorMode,
+    raw_cache: &mut Option<((usize, usize), Arc<SampleBuffer>)>,
+    marker_drag: &mut Option<FlexMarkerDrag>,
+    note_drag: &mut Option<FlexNoteDrag>,
+) {
+    let Some((track_index, slot_index)) = *editor_target else {
+        return;
+    };
+    let Some(file_path) = song
+        .tracks
+        .get(track_index)
+        .and_then(|t| t.session_clips.get(slot_index))
+        .and_then(|slot| slot.as_ref())
+        .and_then(|clip| match &clip.content {
+            SessionClipContent::Audio(audio) => Some(audio.file_path.clone()),
+            SessionClipContent::Region { .. } => None,
+        })
+    else {
+        *editor_target = None;
+        return;
+    };
+
+    let target = (track_index, slot_index);
+    if raw_cache.as_ref().map(|(key, _)| *key) != Some(target) {
+        let rate = sample_rate.unwrap_or(48_000);
+        *raw_cache = SampleBuffer::load_wav_resampled(Path::new(&file_path), rate)
+            .ok()
+            .map(|buffer| (target, Arc::new(buffer)));
+    }
+
+    let mut open = true;
+    egui::Window::new("Flex Time / Pitch (Session View)")
+        .id(egui::Id::new(("session-flex-editor", track_index, slot_index)))
+        .collapsible(false)
+        .resizable(true)
+        .default_width(760.0)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            let Some((_, raw_buffer)) = raw_cache.clone() else {
+                ui.weak("Couldn't decode this clip's audio file.");
+                return;
+            };
+            let Some(clip) = song
+                .tracks
+                .get_mut(track_index)
+                .and_then(|t| t.session_clips.get_mut(slot_index))
+                .and_then(|slot| slot.as_mut())
+                .and_then(|clip| match &mut clip.content {
+                    SessionClipContent::Audio(audio) => Some(audio),
+                    SessionClipContent::Region { .. } => None,
+                })
             else {
                 ui.weak("Clip no longer exists.");
                 return;
