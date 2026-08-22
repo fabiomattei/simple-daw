@@ -3177,6 +3177,29 @@ fn active_region_at(track: &Track, tick: usize) -> Option<&crate::model::Region>
     })
 }
 
+/// `active_region_at`'s Session View counterpart: the one slot (if any) on `track_index` that's
+/// currently sounding — `Playing` or winding down via `QueuedStop` — plus its own `local_tick`, the
+/// session-playback analog of `active_region_at`'s region-local offset. Session View plays at most
+/// one clip per track at a time (`Sequencer::stop_other_session_slots`), so there's at most one
+/// match. `session_slots` is `Sequencer::session_slots` as published for this buffer — index-aligned
+/// with `track.session_clips`, same convention as `SessionSlotHandles`.
+fn active_session_clip_at<'a>(
+    track: &'a Track,
+    track_index: usize,
+    session_slots: &[Vec<SlotState>],
+) -> Option<(&'a crate::model::SessionClip, usize)> {
+    let slots = session_slots.get(track_index)?;
+    slots.iter().enumerate().find_map(|(slot_index, state)| {
+        let local_tick = match state {
+            SlotState::Playing { local_tick, .. } | SlotState::QueuedStop { local_tick, .. } => {
+                *local_tick
+            }
+            SlotState::Stopped | SlotState::Queued { .. } => return None,
+        };
+        track.session_clips.get(slot_index)?.as_ref().map(|clip| (clip, local_tick))
+    })
+}
+
 /// Evaluates one automation lane owned (in the source sense — see `TrackAutomationOverride`'s doc
 /// comment) by `own_index`, at `base_offset`, into whichever bucket its `AutomationTarget` actually
 /// resolves to — most land back on `tracks[own_index]` (the common case), but `OtherTrack*`/
@@ -3244,17 +3267,24 @@ fn apply_automation_lane<'a>(
 }
 
 /// Scans every track's own track-wide automation (`Track::automation`, evaluated at the *absolute*
-/// `tick`) and then its currently-active region's automation (if any, evaluated region-locally) at
-/// `tick` (this buffer's first sample), bucketing every lane by target owner via
-/// `apply_automation_lane`. Track-wide lanes are applied first so an active region's own lane on
-/// the same target overrides it, matching `Track::automation`'s doc comment — a region is the more
-/// specific "clip automation" layer, the track-wide lane is the underlying "track automation"
-/// layer it can locally override. A lane with no points yet is skipped entirely, so adding an
-/// automation lane in the UI before placing any points doesn't silently zero out that parameter.
-fn collect_automation(
-    snapshot: &Song,
+/// `tick`) and then its currently-active clip automation at `tick` (this buffer's first sample),
+/// bucketing every lane by target owner via `apply_automation_lane`. Which "active clip" means
+/// depends on `session_mode` — the same mode switch `Sequencer::process`/`trigger_session_clips`
+/// use (see `Transport::session_mode`'s doc comment): outside Session View it's a Playlist
+/// `Region`'s automation, evaluated region-locally (`active_region_at`); in Session View it's
+/// instead the one currently-sounding `SessionClip`'s own automation, evaluated against its
+/// `local_tick` (`active_session_clip_at`) — never both, matching every other session-mode branch
+/// in this file. Track-wide lanes are applied first so the active clip's own lane on the same
+/// target overrides it, matching `Track::automation`'s doc comment — a clip is the more specific
+/// "clip automation" layer, the track-wide lane is the underlying "track automation" layer it can
+/// locally override. A lane with no points yet is skipped entirely, so adding an automation lane in
+/// the UI before placing any points doesn't silently zero out that parameter.
+fn collect_automation<'a>(
+    snapshot: &'a Song,
     tick: usize,
-) -> (Vec<TrackAutomationOverride<'_>>, MasterAutomationOverride<'_>, Vec<SendAutomationOverride<'_>>) {
+    session_mode: bool,
+    session_slots: &[Vec<SlotState>],
+) -> (Vec<TrackAutomationOverride<'a>>, MasterAutomationOverride<'a>, Vec<SendAutomationOverride<'a>>) {
     let mut tracks: Vec<TrackAutomationOverride> =
         (0..snapshot.tracks.len()).map(|_| TrackAutomationOverride::default()).collect();
     let mut master = MasterAutomationOverride::default();
@@ -3265,7 +3295,20 @@ fn collect_automation(
         for lane in &track.automation {
             apply_automation_lane(lane, tick as f64, own_index, &mut tracks, &mut master, &mut sends);
         }
-        if let Some(region) = active_region_at(track, tick) {
+        if session_mode {
+            if let Some((clip, local_tick)) = active_session_clip_at(track, own_index, session_slots) {
+                for lane in &clip.automation {
+                    apply_automation_lane(
+                        lane,
+                        local_tick as f64,
+                        own_index,
+                        &mut tracks,
+                        &mut master,
+                        &mut sends,
+                    );
+                }
+            }
+        } else if let Some(region) = active_region_at(track, tick) {
             let base_offset = (tick - region.start_tick) as f64;
             for lane in &region.automation {
                 apply_automation_lane(lane, base_offset, own_index, &mut tracks, &mut master, &mut sends);
@@ -3595,8 +3638,12 @@ where
                 // One automated-lane snapshot per track/send/master for this whole buffer,
                 // evaluated per output sample below via `LaneRef::value_at` — see
                 // `TrackAutomationOverride`'s doc comment.
-                let (track_automation, master_override, send_automation) =
-                    collect_automation(snapshot, buffer_start_tick);
+                let (track_automation, master_override, send_automation) = collect_automation(
+                    snapshot,
+                    buffer_start_tick,
+                    transport.is_session_mode(),
+                    &sequencer.session_slots,
+                );
                 master_automation = master_override;
 
                 // Track count can change between callbacks (tracks added/removed) — resize in
@@ -4176,8 +4223,11 @@ pub fn render_track_to_buffer(
         let chunk_start_tick = tick_cursor.round() as usize;
         let samples_per_tick =
             samples_per_tick_at(sample_rate as f64, song.bpm_at(chunk_start_tick));
+        // The offline bounce always renders the Playlist arrangement, never a live Session View
+        // performance (which has no persisted timeline to render) — see this loop's own doc
+        // comment above and `render_song_to_wav`'s.
         let (track_automation, _master_automation, _send_automation) =
-            collect_automation(song, chunk_start_tick);
+            collect_automation(song, chunk_start_tick, false, &[]);
         let automation = track_automation.get(track_index);
         let empty_effect_params = Vec::new();
         let effect_params = automation.map_or(&empty_effect_params, |a| &a.effect_params);
@@ -4385,8 +4435,10 @@ fn mix_song_to_wav_buffer(
         // per call.
         let samples_per_tick =
             samples_per_tick_at(sample_rate as f64, song.bpm_at(chunk_start_tick));
+        // Same "always the Playlist arrangement, never Session View" reasoning as
+        // `render_song_to_wav`'s own `collect_automation` call above.
         let (track_automation, master_automation, send_automation) =
-            collect_automation(song, chunk_start_tick);
+            collect_automation(song, chunk_start_tick, false, &[]);
 
         for buf in send_mix_l.iter_mut().chain(send_mix_r.iter_mut()) {
             buf[..chunk_len].fill(0.0);
@@ -5816,7 +5868,7 @@ mod tests {
     #[test]
     fn collect_automation_is_default_with_no_active_region() {
         let song = song_with_regions(Vec::new());
-        let (tracks, master, sends) = collect_automation(&song, 0);
+        let (tracks, master, sends) = collect_automation(&song, 0, false, &[]);
         assert!(tracks[0].volume.is_none());
         assert!(tracks[0].pan.is_none());
         assert!(tracks[0].send_levels.is_empty());
@@ -5828,7 +5880,7 @@ mod tests {
     #[test]
     fn collect_automation_is_default_when_the_active_region_has_no_lanes() {
         let song = song_with_regions(vec![region_with_automation(4, Vec::new())]);
-        let (tracks, _, _) = collect_automation(&song, 10);
+        let (tracks, _, _) = collect_automation(&song, 10, false, &[]);
         assert!(tracks[0].volume.is_none());
         assert!(tracks[0].pan.is_none());
     }
@@ -5852,7 +5904,7 @@ mod tests {
                 },
             ],
         )]);
-        let (tracks, _, _) = collect_automation(&song, 48);
+        let (tracks, _, _) = collect_automation(&song, 48, false, &[]);
         let volume = tracks[0].volume.unwrap().value_at(0, 1.0);
         assert!((volume - 0.5).abs() < 1e-6);
         let pan = tracks[0].pan.unwrap().value_at(0, 1.0);
@@ -5870,7 +5922,7 @@ mod tests {
             }],
         )]);
         // Past the region's on-timeline span (4 steps * TICKS_PER_STEP).
-        let (tracks, _, _) = collect_automation(&song, 4 * TICKS_PER_STEP + 1);
+        let (tracks, _, _) = collect_automation(&song, 4 * TICKS_PER_STEP + 1, false, &[]);
         assert!(tracks[0].volume.is_none());
     }
 
@@ -5893,7 +5945,7 @@ mod tests {
                 },
             ],
         )]);
-        let (tracks, _, _) = collect_automation(&song, 0);
+        let (tracks, _, _) = collect_automation(&song, 0, false, &[]);
         assert_eq!(tracks[0].send_levels.len(), 1);
         let (send_index, lane) = &tracks[0].send_levels[0];
         assert_eq!(*send_index, 2);
@@ -5927,7 +5979,7 @@ mod tests {
         // A second track, with no automation of its own, to be the redirect target.
         song.tracks.push(crate::model::Track::new_piano_roll("Other", 1));
 
-        let (tracks, master, _) = collect_automation(&song, 0);
+        let (tracks, master, _) = collect_automation(&song, 0, false, &[]);
         assert!(tracks[0].volume.is_none(), "lane redirects away from its own track");
         assert_eq!(tracks[1].volume.unwrap().value_at(0, 1.0), 0.4);
         assert_eq!(master.effect_params.len(), 1);
@@ -5950,7 +6002,7 @@ mod tests {
         });
         // No region at all, let alone one active at tick 50 — the track-wide lane still applies,
         // evaluated at the absolute tick (unlike a region lane, not offset by any region start).
-        let (tracks, _, _) = collect_automation(&song, 50);
+        let (tracks, _, _) = collect_automation(&song, 50, false, &[]);
         assert_eq!(tracks[0].volume.unwrap().value_at(0, 1.0), 0.6);
     }
 
@@ -5970,8 +6022,77 @@ mod tests {
         });
         // Tick 0 is inside the region's on-timeline span — its lane should win over the
         // track-wide one on the same target (Volume), per `Track::automation`'s doc comment.
-        let (tracks, _, _) = collect_automation(&song, 0);
+        let (tracks, _, _) = collect_automation(&song, 0, false, &[]);
         assert_eq!(tracks[0].volume.unwrap().value_at(0, 1.0), 0.9);
+    }
+
+    fn song_with_session_clip(clip: crate::model::SessionClip) -> crate::model::Song {
+        let mut track = crate::model::Track::new_piano_roll("Lead", 1);
+        track.session_clips = vec![Some(clip)];
+        crate::model::Song {
+            name: "session clip automation test".to_string(),
+            bpm: 120.0,
+            tempo_map: Vec::new(),
+            tracks: vec![track],
+            next_note_id: 0,
+            master_effects: Vec::new(),
+            plugins: Vec::new(),
+            synth_presets: Vec::new(),
+            time_signature_numerator: 4,
+            time_signature_denominator: 4,
+            sends: Vec::new(),
+            submixes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn collect_automation_reads_a_playing_session_clips_lane_in_session_mode() {
+        use crate::model::{AutomationLane, AutomationPoint, AutomationTarget};
+        let mut clip = crate::model::SessionClip::new_piano_roll("Clip", 4);
+        clip.automation.push(AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![
+                AutomationPoint { tick: 0, value: 0.0, curve: CurveShape::default() },
+                AutomationPoint { tick: 96, value: 1.0, curve: CurveShape::default() },
+            ],
+        });
+        let song = song_with_session_clip(clip);
+        let session_slots = vec![vec![SlotState::Playing { local_tick: 48, loop_count: 0 }]];
+        // The absolute tick (0) is irrelevant in session mode — only the slot's own `local_tick`
+        // (48, halfway through the lane's 0..96 span) matters.
+        let (tracks, _, _) = collect_automation(&song, 0, true, &session_slots);
+        let volume = tracks[0].volume.unwrap().value_at(0, 1.0);
+        assert!((volume - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn collect_automation_ignores_a_session_clips_lane_outside_session_mode() {
+        use crate::model::{AutomationLane, AutomationPoint, AutomationTarget};
+        let mut clip = crate::model::SessionClip::new_piano_roll("Clip", 4);
+        clip.automation.push(AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![AutomationPoint { tick: 0, value: 0.25, curve: CurveShape::default() }],
+        });
+        let song = song_with_session_clip(clip);
+        let session_slots = vec![vec![SlotState::Playing { local_tick: 0, loop_count: 0 }]];
+        // Same slot state as above, but `session_mode` is false — a session clip's own lanes
+        // never apply outside Session View, matching `Sequencer::process`'s own mode switch.
+        let (tracks, _, _) = collect_automation(&song, 0, false, &session_slots);
+        assert!(tracks[0].volume.is_none());
+    }
+
+    #[test]
+    fn collect_automation_ignores_a_stopped_slots_lane_in_session_mode() {
+        use crate::model::{AutomationLane, AutomationPoint, AutomationTarget};
+        let mut clip = crate::model::SessionClip::new_piano_roll("Clip", 4);
+        clip.automation.push(AutomationLane {
+            target: AutomationTarget::Volume,
+            points: vec![AutomationPoint { tick: 0, value: 0.25, curve: CurveShape::default() }],
+        });
+        let song = song_with_session_clip(clip);
+        let session_slots = vec![vec![SlotState::Stopped]];
+        let (tracks, _, _) = collect_automation(&song, 0, true, &session_slots);
+        assert!(tracks[0].volume.is_none());
     }
 
     #[test]
@@ -6425,6 +6546,7 @@ mod tests {
             legato: false,
             launch_mode: LaunchMode::Toggle,
             quantize_override: None,
+            automation: Vec::new(),
         }));
         track.session_launch_requests.push(crate::model::SessionLaunchRequest {
             generation: 1,
@@ -6486,6 +6608,7 @@ mod tests {
             // Overrides the grid-wide quantize below with "None" (immediate) — without this,
             // the launch would never resolve within this test's short processed window.
             quantize_override: Some(crate::model::SessionQuantize::None),
+            automation: Vec::new(),
         }));
         track.session_launch_requests.push(crate::model::SessionLaunchRequest {
             generation: 1,
@@ -6550,6 +6673,7 @@ mod tests {
             legato: false,
             launch_mode: LaunchMode::Toggle,
             quantize_override: None,
+            automation: Vec::new(),
         }));
         track.session_launch_requests.push(crate::model::SessionLaunchRequest {
             generation: 1,
@@ -6652,6 +6776,7 @@ mod tests {
             legato: false,
             launch_mode: LaunchMode::Toggle,
             quantize_override: None,
+            automation: Vec::new(),
         }));
         track.session_clips.push(Some(crate::model::SessionClip {
             name: "Slot 1".to_string(),
@@ -6664,6 +6789,7 @@ mod tests {
             legato: false,
             launch_mode: LaunchMode::Toggle,
             quantize_override: None,
+            automation: Vec::new(),
         }));
         track.session_launch_requests.push(crate::model::SessionLaunchRequest {
             generation: 1,
@@ -6709,6 +6835,7 @@ mod tests {
                 legato: true,
                 launch_mode: LaunchMode::Toggle,
                 quantize_override: None,
+                automation: Vec::new(),
             }));
         }
         track.session_launch_requests.push(crate::model::SessionLaunchRequest {

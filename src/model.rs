@@ -1131,6 +1131,13 @@ pub struct SessionClip {
     /// still load as `None` (always follow the grid-wide setting, unchanged prior behavior).
     #[serde(default)]
     pub quantize_override: Option<SessionQuantize>,
+    /// This slot's own automation lanes ("rides" — see `AutomationLane`), evaluated against the
+    /// slot's own `SlotState::Playing`/`QueuedStop` `local_tick` instead of a `Region`'s
+    /// `region_local_tick` — see `audio::collect_automation`'s session-mode path. Distinct from
+    /// arrangement-wide `Track::automation`, which still applies during Session View playback too.
+    /// `#[serde(default)]` so session clips saved before this existed still load with none.
+    #[serde(default)]
+    pub automation: Vec<AutomationLane>,
 }
 
 impl SessionClip {
@@ -1149,6 +1156,7 @@ impl SessionClip {
             legato: false,
             launch_mode: LaunchMode::default(),
             quantize_override: None,
+            automation: Vec::new(),
         }
     }
 
@@ -1165,6 +1173,7 @@ impl SessionClip {
             legato: false,
             launch_mode: LaunchMode::default(),
             quantize_override: None,
+            automation: Vec::new(),
         }
     }
 
@@ -1185,6 +1194,7 @@ impl SessionClip {
             legato: false,
             launch_mode: LaunchMode::default(),
             quantize_override: None,
+            automation: Vec::new(),
         }
     }
 
@@ -1205,6 +1215,7 @@ impl SessionClip {
             legato: false,
             launch_mode: LaunchMode::default(),
             quantize_override: None,
+            automation: Vec::new(),
         }
     }
 
@@ -1229,7 +1240,9 @@ impl SessionClip {
             content: content.clone(),
             fade_in_ticks: 0,
             fade_out_ticks: 0,
-            automation: Vec::new(),
+            // Both are local-tick rides over a loop span (see this slot's own `automation` doc
+            // comment), so copying carries over cleanly rather than losing the slot's rides.
+            automation: self.automation.clone(),
         })
     }
 

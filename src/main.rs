@@ -838,6 +838,10 @@ struct SimpleDawApp {
     /// In-progress pitch-correction drag in the Session View Flex editor's Pitch tab — see
     /// `flex_note_drag`.
     session_flex_note_drag: Option<FlexNoteDrag>,
+    /// In-progress automation-point drag in the Session View Flex editor's own automation panel
+    /// (an `Audio`-content `SessionClip`'s only editor surface, so its automation panel lives here
+    /// rather than in the Piano Roll/Beats windows — see `SessionClip::automation`'s doc comment).
+    session_flex_automation_drag: Option<AutomationDrag>,
     /// Index of the `Audio`-kind track armed for recording, if any — set from the Channel Rack's
     /// record-arm toggle, cleared if that track is deleted. Session/UI state, not song data (see
     /// `RecordingSession`).
@@ -1028,6 +1032,7 @@ impl SimpleDawApp {
             session_flex_editor_raw: None,
             session_flex_marker_drag: None,
             session_flex_note_drag: None,
+            session_flex_automation_drag: None,
             record_armed_track: None,
             selected_input_device: None,
             recording: None,
@@ -2112,14 +2117,22 @@ fn piano_roll_contents_ui(
         }
         Some((index, RegionEditTarget::SessionSlot(slot_index))) => {
             let color = track_color(index);
-            // No automation panel for a session slot yet (see this function's doc comment on
-            // `RegionEditTarget`), so the note grid gets to keep the space that panel would
-            // otherwise reserve — just a small margin for the note below it.
-            let visible_height = (ui.available_height() - 40.0).max(PIANO_ROLL_HEIGHT_MIN);
+            // Same reservation as the `Region` arm above, now that a session slot gets its own
+            // automation panel too (see `SessionClip::automation`'s doc comment).
+            let automation_reserved = 110.0;
+            let visible_height =
+                (ui.available_height() - automation_reserved).max(PIANO_ROLL_HEIGHT_MIN);
             let steps_per_bar = song.steps_per_bar();
             let steps_per_beat = song.steps_per_beat();
+            // Same pre-borrow snapshot as the `Region` arm above, for the same reason.
+            let other_tracks_snapshot: Vec<(String, Vec<TrackEffectConfig>)> = song
+                .tracks
+                .iter()
+                .map(|t| (t.name.clone(), t.effects.clone()))
+                .collect();
             let next_note_id = &mut song.next_note_id;
             let track = &mut song.tracks[index];
+            let track_effects_snapshot = track.effects.clone();
             let default_note_length_ticks = &mut track.default_note_length_ticks;
             let Some(Some(clip)) = track.session_clips.get_mut(slot_index) else {
                 ui.weak("Clip no longer exists.");
@@ -2149,9 +2162,31 @@ fn piano_roll_contents_ui(
                 );
             }
             ui.separator();
-            ui.weak(
-                "Per-clip automation isn't available for Session View slots yet — use \"Send to \
-                 Playlist\" to place this clip as a Region, where automation is supported.",
+            let clip_span_ticks = match &clip.content {
+                SessionClipContent::Region { loop_length_steps, .. } => {
+                    loop_length_steps * TICKS_PER_STEP
+                }
+                SessionClipContent::Audio(_) => 0,
+            };
+            egui::ScrollArea::vertical().max_height(automation_reserved.max(60.0)).show(
+                ui,
+                |ui| {
+                    automation_lanes_ui(
+                        ui,
+                        &mut clip.automation,
+                        clip_span_ticks,
+                        index,
+                        &track_effects_snapshot,
+                        panel.track_effect_slots,
+                        &other_tracks_snapshot,
+                        &song.sends,
+                        panel.send_effect_slots,
+                        &song.master_effects,
+                        panel.master_effect_slots,
+                        *panel.piano_roll_zoom,
+                        panel.automation_drag,
+                    );
+                },
             );
         }
     }
@@ -7417,6 +7452,10 @@ impl eframe::App for SimpleDawApp {
             &mut self.session_flex_editor_raw,
             &mut self.session_flex_marker_drag,
             &mut self.session_flex_note_drag,
+            &self.track_effect_slots,
+            &self.send_effect_slots,
+            &self.master_effect_slots,
+            &mut self.session_flex_automation_drag,
         );
 
         let current_tick = playing.then(|| self.transport.current_tick());
@@ -8642,6 +8681,14 @@ fn beats_contents_ui(
         }
         Some((index, RegionEditTarget::SessionSlot(slot_index))) => {
             let color = track_color(index);
+            // Same pre-borrow snapshot as the `Region` arm above, for the same reason —
+            // `automation_lanes_ui`'s "Other Track" targets need to list every track.
+            let track_effects_snapshot = song.tracks[index].effects.clone();
+            let other_tracks_snapshot: Vec<(String, Vec<TrackEffectConfig>)> = song
+                .tracks
+                .iter()
+                .map(|t| (t.name.clone(), t.effects.clone()))
+                .collect();
             // Unlike `Track::add_lane`/`remove_lane` (which apply to every region on the track at
             // once — see their doc comments), a session slot's lanes are its own independent list,
             // so lane add/remove here just mutates this one slot's `Vec<Lane>` directly.
@@ -8649,11 +8696,13 @@ fn beats_contents_ui(
                 ui.weak("Clip no longer exists.");
                 return;
             };
-            let SessionClipContent::Region { content, content_length_steps, .. } = &mut clip.content
+            let SessionClipContent::Region { content, content_length_steps, loop_length_steps } =
+                &mut clip.content
             else {
                 ui.weak("Clip no longer exists.");
                 return;
             };
+            let clip_span_ticks = *loop_length_steps * TICKS_PER_STEP;
             let RegionContent::StepGrid(lanes) = content else {
                 ui.weak("Clip no longer exists.");
                 return;
@@ -8679,10 +8728,25 @@ fn beats_contents_ui(
                 lanes.remove(lane_index);
             }
             ui.separator();
-            ui.weak(
-                "Per-clip automation isn't available for Session View slots yet — use \"Send to \
-                 Playlist\" to place this clip as a Region, where automation is supported.",
-            );
+            // Beats has no continuous zoom of its own — same fixed default as the `Region` arm.
+            let zoom = 1.0;
+            egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
+                automation_lanes_ui(
+                    ui,
+                    &mut clip.automation,
+                    clip_span_ticks,
+                    index,
+                    &track_effects_snapshot,
+                    track_effect_slots,
+                    &other_tracks_snapshot,
+                    &song.sends,
+                    send_effect_slots,
+                    &song.master_effects,
+                    master_effect_slots,
+                    zoom,
+                    automation_drag,
+                );
+            });
         }
     }
 }
@@ -11544,6 +11608,10 @@ fn session_flex_editor_window_ui(
     raw_cache: &mut Option<((usize, usize), Arc<SampleBuffer>)>,
     marker_drag: &mut Option<FlexMarkerDrag>,
     note_drag: &mut Option<FlexNoteDrag>,
+    track_effect_slots: &TrackEffectSlots,
+    send_effect_slots: &SendEffectSlots,
+    master_effect_slots: &MasterEffectSlots,
+    automation_drag: &mut Option<AutomationDrag>,
 ) {
     let Some((track_index, slot_index)) = *editor_target else {
         return;
@@ -11582,20 +11650,31 @@ fn session_flex_editor_window_ui(
                 ui.weak("Couldn't decode this clip's audio file.");
                 return;
             };
-            let Some(clip) = song
+            // Same pre-borrow snapshot as `piano_roll_contents_ui`'s automation panel, for the
+            // same reason — `automation_lanes_ui`'s "Other Track" targets need every track.
+            let other_tracks_snapshot: Vec<(String, Vec<TrackEffectConfig>)> = song
+                .tracks
+                .iter()
+                .map(|t| (t.name.clone(), t.effects.clone()))
+                .collect();
+            let track_effects_snapshot =
+                song.tracks.get(track_index).map(|t| t.effects.clone()).unwrap_or_default();
+            let ticks_per_second = audio::ticks_per_second(song.bpm);
+            let Some(session_clip) = song
                 .tracks
                 .get_mut(track_index)
                 .and_then(|t| t.session_clips.get_mut(slot_index))
                 .and_then(|slot| slot.as_mut())
-                .and_then(|clip| match &mut clip.content {
-                    SessionClipContent::Audio(audio) => Some(audio),
-                    SessionClipContent::Region { .. } => None,
-                })
             else {
                 ui.weak("Clip no longer exists.");
                 return;
             };
+            let SessionClipContent::Audio(clip) = &mut session_clip.content else {
+                ui.weak("Clip no longer exists.");
+                return;
+            };
             let raw_len = raw_buffer.mono.len();
+            let clip_span_ticks = clip.effective_length_ticks(ticks_per_second);
 
             ui.horizontal(|ui| {
                 if ui.selectable_label(*mode == FlexEditorMode::Time, "Time").clicked() {
@@ -11627,11 +11706,31 @@ fn session_flex_editor_window_ui(
                     flex_pitch_tab_ui(ui, clip, &raw_buffer, sample_rate, note_drag);
                 }
             }
+
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
+                automation_lanes_ui(
+                    ui,
+                    &mut session_clip.automation,
+                    clip_span_ticks,
+                    track_index,
+                    &track_effects_snapshot,
+                    track_effect_slots,
+                    &other_tracks_snapshot,
+                    &song.sends,
+                    send_effect_slots,
+                    &song.master_effects,
+                    master_effect_slots,
+                    1.0,
+                    automation_drag,
+                );
+            });
         });
     if !open {
         *editor_target = None;
         *marker_drag = None;
         *note_drag = None;
+        *automation_drag = None;
     }
 }
 
