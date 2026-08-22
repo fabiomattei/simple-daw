@@ -2584,6 +2584,14 @@ pub struct Song {
     /// track's `Track::output` also defaults to `Master`, so nothing changes for them).
     #[serde(default)]
     pub submixes: Vec<SubmixBus>,
+    /// Session View scene rows (see `Scene`) — index-aligned to the grid's slot rows the way
+    /// `Track::session_clips` already are, but grown lazily via `ensure_scene` rather than an
+    /// explicit add/remove pair like `sends`/`submixes`, since a grid row isn't itself a managed
+    /// collection (it just exists wherever a track has a clip). Shorter than the visible row count
+    /// until a scene is actually named or given a tempo. `#[serde(default)]` so song files saved
+    /// before scenes existed still load with none.
+    #[serde(default)]
+    pub scenes: Vec<Scene>,
 }
 
 fn default_time_signature_numerator() -> u8 {
@@ -2601,6 +2609,20 @@ fn default_time_signature_denominator() -> u8 {
 pub struct TempoPoint {
     pub tick: usize,
     pub bpm: f32,
+}
+
+/// One row of `Song::scenes` — a Session View grid row's own name and, optionally, a tempo to
+/// recall when that row's scene is launched (Ableton's "stateful scene" concept). Launching a
+/// scene with `tempo: Some(bpm)` inserts a real `TempoPoint` at the launch-quantize boundary tick
+/// (see `session_view_ui::launch_scene`), so the change is tick-accurate and survives a rewind
+/// past that point the same way any other tempo-map point does. There's no time-signature
+/// counterpart yet — `Song::time_signature_numerator`/`denominator` are single global fields with
+/// no tick-indexed map to recall into (unlike `tempo_map`), so scene-based time-signature recall
+/// is left for a future item once/if that map exists.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Scene {
+    pub name: String,
+    pub tempo: Option<f32>,
 }
 
 /// One imported CLAP plugin in the project library (`Song::plugins`) — a mnemonic name paired
@@ -2841,6 +2863,7 @@ impl Song {
             time_signature_denominator: 4,
             sends: Vec::new(),
             submixes: Vec::new(),
+            scenes: Vec::new(),
         }
     }
 
@@ -2915,6 +2938,16 @@ impl Song {
                 other => other,
             };
         }
+    }
+
+    /// Returns `scenes[index]`, growing the vec with default (unnamed, no tempo) `Scene`s up to
+    /// `index` first if it's not long enough yet — see `Song::scenes`'s doc comment on why scene
+    /// rows are grown lazily rather than through an explicit add/remove pair.
+    pub fn ensure_scene(&mut self, index: usize) -> &mut Scene {
+        if self.scenes.len() <= index {
+            self.scenes.resize(index + 1, Scene::default());
+        }
+        &mut self.scenes[index]
     }
 
     /// Serializes the song to pretty-printed JSON. Loaded sample audio itself
@@ -3266,6 +3299,7 @@ fn migrate_patterns_song(mid: PatternsEraSong) -> Song {
         time_signature_denominator: 4,
         sends: Vec::new(),
         submixes: Vec::new(),
+        scenes: Vec::new(),
     }
 }
 
@@ -5160,6 +5194,24 @@ mod tests {
         song.set_tempo_at(1000, 140.0);
         let ticks: Vec<usize> = song.tempo_map.iter().map(|p| p.tick).collect();
         assert_eq!(ticks, vec![1000, 2000]);
+    }
+
+    #[test]
+    fn ensure_scene_grows_the_vec_and_returns_a_default_entry_beyond_its_current_length() {
+        let mut song = Song::demo();
+        assert!(song.scenes.is_empty());
+        let scene = song.ensure_scene(2);
+        assert_eq!(scene.name, "");
+        assert_eq!(scene.tempo, None);
+        assert_eq!(song.scenes.len(), 3);
+    }
+
+    #[test]
+    fn ensure_scene_returns_the_existing_entry_without_resetting_it() {
+        let mut song = Song::demo();
+        song.ensure_scene(0).tempo = Some(140.0);
+        assert_eq!(song.ensure_scene(0).tempo, Some(140.0));
+        assert_eq!(song.scenes.len(), 1);
     }
 
     #[test]

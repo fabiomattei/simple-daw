@@ -5795,6 +5795,7 @@ mod tests {
             time_signature_denominator: 4,
             sends: Vec::new(),
             submixes: Vec::new(),
+            scenes: Vec::new(),
         }
     }
 
@@ -6042,6 +6043,7 @@ mod tests {
             time_signature_denominator: 4,
             sends: Vec::new(),
             submixes: Vec::new(),
+            scenes: Vec::new(),
         }
     }
 
@@ -6312,6 +6314,7 @@ mod tests {
             time_signature_denominator: 4,
             sends: Vec::new(),
             submixes: Vec::new(),
+            scenes: Vec::new(),
         };
 
         let mut sequencer = Sequencer::new(48_000.0);
@@ -6497,6 +6500,7 @@ mod tests {
             time_signature_denominator: 4,
             sends: Vec::new(),
             submixes: Vec::new(),
+            scenes: Vec::new(),
         };
 
         // The clip alone (no regions at all) should still determine a nonzero loop length —
@@ -6567,6 +6571,7 @@ mod tests {
             time_signature_denominator: 4,
             sends: Vec::new(),
             submixes: Vec::new(),
+            scenes: Vec::new(),
         };
 
         let mut sequencer = Sequencer::new(48_000.0);
@@ -6629,6 +6634,7 @@ mod tests {
             time_signature_denominator: 4,
             sends: Vec::new(),
             submixes: Vec::new(),
+            scenes: Vec::new(),
         };
 
         let mut sequencer = Sequencer::new(48_000.0);
@@ -6694,6 +6700,7 @@ mod tests {
             time_signature_denominator: 4,
             sends: Vec::new(),
             submixes: Vec::new(),
+            scenes: Vec::new(),
         };
 
         let mut sequencer = Sequencer::new(sample_rate as f32);
@@ -6753,6 +6760,7 @@ mod tests {
             time_signature_denominator: 4,
             sends: Vec::new(),
             submixes: Vec::new(),
+            scenes: Vec::new(),
         }
     }
 

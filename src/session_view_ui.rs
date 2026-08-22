@@ -8,14 +8,26 @@
 //! already-authored Playlist `Region`/`AudioClip` (see `SessionClip::from_region`/
 //! `from_audio_clip`), not composed fresh here — so this file never touches the Piano Roll/Beats
 //! editor windows.
+//!
+//! Scene rows (`Song::scenes`, `Scene`) can each recall a tempo on launch (`launch_scene`). Unlike
+//! clip launches — which have to round-trip through `Track::session_launch_requests` because the
+//! audio thread only ever sees stale per-callback clones of `Song` (see "Data model vs. real-time
+//! engine" in the project's CLAUDE.md) — a scene's tempo change is just data (`Song::tempo_map`),
+//! so `launch_scene` writes it straight into the live `Song` here on the UI thread: every function
+//! in this file already receives `song: &mut Song` as an already-locked `MutexGuard` deref, the
+//! same one every other UI-thread edit in this app mutates directly.
 
 use crate::audio::{SessionSlotHandles, Transport};
 use crate::model::{
     FollowAction, LaunchIntent, LaunchMode, RegionContent, SessionClip, SessionClipContent,
     SessionLaunchRequest, SessionQuantize, Song, TrackKind,
 };
-use crate::session::SlotState;
+use crate::session::{next_quantize_boundary, SlotState};
 use crate::RegionEditTarget;
+
+/// Tempo range for a scene's own `DragValue` — matches the Tempo Track panel's own tempo fields
+/// (`tempo_track_ui` in `main.rs`).
+const SCENE_TEMPO_RANGE: std::ops::RangeInclusive<f32> = 20.0..=300.0;
 
 /// Rows shown even when every track's `Track::session_clips` is shorter than this — so the grid
 /// always offers somewhere to assign a first clip rather than starting at zero height.
@@ -126,17 +138,7 @@ pub fn session_view_contents_ui(
                 ui.end_row();
 
                 for slot_index in 0..slot_count {
-                    if ui
-                        .button("▶")
-                        .on_hover_text(format!(
-                            "Launch Scene {}: every track's clip at this row (tracks with \
-                             nothing here are left alone)",
-                            slot_index + 1
-                        ))
-                        .clicked()
-                    {
-                        launch_scene(song, slot_index);
-                    }
+                    scene_header_cell_ui(ui, song, transport, slot_index);
                     for track_index in 0..track_count {
                         let live_state = live_slots
                             .as_deref()
@@ -165,10 +167,47 @@ pub fn session_view_contents_ui(
     follow_action_editor_window_ui(ui.ctx(), song, follow_action_editor);
 }
 
+/// One scene row's header cell: an editable name, an optional tempo to recall on launch (see
+/// `model::Scene`), and the launch button itself.
+fn scene_header_cell_ui(ui: &mut egui::Ui, song: &mut Song, transport: &Transport, slot_index: usize) {
+    // Read before `ensure_scene` takes a mutable borrow of `song` below — `bpm_at` needs `&song`.
+    let current_bpm = song.bpm_at(transport.current_tick());
+    ui.horizontal(|ui| {
+        if ui
+            .button("▶")
+            .on_hover_text(format!(
+                "Launch Scene {}: every track's clip at this row (tracks with nothing here are \
+                 left alone), plus this scene's own tempo if it has one",
+                slot_index + 1
+            ))
+            .clicked()
+        {
+            launch_scene(song, transport, slot_index);
+        }
+        let scene = song.ensure_scene(slot_index);
+        ui.add(
+            egui::TextEdit::singleline(&mut scene.name)
+                .hint_text(format!("Scene {}", slot_index + 1))
+                .desired_width(70.0),
+        );
+        let mut has_tempo = scene.tempo.is_some();
+        if ui.checkbox(&mut has_tempo, "").on_hover_text("Recall a tempo when this scene launches").changed() {
+            scene.tempo = has_tempo.then_some(current_bpm);
+        }
+        if let Some(tempo) = scene.tempo.as_mut() {
+            ui.add(egui::DragValue::new(tempo).range(SCENE_TEMPO_RANGE).suffix(" BPM"));
+        }
+    });
+}
+
 /// Sends a `Play` request to every track whose `session_clips[slot_index]` is filled — tracks
 /// with nothing at that row are left untouched (Ableton's own scene-launch behavior: a scene
-/// launch never stops a track that has no clip in that row).
-fn launch_scene(song: &mut Song, slot_index: usize) {
+/// launch never stops a track that has no clip in that row). If this row's `Scene` has its own
+/// tempo set, also inserts it as a real `TempoPoint` at the same launch-quantize boundary tick the
+/// clip launches themselves resolve to — tick-accurate and rewind-safe, the same guarantee the
+/// Tempo Track panel's own points get, since `song` here is already the locked live `Song` (see
+/// this module's doc comment on why no audio-thread hop is needed for this, unlike clip launches).
+fn launch_scene(song: &mut Song, transport: &Transport, slot_index: usize) {
     for track_index in 0..song.tracks.len() {
         let has_clip = song.tracks[track_index]
             .session_clips
@@ -177,6 +216,11 @@ fn launch_scene(song: &mut Song, slot_index: usize) {
         if has_clip {
             send_launch_request(song, track_index, slot_index, LaunchIntent::Play);
         }
+    }
+    if let Some(bpm) = song.scenes.get(slot_index).and_then(|scene| scene.tempo) {
+        let boundary_tick =
+            next_quantize_boundary(transport.current_tick(), transport.session_quantize_ticks());
+        song.set_tempo_at(boundary_tick, bpm);
     }
 }
 
