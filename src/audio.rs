@@ -7,10 +7,11 @@ use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, Stream, StreamConf
 
 use crate::metering::{LoudnessMeter, MeterHandles};
 use crate::model::{
-    AutomationLane, AutomationTarget, EffectParamKey, FilterRouting, FilterSlope, FilterType, FollowAction,
-    Lane, LaunchIntent, LaunchMode, LfoTarget, ModSlot, ModSource, ModTarget, Note, RegionContent, SessionClip,
-    SessionClipContent, Song, StepData, SynthEngine, SynthParams, SynthWaveform, TICKS_PER_STEP, Track,
-    TrackKind, TrackOutput, TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams,
+    AutomationLane, AutomationTarget, CaptureEvent, CaptureEventKind, EffectParamKey, FilterRouting,
+    FilterSlope, FilterType, FollowAction, Lane, LaunchIntent, LaunchMode, LfoTarget, ModSlot, ModSource,
+    ModTarget, Note, RegionContent, SessionClip, SessionClipContent, Song, StepData, SynthEngine,
+    SynthParams, SynthWaveform, TICKS_PER_STEP, Track, TrackKind, TrackOutput, TrineParams, WaveModSlot,
+    WaveModSource, WaveModTarget, WaveParams,
 };
 use crate::plugin_host::{
     self, MasterEffectSlots, SendEffectSlots, SubmixEffectSlots, TrackEffectSlots,
@@ -97,6 +98,12 @@ pub struct Transport {
     /// by the UI from the current song's own `Song::steps_per_bar` (main.rs's quantize picker), not
     /// computed here, since only the UI has a `Song` to read a time signature from at click time.
     session_quantize_ticks: Arc<AtomicUsize>,
+    /// Whether the toolbar's "Capture" button is currently armed — while true (and only while
+    /// `session_mode`/`playing` are also true), `Sequencer::trigger_session_clips` logs every slot
+    /// launch/stop into its own `capture_log` for `main.rs`'s "Capture to Arrangement" workflow to
+    /// materialize onto the Playlist once this is turned back off. Transport state, not song data,
+    /// same category as `session_mode`.
+    capturing: Arc<AtomicBool>,
 }
 
 impl Transport {
@@ -108,6 +115,7 @@ impl Transport {
             metronome_enabled: Arc::new(AtomicBool::new(false)),
             session_mode: Arc::new(AtomicBool::new(false)),
             session_quantize_ticks: Arc::new(AtomicUsize::new(0)),
+            capturing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -156,6 +164,16 @@ impl Transport {
     /// the UI's playhead. Divide by `TICKS_PER_STEP` for step-grid display.
     pub fn current_tick(&self) -> usize {
         self.current_tick.load(Ordering::Relaxed)
+    }
+
+    /// See `Transport::capturing`.
+    pub fn is_capturing(&self) -> bool {
+        self.capturing.load(Ordering::Relaxed)
+    }
+
+    /// See `Transport::capturing`.
+    pub fn set_capturing(&self, capturing: bool) {
+        self.capturing.store(capturing, Ordering::Relaxed);
     }
 }
 
@@ -221,6 +239,7 @@ impl AudioEngine {
         master_meter: MeterHandles,
         submix_meters: MeterHandles,
         session_slots: SessionSlotHandles,
+        capture_log: CaptureLogHandle,
         device_name: Option<&str>,
         sample_rate: Option<u32>,
     ) -> Result<Self> {
@@ -282,6 +301,7 @@ impl AudioEngine {
                 master_meter,
                 submix_meters,
                 session_slots,
+                capture_log,
                 max_frames as usize,
             )?,
             SampleFormat::I16 => build_playback_stream::<i16>(
@@ -297,6 +317,7 @@ impl AudioEngine {
                 master_meter,
                 submix_meters,
                 session_slots,
+                capture_log,
                 max_frames as usize,
             )?,
             SampleFormat::U16 => build_playback_stream::<u16>(
@@ -312,6 +333,7 @@ impl AudioEngine {
                 master_meter,
                 submix_meters,
                 session_slots,
+                capture_log,
                 max_frames as usize,
             )?,
             other => bail!("unsupported output sample format: {other:?}"),
@@ -2159,6 +2181,18 @@ pub fn new_session_slot_handles() -> SessionSlotHandles {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// `Sequencer::capture_log` plus `Sequencer::capture_tick` (the tick to close any still-open
+/// interval at — see `model::Song::insert_captured_session_performance`'s `final_relative_tick`),
+/// published once per callback for `main.rs`'s "Capture to Arrangement" toolbar button to read the
+/// moment it turns capturing back off — same "audio thread owns and publishes, UI thread reads a
+/// cheap clone" split as `SessionSlotHandles`.
+pub type CaptureLogHandle = Arc<Mutex<(Vec<CaptureEvent>, usize)>>;
+
+/// A fresh, empty `CaptureLogHandle`.
+pub fn new_capture_log_handle() -> CaptureLogHandle {
+    Arc::new(Mutex::new((Vec::new(), 0)))
+}
+
 struct Sequencer {
     sample_rate: f32,
     track_voices: Vec<TrackVoices>,
@@ -2195,6 +2229,23 @@ struct Sequencer {
     /// `SampleVoice` never stops itself, so `trigger_session_clips` needs this handle to hard-cut
     /// it the moment a slot's state reaches `SlotState::Stopped`.
     session_audio_voice: Vec<Vec<Option<usize>>>,
+    /// Whether `Transport::capturing` read as true on the *previous* `trigger_session_clips` call —
+    /// lets that function detect the off→on/on→off edges itself (resetting `capture_log`/
+    /// `capture_tick` on the former, nothing special on the latter — `main.rs` reads whatever's
+    /// last published right after flipping the flag off) without `main.rs` needing its own
+    /// round-trip through `Song` the way a slot click does (see `model::SessionLaunchRequest`'s
+    /// doc comment on why *that* needs one — this doesn't, since nothing here needs to survive a
+    /// `Song` snapshot clone).
+    was_capturing: bool,
+    /// Ticks since capturing was last armed — reset to `0` on the off→on edge. Deliberately
+    /// separate from `tick_index`, which wraps around the Playlist's own current length even in
+    /// Session View (see `process`'s doc comment) — a capture spanning multiple wraps needs a
+    /// counter that doesn't.
+    capture_tick: usize,
+    /// Every slot start/stop logged since capturing was last armed — see `model::CaptureEvent`.
+    /// Published each callback via `CaptureLogHandle`, the same "audio thread owns and publishes,
+    /// UI thread reads a cheap clone" split `SessionSlotHandles` already uses.
+    capture_log: Vec<CaptureEvent>,
 }
 
 /// One beat's worth of ticks (see `STEPS_PER_BEAT`/`TICKS_PER_STEP`) — the metronome clicks once
@@ -2220,6 +2271,9 @@ impl Sequencer {
             session_slots: Vec::new(),
             session_last_seen_generation: Vec::new(),
             session_audio_voice: Vec::new(),
+            was_capturing: false,
+            capture_tick: 0,
+            capture_log: Vec::new(),
         }
     }
 
@@ -2278,6 +2332,7 @@ impl Sequencer {
         metronome_out: &mut Vec<f32>,
         session_mode: bool,
         session_quantize_ticks: usize,
+        capturing: bool,
     ) {
         while self.track_voices.len() < snapshot.tracks.len() {
             self.track_voices.push(TrackVoices::new());
@@ -2343,7 +2398,7 @@ impl Sequencer {
                     // Session View is a mode switch, not an overlay (see `Transport::session_mode`'s
                     // doc comment): while active, none of the Playlist arrangement's regions/audio
                     // clips/take folders below trigger — only Session View's own clip slots do.
-                    self.trigger_session_clips(snapshot, session_quantize_ticks, &track_silent);
+                    self.trigger_session_clips(snapshot, session_quantize_ticks, &track_silent, capturing);
                 } else {
                 // A track's regions are independently positioned and may overlap in time with
                 // each other (unusual, but not prevented) — every region active at this tick on
@@ -2590,6 +2645,7 @@ impl Sequencer {
         snapshot: &Song,
         session_quantize_ticks: usize,
         track_silent: &impl Fn(&Track) -> bool,
+        capturing: bool,
     ) {
         while self.session_slots.len() < snapshot.tracks.len() {
             self.session_slots.push(Vec::new());
@@ -2599,6 +2655,15 @@ impl Sequencer {
         self.session_slots.truncate(snapshot.tracks.len());
         self.session_last_seen_generation.truncate(snapshot.tracks.len());
         self.session_audio_voice.truncate(snapshot.tracks.len());
+
+        // The off→on/on→off edges of `Transport::capturing` — see `was_capturing`'s doc comment.
+        if capturing && !self.was_capturing {
+            self.capture_log.clear();
+            self.capture_tick = 0;
+        } else if capturing {
+            self.capture_tick += 1;
+        }
+        self.was_capturing = capturing;
 
         let tick_now = self.tick_index;
         let ticks_per_second = ticks_per_second(snapshot.bpm_at(tick_now));
@@ -2678,7 +2743,8 @@ impl Sequencer {
                 let before = state;
                 let mut after = session::advance_slot(state, tick_now, loop_length_ticks);
 
-                if session::just_started_playing(before, after) {
+                let started_playing = session::just_started_playing(before, after);
+                if started_playing {
                     // Legato: continue whatever phase a sibling on this same track was already
                     // at, instead of restarting at local_tick 0 — read before the exclusivity
                     // stop below wipes that sibling's state. Still waits for the normal
@@ -2697,10 +2763,27 @@ impl Sequencer {
                 }
                 self.session_slots[track_index][slot_index] = after;
 
-                if matches!(after, SlotState::Stopped)
-                    && !matches!(before, SlotState::Stopped | SlotState::Queued { .. })
-                {
+                let just_stopped = matches!(after, SlotState::Stopped)
+                    && !matches!(before, SlotState::Stopped | SlotState::Queued { .. });
+                if just_stopped {
                     self.stop_session_slot_audio(track_index, slot_index);
+                }
+
+                if capturing {
+                    if started_playing {
+                        self.capture_log.push(CaptureEvent {
+                            relative_tick: self.capture_tick,
+                            track_index,
+                            kind: CaptureEventKind::Started { clip: Box::new(clip.clone()) },
+                        });
+                    }
+                    if just_stopped {
+                        self.capture_log.push(CaptureEvent {
+                            relative_tick: self.capture_tick,
+                            track_index,
+                            kind: CaptureEventKind::Stopped,
+                        });
+                    }
                 }
 
                 let local_tick = match after {
@@ -2737,11 +2820,25 @@ impl Sequencer {
                 let target_index = session::follow_action_target(action, slot_index, slot_count, seed);
                 self.stop_session_slot_audio(track_index, slot_index);
                 self.session_slots[track_index][slot_index] = SlotState::Stopped;
+                if capturing {
+                    self.capture_log.push(CaptureEvent {
+                        relative_tick: self.capture_tick,
+                        track_index,
+                        kind: CaptureEventKind::Stopped,
+                    });
+                }
 
                 let Some(target_index) = target_index else { continue };
                 let Some(target_clip) = &track.session_clips[target_index] else { continue };
                 self.session_slots[track_index][target_index] =
                     SlotState::Playing { local_tick: 0, loop_count: 0 };
+                if capturing {
+                    self.capture_log.push(CaptureEvent {
+                        relative_tick: self.capture_tick,
+                        track_index,
+                        kind: CaptureEventKind::Started { clip: Box::new(target_clip.clone()) },
+                    });
+                }
                 self.trigger_session_slot_content(
                     track,
                     track_index,
@@ -3442,6 +3539,7 @@ fn build_playback_stream<T>(
     master_meter: MeterHandles,
     submix_meters: MeterHandles,
     session_slots: SessionSlotHandles,
+    capture_log: CaptureLogHandle,
     max_frames: usize,
 ) -> Result<Stream>
 where
@@ -3648,6 +3746,7 @@ where
                     &mut metronome_dry,
                     transport.is_session_mode(),
                     transport.session_quantize_ticks(),
+                    transport.is_capturing(),
                 );
                 transport
                     .current_tick
@@ -3657,6 +3756,12 @@ where
                 // thread reads a cheap clone" split `track_meters` already uses just below.
                 if let Ok(mut published_session_slots) = session_slots.lock() {
                     published_session_slots.clone_from(&sequencer.session_slots);
+                }
+                // See `CaptureLogHandle`'s doc comment — published every buffer so `main.rs` can
+                // read the latest log the moment it turns `Transport::capturing` back off.
+                if let Ok(mut published_capture_log) = capture_log.lock() {
+                    published_capture_log.0.clone_from(&sequencer.capture_log);
+                    published_capture_log.1 = sequencer.capture_tick;
                 }
 
                 // Resolved once per buffer from the tempo at its first tick — unlike
@@ -4229,6 +4334,7 @@ pub fn render_track_to_buffer(
         // doc comment.
         false,
         0,
+        false, // capturing — the offline bounce never logs a Session View performance
     );
 
     let mut chain = plugin_host::load_offline_chain(
@@ -4326,6 +4432,7 @@ pub fn render_song_to_wav(
         // doc comment.
         false,
         0,
+        false, // capturing — the offline bounce never logs a Session View performance
     );
 
     let buffer_l = vec![0.0f32; total_samples];
@@ -6159,6 +6266,7 @@ mod tests {
             &mut metronome_out,
             false,
             0,
+            false, // capturing
         );
 
         let samples_per_tick = (sample_rate as f64 * 60.0
@@ -6208,6 +6316,7 @@ mod tests {
             &mut metronome_out,
             false,
             0,
+            false, // capturing
         );
 
         let expected_onset = (tempo_change_tick as f64
@@ -6363,6 +6472,7 @@ mod tests {
             &mut metronome_out,
             false,
             0,
+            false, // capturing
         );
 
         assert!(
@@ -6406,6 +6516,7 @@ mod tests {
         let mut metronome_out = Vec::new();
         sequencer.process(
             &song, 4096, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, false, 0,
+            false, // capturing
         );
 
         assert!(
@@ -6448,6 +6559,7 @@ mod tests {
         let mut metronome_out = Vec::new();
         sequencer.process(
             &song, 4096, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, false, 0,
+            false, // capturing
         );
 
         assert!(
@@ -6619,6 +6731,7 @@ mod tests {
             &mut metronome_out,
             true, // session_mode
             0,    // no quantization: launches immediately
+            false, // capturing
         );
 
         assert!(
@@ -6682,6 +6795,7 @@ mod tests {
             &mut metronome_out,
             true,      // session_mode
             1_000_000, // grid-wide quantize: far beyond this test's window if not overridden
+            false, // capturing
         );
 
         assert!(
@@ -6743,6 +6857,7 @@ mod tests {
         // clip actually looped (see `SampleVoice::looping`) instead of going silent after once.
         sequencer.process(
             &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            false, // capturing
         );
         assert!(
             track_out_l[0][3000..4000].iter().any(|&s| s != 0.0),
@@ -6761,6 +6876,7 @@ mod tests {
             &mut metronome_out,
             true,
             0,
+            false, // capturing
         );
         assert!(
             track_out_l[0][3000..4000].iter().all(|&s| s == 0.0),
@@ -6818,6 +6934,7 @@ mod tests {
         // recording actually looped instead of going silent after playing once.
         sequencer.process(
             &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            false, // capturing
         );
         assert!(
             track_out_l[0][3000..4000].iter().any(|&s| s != 0.0),
@@ -6903,6 +7020,7 @@ mod tests {
         // second of audio at any reasonable tempo, so this covers several loops.
         sequencer.process(
             &song, 48_000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            false, // capturing
         );
 
         assert_eq!(
@@ -6950,6 +7068,7 @@ mod tests {
         // short of its own 16-step length.
         sequencer.process(
             &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            false, // capturing
         );
         let SlotState::Playing { local_tick: slot_0_local_tick, .. } = sequencer.session_slots[0][0] else {
             panic!("slot 0 should be playing by now: {:?}", sequencer.session_slots[0][0]);
@@ -6971,6 +7090,7 @@ mod tests {
             &mut metronome_out,
             true,
             0,
+            false, // capturing
         );
 
         assert_eq!(
@@ -6984,6 +7104,122 @@ mod tests {
         assert!(
             slot_1_local_tick > 0,
             "legato should have continued slot 0's phase instead of restarting at 0, got {slot_1_local_tick}"
+        );
+    }
+
+    fn session_launch(track: &mut crate::model::Track, pitch: u8, generation: u64) {
+        track.session_clips.push(Some(crate::model::SessionClip {
+            name: "Loop".to_string(),
+            content: crate::model::SessionClipContent::Region {
+                content: RegionContent::StepGrid(vec![one_step_lane(pitch)]),
+                content_length_steps: 1,
+                loop_length_steps: 1,
+            },
+            follow_action: crate::model::FollowActionConfig::default(),
+            legato: false,
+            launch_mode: LaunchMode::Toggle,
+            quantize_override: None,
+            automation: Vec::new(),
+        }));
+        track.session_launch_requests.push(crate::model::SessionLaunchRequest {
+            generation,
+            intent: crate::model::LaunchIntent::Play,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn capturing_logs_a_started_event_on_launch_and_a_stopped_event_on_stop() {
+        let mut track = step_grid_session_track("Drums");
+        session_launch(&mut track, 36, 1);
+        let song = session_song(track);
+
+        let mut sequencer = Sequencer::new(48_000.0);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        sequencer.process(
+            &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            true, // capturing
+        );
+
+        assert_eq!(sequencer.capture_log.len(), 1);
+        assert!(matches!(
+            sequencer.capture_log[0].kind,
+            crate::model::CaptureEventKind::Started { .. }
+        ));
+
+        let mut song_after_stop = song.clone();
+        song_after_stop.tracks[0].session_launch_requests[0].generation = 2;
+        song_after_stop.tracks[0].session_launch_requests[0].intent = crate::model::LaunchIntent::Stop;
+        sequencer.process(
+            &song_after_stop, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            true, // capturing
+        );
+
+        assert_eq!(sequencer.capture_log.len(), 2);
+        assert!(matches!(sequencer.capture_log[1].kind, crate::model::CaptureEventKind::Stopped));
+    }
+
+    #[test]
+    fn capturing_logs_nothing_when_the_flag_is_off() {
+        let mut track = step_grid_session_track("Drums");
+        session_launch(&mut track, 36, 1);
+        let song = session_song(track);
+
+        let mut sequencer = Sequencer::new(48_000.0);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        sequencer.process(
+            &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            false, // capturing
+        );
+
+        assert!(sequencer.capture_log.is_empty());
+    }
+
+    #[test]
+    fn capturing_clears_the_log_on_the_off_to_on_edge() {
+        let mut track = step_grid_session_track("Drums");
+        session_launch(&mut track, 36, 1);
+        let song = session_song(track);
+
+        let mut sequencer = Sequencer::new(48_000.0);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        // First arm: logs the launch, and advances `capture_tick` by however many ticks one
+        // 4000-frame call fires.
+        sequencer.process(
+            &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            true, // capturing
+        );
+        assert_eq!(sequencer.capture_log.len(), 1);
+        let capture_tick_after_first_window = sequencer.capture_tick;
+
+        // Turned off, then back on (a fresh arm) — the old log shouldn't leak into the new one,
+        // and `capture_tick` should restart near 0 rather than keep accumulating from before.
+        // Large enough frame counts that a tick boundary (and so `trigger_session_clips`, which is
+        // what actually detects the edge) definitely fires within each call.
+        sequencer.process(
+            &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            false, // capturing
+        );
+        sequencer.process(
+            &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+            true, // capturing
+        );
+        assert!(
+            sequencer.capture_log.is_empty(),
+            "re-arming capture should start from an empty log, not carry over the previous window's events"
+        );
+        assert!(
+            sequencer.capture_tick <= capture_tick_after_first_window,
+            "re-arming should reset capture_tick near 0, not keep accumulating across the gap: \
+             got {} after re-arming vs {} after the first window alone",
+            sequencer.capture_tick,
+            capture_tick_after_first_window
         );
     }
 

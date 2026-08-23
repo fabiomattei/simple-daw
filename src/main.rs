@@ -658,6 +658,11 @@ struct SimpleDawApp {
     /// (the audio thread resizes it to match `Song::tracks`/`Track::session_clips` itself), unlike
     /// `track_meters`, so there's no `resize_session_slots` counterpart to call on track add/remove.
     session_slots: audio::SessionSlotHandles,
+    /// Session View performance log while the toolbar's "Capture" button is armed, published by
+    /// the audio thread once per callback — see `audio::CaptureLogHandle`'s doc comment. Read once,
+    /// when the button is turned back off (`handle_capture_toggle`), and handed to `Song::
+    /// insert_captured_session_performance` to materialize.
+    capture_log: audio::CaptureLogHandle,
     /// Session View's grid-wide launch-quantize setting (e.g. "1 Bar") — live UI state, not song
     /// data, read each frame to compute `Transport::session_quantize_ticks` from the current
     /// song's own `Song::steps_per_bar`. A `SessionClip::quantize_override` can override this per
@@ -854,6 +859,9 @@ struct SimpleDawApp {
     recording: Option<RecordingSession>,
     /// (was the last recording successfully turned into a clip, message to show)
     recording_message: Option<(bool, String)>,
+    /// (did the last "Capture to Arrangement" (see `capture_log`) produce anything, message to
+    /// show) — set when the toolbar's Capture button is turned off.
+    capture_message: Option<(bool, String)>,
     /// The in-progress Session View slot recording, if a slot's own record-arm button is
     /// currently engaged — see `session_view_ui::session_slot_cell_ui`'s record button. Mutually
     /// exclusive with `recording`: only one `InputRecorder` (one input device) can run at a time,
@@ -910,6 +918,7 @@ impl SimpleDawApp {
         let master_meter = metering::new_master_meter_handles();
         let submix_meters = metering::new_track_meter_handles(submix_count);
         let session_slots = audio::new_session_slot_handles();
+        let capture_log = audio::new_capture_log_handle();
         let engine = AudioEngine::start(
             song.clone(),
             transport.clone(),
@@ -921,6 +930,7 @@ impl SimpleDawApp {
             master_meter.clone(),
             submix_meters.clone(),
             session_slots.clone(),
+            capture_log.clone(),
             None,
             None,
         );
@@ -999,6 +1009,7 @@ impl SimpleDawApp {
             master_meter,
             submix_meters,
             session_slots,
+            capture_log,
             session_quantize: SessionQuantize::default(),
             follow_action_editor: None,
             effect_editor: None,
@@ -1055,6 +1066,7 @@ impl SimpleDawApp {
             selected_input_device: None,
             recording: None,
             recording_message: None,
+            capture_message: None,
             session_recording: None,
             selected_output_device: None,
             selected_output_sample_rate: None,
@@ -6762,6 +6774,66 @@ impl eframe::App for SimpleDawApp {
                             }
 
                             ui.add_space(6.0);
+                            let is_capturing = self.transport.is_capturing();
+                            let capture_enabled = is_capturing
+                                || (self.transport.is_session_mode() && playing);
+                            let capture_button =
+                                egui::Button::new(egui::RichText::new("⏺ Capture").size(13.0))
+                                    .fill(if is_capturing {
+                                        FL_ACCENT_ORANGE
+                                    } else {
+                                        ui.visuals().widgets.inactive.bg_fill
+                                    })
+                                    .min_size(egui::vec2(76.0, 30.0));
+                            let capture_response = ui
+                                .add_enabled(capture_enabled, capture_button)
+                                .on_hover_text(if is_capturing {
+                                    "Stop capturing and insert this performance into the Playlist"
+                                } else {
+                                    "Capture this Session View performance into the Playlist \
+                                     (needs Session Mode on and the transport playing)"
+                                });
+                            if capture_response.clicked() {
+                                if is_capturing {
+                                    self.transport.set_capturing(false);
+                                    let (events, final_tick) = self
+                                        .capture_log
+                                        .lock()
+                                        .map(|log| log.clone())
+                                        .unwrap_or_default();
+                                    if events.is_empty() {
+                                        self.capture_message =
+                                            Some((false, "Nothing was captured".to_string()));
+                                    } else {
+                                        let ticks_per_second = audio::ticks_per_second(
+                                            song.bpm_at(self.transport.current_tick()),
+                                        );
+                                        song.insert_captured_session_performance(
+                                            &events,
+                                            final_tick,
+                                            ticks_per_second,
+                                        );
+                                        self.capture_message = Some((
+                                            true,
+                                            "Captured this performance into the Playlist"
+                                                .to_string(),
+                                        ));
+                                    }
+                                } else {
+                                    self.transport.set_capturing(true);
+                                    self.capture_message = None;
+                                }
+                            }
+                            if let Some((ok, message)) = &self.capture_message {
+                                let color = if *ok {
+                                    FL_ACCENT_GREEN
+                                } else {
+                                    egui::Color32::RED
+                                };
+                                ui.colored_label(color, message);
+                            }
+
+                            ui.add_space(6.0);
                             let metronome_enabled = self.transport.is_metronome_enabled();
                             let metronome_button =
                                 egui::Button::new(egui::RichText::new("🔔").size(18.0))
@@ -6916,6 +6988,7 @@ impl eframe::App for SimpleDawApp {
                                     self.master_meter.clone(),
                                     self.submix_meters.clone(),
                                     self.session_slots.clone(),
+                                    self.capture_log.clone(),
                                     self.selected_output_device.as_deref(),
                                     self.selected_output_sample_rate,
                                 ) {

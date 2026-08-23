@@ -1316,6 +1316,32 @@ pub enum LaunchIntent {
     Stop,
 }
 
+/// One entry in `audio::Sequencer`'s Session-View performance log — see `Song::
+/// insert_captured_session_performance`, the pure logic that turns a whole log into Playlist
+/// content. `relative_tick` is ticks since the toolbar's "Capture" button was last armed, *not* an
+/// absolute song tick — the tick clock wraps around the Playlist's own current length even in
+/// Session View (see `audio::Sequencer::process`), so a capture spanning multiple wraps needs its
+/// own non-wrapping counter (`Sequencer::capture_tick`) instead of trusting `tick_index` directly.
+/// This module never constructs one of these itself (that's `Sequencer::trigger_session_clips`'s
+/// job, at the exact points it already detects a slot starting/stopping) — it only consumes them.
+#[derive(Clone, Debug)]
+pub struct CaptureEvent {
+    pub relative_tick: usize,
+    pub track_index: usize,
+    pub kind: CaptureEventKind,
+}
+
+/// See `CaptureEvent`. `Started` carries a full clone of the `SessionClip` that was launched
+/// (cheap — its own buffers are `Arc`s) rather than just a slot index, so materializing the log
+/// later doesn't depend on that slot still holding the same content (or existing at all) by the
+/// time the user turns capture back off. No slot index either — `Sequencer`'s per-track
+/// exclusivity means `track_index` plus this clip already fully identifies the event.
+#[derive(Clone, Debug)]
+pub enum CaptureEventKind {
+    Started { clip: Box<SessionClip> },
+    Stopped,
+}
+
 /// Adds a new note, clearing any existing note on the same pitch that it
 /// would overlap (two notes overlapping at the same pitch is ambiguous for
 /// playback — which one's on?). Returns the new note's id.
@@ -2738,6 +2764,30 @@ impl SynthPreset {
     }
 }
 
+/// The furthest tick `track`'s own existing Playlist content (regions, audio clips, take folders)
+/// already reaches — the per-track building block `Song::insert_captured_session_performance`
+/// uses to append captured material without overwriting anything, and the model.rs-only mirror of
+/// `audio::arrangement_length_ticks`'s per-track pieces (kept separate since that function also
+/// folds in a whole-song minimum this one has no use for, and pulling it in would mean model.rs
+/// depending on audio.rs).
+fn track_playlist_end_tick(track: &Track, ticks_per_second: f64) -> usize {
+    let regions_end = track.end_of_regions_tick();
+    let audio_end = track
+        .audio_clips
+        .iter()
+        .filter(|clip| clip.buffer.is_some())
+        .map(|clip| clip.start_tick + clip.effective_length_ticks(ticks_per_second))
+        .max()
+        .unwrap_or(0);
+    let take_folder_end = track
+        .take_folders
+        .iter()
+        .map(|folder| folder.start_tick + folder.length_ticks)
+        .max()
+        .unwrap_or(0);
+    regions_end.max(audio_end).max(take_folder_end)
+}
+
 impl Song {
     /// Steps (fixed sixteenth notes) per beat, where "beat" means the time signature's own
     /// denominator note value — e.g. an eighth-note beat (6/8) is 2 steps, a quarter-note beat
@@ -2977,6 +3027,124 @@ impl Song {
             self.scenes.resize(index + 1, Scene::default());
         }
         &mut self.scenes[index]
+    }
+
+    /// Turns a Session View performance capture (`audio::Sequencer::capture_log`, drained via
+    /// `main.rs`'s "Capture to Arrangement" toolbar button) into real Playlist content — see
+    /// `CaptureEvent`'s doc comment on why its ticks are capture-relative, not absolute song ticks.
+    /// `final_relative_tick` closes any interval still open at the moment capture was turned off
+    /// (a clip still playing then didn't get its own `Stopped` event). `ticks_per_second` converts
+    /// an `Audio`/`Recording` clip's own real-time buffer length into ticks for repeat-placement —
+    /// a single flat rate for the whole capture, the same "caller supplies it, this module stays
+    /// audio.rs-independent" approach `AudioClip::effective_length_ticks` already uses, rather than
+    /// resolving `tempo_map` per repeat.
+    ///
+    /// Every affected track's captured material is appended after whatever that track's own
+    /// existing Playlist content already reaches (never overwriting it), all shifted by one shared
+    /// offset — the furthest *any* affected track already extends to — so multiple tracks captured
+    /// together stay aligned relative to each other exactly as performed.
+    ///
+    /// `Region` content becomes one `Region` per captured interval, using the interval's actual
+    /// played span as `loop_length_steps` — native looping, so multiple loop passes collapse into
+    /// one entry. `Audio`/`Recording` content has no such native Playlist looping, so it becomes
+    /// one copy per full loop pass actually completed within the interval, back to back; an
+    /// `Audio` copy's tail is trimmed to the exact stop point (`AudioClip::length_ticks`) and only
+    /// its first/last copy keep the original's fade in/out (internal loop-seam copies get none, so
+    /// they don't audibly duck); a `Recording`'s trailing partial pass is dropped rather than
+    /// trimmed, since `TakeFolder` has no partial-length playback of its own.
+    pub fn insert_captured_session_performance(
+        &mut self,
+        events: &[CaptureEvent],
+        final_relative_tick: usize,
+        ticks_per_second: f64,
+    ) {
+        let mut open: std::collections::HashMap<usize, (usize, SessionClip)> = std::collections::HashMap::new();
+        let mut intervals: Vec<(usize, usize, usize, SessionClip)> = Vec::new();
+        for event in events {
+            if let Some((start, clip)) = open.remove(&event.track_index) {
+                intervals.push((event.track_index, start, event.relative_tick, clip));
+            }
+            if let CaptureEventKind::Started { clip } = &event.kind {
+                open.insert(event.track_index, (event.relative_tick, clip.as_ref().clone()));
+            }
+        }
+        for (track_index, (start, clip)) in open {
+            intervals.push((track_index, start, final_relative_tick, clip));
+        }
+        if intervals.is_empty() {
+            return;
+        }
+
+        let mut base_tick = 0usize;
+        for &(track_index, ..) in &intervals {
+            if let Some(track) = self.tracks.get(track_index) {
+                base_tick = base_tick.max(track_playlist_end_tick(track, ticks_per_second));
+            }
+        }
+
+        for (track_index, start, end, clip) in intervals {
+            if end <= start {
+                continue;
+            }
+            let Some(track) = self.tracks.get_mut(track_index) else { continue };
+            let placed_start = base_tick + start;
+            let span_ticks = end - start;
+            match clip.content {
+                SessionClipContent::Region { content, content_length_steps, .. } => {
+                    track.regions.push(Region {
+                        name: clip.name,
+                        start_tick: placed_start,
+                        content_length_steps,
+                        loop_length_steps: (span_ticks / TICKS_PER_STEP).max(1),
+                        content,
+                        fade_in_ticks: 0,
+                        fade_out_ticks: 0,
+                        automation: clip.automation,
+                    });
+                }
+                SessionClipContent::Audio(audio_clip) => {
+                    // An unloaded clip with no explicit trim (`length_ticks == 0`) has no known
+                    // real-time duration to repeat by — falls back to one copy spanning the whole
+                    // interval instead of looping thousands of 1-tick copies.
+                    let loop_ticks = match audio_clip.effective_length_ticks(ticks_per_second) {
+                        0 => span_ticks.max(1),
+                        ticks => ticks,
+                    };
+                    let mut offsets = Vec::new();
+                    let mut offset = 0usize;
+                    while offset < span_ticks {
+                        offsets.push(offset);
+                        offset += loop_ticks;
+                    }
+                    let last_index = offsets.len().saturating_sub(1);
+                    for (index, offset) in offsets.into_iter().enumerate() {
+                        let mut copy = audio_clip.clone();
+                        copy.start_tick = placed_start + offset;
+                        let remaining = span_ticks - offset;
+                        if remaining < loop_ticks {
+                            copy.length_ticks = remaining;
+                        }
+                        if index > 0 {
+                            copy.fade_in_ticks = 0;
+                        }
+                        if index != last_index {
+                            copy.fade_out_ticks = 0;
+                        }
+                        track.audio_clips.push(copy);
+                    }
+                }
+                SessionClipContent::Recording(folder) => {
+                    let loop_ticks = folder.length_ticks.max(1);
+                    let mut offset = 0usize;
+                    while offset + loop_ticks <= span_ticks {
+                        let mut copy = folder.clone();
+                        copy.start_tick = placed_start + offset;
+                        track.take_folders.push(copy);
+                        offset += loop_ticks;
+                    }
+                }
+            }
+        }
     }
 
     /// Serializes the song to pretty-printed JSON. Loaded sample audio itself
@@ -5255,6 +5423,201 @@ mod tests {
         song.ensure_scene(0).tempo = Some(140.0);
         assert_eq!(song.ensure_scene(0).tempo, Some(140.0));
         assert_eq!(song.scenes.len(), 1);
+    }
+
+    #[test]
+    fn insert_captured_session_performance_with_no_events_does_nothing() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Lead", 1, TrackKind::PianoRoll);
+        song.insert_captured_session_performance(&[], 0, 1000.0);
+        assert!(song.tracks[track_index].regions.is_empty());
+    }
+
+    #[test]
+    fn insert_captured_session_performance_places_one_region_spanning_the_captured_span() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Lead", 1, TrackKind::PianoRoll);
+        let clip = SessionClip::new_piano_roll("Riff", 4);
+        let events = vec![
+            CaptureEvent {
+                relative_tick: 0,
+                track_index,
+                kind: CaptureEventKind::Started { clip: Box::new(clip) },
+            },
+            CaptureEvent { relative_tick: 8 * TICKS_PER_STEP, track_index, kind: CaptureEventKind::Stopped },
+        ];
+        song.insert_captured_session_performance(&events, 0, 1000.0);
+
+        assert_eq!(song.tracks[track_index].regions.len(), 1);
+        let region = &song.tracks[track_index].regions[0];
+        assert_eq!(region.start_tick, 0);
+        assert_eq!(region.content_length_steps, 4);
+        assert_eq!(
+            region.loop_length_steps, 8,
+            "one Region should span the whole performed duration, not just the clip's own loop length"
+        );
+    }
+
+    #[test]
+    fn insert_captured_session_performance_closes_a_still_playing_clip_at_the_final_tick() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Lead", 1, TrackKind::PianoRoll);
+        let clip = SessionClip::new_piano_roll("Riff", 4);
+        let events = vec![CaptureEvent {
+            relative_tick: 0,
+            track_index,
+            kind: CaptureEventKind::Started { clip: Box::new(clip) },
+        }];
+        song.insert_captured_session_performance(&events, 6 * TICKS_PER_STEP, 1000.0);
+
+        assert_eq!(song.tracks[track_index].regions.len(), 1);
+        assert_eq!(song.tracks[track_index].regions[0].loop_length_steps, 6);
+    }
+
+    #[test]
+    fn insert_captured_session_performance_appends_after_existing_playlist_content() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Lead", 1, TrackKind::PianoRoll);
+        song.tracks[track_index].regions.push(Region {
+            name: "Existing".to_string(),
+            start_tick: 0,
+            content_length_steps: 4,
+            loop_length_steps: 4,
+            content: RegionContent::PianoRoll(Vec::new()),
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            automation: Vec::new(),
+        });
+        let existing_end = song.tracks[track_index].end_of_regions_tick();
+
+        let clip = SessionClip::new_piano_roll("Riff", 4);
+        let events = vec![CaptureEvent {
+            relative_tick: 0,
+            track_index,
+            kind: CaptureEventKind::Started { clip: Box::new(clip) },
+        }];
+        song.insert_captured_session_performance(&events, 4 * TICKS_PER_STEP, 1000.0);
+
+        assert_eq!(song.tracks[track_index].regions.len(), 2);
+        assert_eq!(
+            song.tracks[track_index].regions[1].start_tick, existing_end,
+            "captured content should append after, never overwrite, existing content"
+        );
+    }
+
+    #[test]
+    fn insert_captured_session_performance_places_repeated_audio_copies_per_loop_pass() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Loop Vox", 1, TrackKind::Audio);
+        let mut audio_clip = AudioClip::new(0, "loop.wav");
+        audio_clip.length_ticks = 100;
+        audio_clip.fade_in_ticks = 10;
+        audio_clip.fade_out_ticks = 10;
+        let clip = SessionClip::from_audio_clip(&audio_clip);
+
+        let events = vec![
+            CaptureEvent {
+                relative_tick: 0,
+                track_index,
+                kind: CaptureEventKind::Started { clip: Box::new(clip) },
+            },
+            CaptureEvent { relative_tick: 250, track_index, kind: CaptureEventKind::Stopped },
+        ];
+        song.insert_captured_session_performance(&events, 0, 1000.0);
+
+        let copies = &song.tracks[track_index].audio_clips;
+        assert_eq!(copies.len(), 3, "250 ticks over a 100-tick loop is 2 full passes plus a partial one");
+        assert_eq!(copies[0].start_tick, 0);
+        assert_eq!(copies[1].start_tick, 100);
+        assert_eq!(copies[2].start_tick, 200);
+        assert_eq!(
+            copies[2].length_ticks, 50,
+            "the trailing copy is trimmed to the remaining captured span, not the full loop length"
+        );
+        assert_eq!(copies[0].fade_in_ticks, 10, "the first copy keeps the original fade-in");
+        assert_eq!(copies[1].fade_in_ticks, 0, "an internal loop-seam copy gets no fade-in");
+        assert_eq!(copies[2].fade_out_ticks, 10, "the last copy keeps the original fade-out");
+        assert_eq!(copies[0].fade_out_ticks, 0, "an internal loop-seam copy gets no fade-out");
+    }
+
+    #[test]
+    fn insert_captured_session_performance_places_full_recording_passes_and_drops_a_partial_trailing_one() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Loop Vox", 1, TrackKind::Audio);
+        let folder = TakeFolder::new(0, 80, "take.wav");
+        let clip = SessionClip::from_recording("Recorded Loop", folder);
+
+        let events = vec![
+            CaptureEvent {
+                relative_tick: 0,
+                track_index,
+                kind: CaptureEventKind::Started { clip: Box::new(clip) },
+            },
+            CaptureEvent { relative_tick: 200, track_index, kind: CaptureEventKind::Stopped },
+        ];
+        song.insert_captured_session_performance(&events, 0, 1000.0);
+
+        let folders = &song.tracks[track_index].take_folders;
+        assert_eq!(
+            folders.len(), 2,
+            "200 ticks over an 80-tick loop is 2 full passes; the trailing 40 ticks has no partial-length \
+             playback to fall back on, so it's dropped rather than trimmed"
+        );
+        assert_eq!(folders[0].start_tick, 0);
+        assert_eq!(folders[1].start_tick, 80);
+    }
+
+    #[test]
+    fn insert_captured_session_performance_shares_one_base_offset_across_tracks() {
+        let mut song = Song::demo();
+        let track_a = song.add_track("A", 1, TrackKind::PianoRoll);
+        let track_b = song.add_track("B", 2, TrackKind::PianoRoll);
+        // Track B already has content reaching further than anything on track A — the whole
+        // capture (both tracks) should shift to start after this, not just track B's own share.
+        song.tracks[track_b].regions.push(Region {
+            name: "Existing".to_string(),
+            start_tick: 0,
+            content_length_steps: 16,
+            loop_length_steps: 16,
+            content: RegionContent::PianoRoll(Vec::new()),
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            automation: Vec::new(),
+        });
+        let track_b_existing_end = song.tracks[track_b].end_of_regions_tick();
+
+        let clip_a = SessionClip::new_piano_roll("A Riff", 4);
+        let clip_b = SessionClip::new_piano_roll("B Riff", 4);
+        let events = vec![
+            CaptureEvent {
+                relative_tick: 0,
+                track_index: track_a,
+                kind: CaptureEventKind::Started { clip: Box::new(clip_a) },
+            },
+            CaptureEvent { relative_tick: 4 * TICKS_PER_STEP, track_index: track_a, kind: CaptureEventKind::Stopped },
+            CaptureEvent {
+                relative_tick: 8 * TICKS_PER_STEP,
+                track_index: track_b,
+                kind: CaptureEventKind::Started { clip: Box::new(clip_b) },
+            },
+            CaptureEvent {
+                relative_tick: 12 * TICKS_PER_STEP,
+                track_index: track_b,
+                kind: CaptureEventKind::Stopped,
+            },
+        ];
+        song.insert_captured_session_performance(&events, 0, 1000.0);
+
+        assert_eq!(
+            song.tracks[track_a].regions[0].start_tick, track_b_existing_end,
+            "track A's new region should start at the shared base offset even though track A itself had \
+             nothing there yet"
+        );
+        assert_eq!(
+            song.tracks[track_b].regions[1].start_tick,
+            track_b_existing_end + 8 * TICKS_PER_STEP,
+            "track B's new region should stay 8 steps later than track A's, preserving their relative timing"
+        );
     }
 
     #[test]
