@@ -2807,12 +2807,13 @@ impl Sequencer {
 
     /// Triggers `clip`'s content for `track_index`/`slot_index` at `local_tick`. Step-grid/
     /// piano-roll content is checked every call (driven purely by matching `local_tick` against
-    /// grid/note positions, same as the arrangement region loop); `SessionClipContent::Audio`
-    /// only triggers when `fresh_start` is true — a `SampleVoice` sets up once and then loops on
-    /// its own (`SampleVoice::looping`), so it's only ever (re)triggered at the moment a slot
-    /// starts, not every tick it continues playing. `local_tick` shifts an `Audio` clip's start
-    /// position forward by that many ticks' worth of frames (a no-op when `local_tick == 0`, the
-    /// ordinary case) — what legato/follow-action restarts need to join an already-playing phase;
+    /// grid/note positions, same as the arrangement region loop); `SessionClipContent::Audio`/
+    /// `Recording` only trigger when `fresh_start` is true — a `SampleVoice` sets up once and then
+    /// loops on its own (`SampleVoice::looping`), so it's only ever (re)triggered at the moment a
+    /// slot starts, not every tick it continues playing. `local_tick` shifts an `Audio`/`Recording`
+    /// clip's start position forward by that many ticks' worth of frames (a no-op when
+    /// `local_tick == 0`, the ordinary case) — what legato/follow-action restarts need to join an
+    /// already-playing phase;
     /// see `trigger_session_clips`'s doc comment on why every subsequent loop then also starts
     /// from that same shifted point rather than the clip's true frame `0` (a documented
     /// simplification, not a bug).
@@ -2877,6 +2878,37 @@ impl Sequencer {
                     end_frame,
                     fade_in_frames,
                     fade_out_frames,
+                    true,
+                );
+                tv.next_sample_voice = (voice_index + 1) % SAMPLE_VOICE_COUNT;
+                self.session_audio_voice[track_index][slot_index] = Some(voice_index);
+            }
+            SessionClipContent::Recording(folder) => {
+                if !fresh_start {
+                    return;
+                }
+                // `comp` is always a single whole-span segment for a session recording (see
+                // `SessionClipContent::Recording`'s doc comment) — the active take is whichever
+                // one that segment points at, falling back to take 0 for an empty/corrupt comp.
+                let take_index = folder.comp.first().map_or(0, |segment| segment.take_index);
+                let Some(buffer) = folder.takes.get(take_index).and_then(|take| take.buffer.as_ref())
+                else {
+                    return;
+                };
+                let frames_per_tick = buffer.sample_rate as f64 / ticks_per_second;
+                let length_frames = (folder.length_ticks as f64 * frames_per_tick).round() as usize;
+                let phase_frames = (local_tick as f64 * frames_per_tick).round() as usize;
+                let start_frame = phase_frames.min(length_frames);
+                let crossfade_frames = (TAKE_FOLDER_CROSSFADE_SECONDS * buffer.sample_rate as f32) as usize;
+                let tv = &mut self.track_voices[track_index];
+                let voice_index = tv.next_sample_voice;
+                tv.sample_voices[voice_index].trigger_clip(
+                    buffer.clone(),
+                    folder.gain,
+                    start_frame,
+                    length_frames,
+                    crossfade_frames,
+                    crossfade_frames,
                     true,
                 );
                 tv.next_sample_voice = (voice_index + 1) % SAMPLE_VOICE_COUNT;
@@ -6733,6 +6765,63 @@ mod tests {
         assert!(
             track_out_l[0][3000..4000].iter().all(|&s| s == 0.0),
             "stopping the slot should hard-cut the looping voice, not let it keep looping"
+        );
+    }
+
+    #[test]
+    fn session_mode_recording_clip_plays_its_active_take_and_loops() {
+        let sample_rate = 48_000u32;
+        // A short take so it wraps (loops) several times within one process() call, same shape as
+        // `session_mode_looping_audio_clip_stops_hard_when_the_slot_is_stopped` above but for
+        // `SessionClipContent::Recording` instead of `Audio`.
+        let buffer = Arc::new(SampleBuffer { sample_rate, mono: vec![0.5; 480] });
+        let mut folder = crate::model::TakeFolder::new(0, 480, "unused.wav");
+        folder.takes[0].buffer = Some(buffer);
+
+        let mut track = crate::model::Track::new_audio("Loop", 1);
+        track.session_clips.push(Some(crate::model::SessionClip {
+            name: "Recorded Loop".to_string(),
+            content: crate::model::SessionClipContent::Recording(folder),
+            follow_action: crate::model::FollowActionConfig::default(),
+            legato: false,
+            launch_mode: LaunchMode::Toggle,
+            quantize_override: None,
+            automation: Vec::new(),
+        }));
+        track.session_launch_requests.push(crate::model::SessionLaunchRequest {
+            generation: 1,
+            intent: crate::model::LaunchIntent::Play,
+            ..Default::default()
+        });
+
+        let song = crate::model::Song {
+            name: "session view recording loop test".to_string(),
+            bpm: 120.0,
+            tempo_map: Vec::new(),
+            tracks: vec![track],
+            next_note_id: 0,
+            master_effects: Vec::new(),
+            plugins: Vec::new(),
+            synth_presets: Vec::new(),
+            time_signature_numerator: 4,
+            time_signature_denominator: 4,
+            sends: Vec::new(),
+            submixes: Vec::new(),
+            scenes: Vec::new(),
+        };
+
+        let mut sequencer = Sequencer::new(sample_rate as f32);
+        let mut track_out_l = Vec::new();
+        let mut track_out_r = Vec::new();
+        let mut metronome_out = Vec::new();
+        // 4000 frames is well past the 480-frame take's own length, so this only passes if the
+        // recording actually looped instead of going silent after playing once.
+        sequencer.process(
+            &song, 4000, &mut track_out_l, &mut track_out_r, false, &mut metronome_out, true, 0,
+        );
+        assert!(
+            track_out_l[0][3000..4000].iter().any(|&s| s != 0.0),
+            "the recorded take should still be looping well past its own natural length"
         );
     }
 

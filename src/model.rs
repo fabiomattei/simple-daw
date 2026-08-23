@@ -1001,6 +1001,16 @@ pub enum SessionClipContent {
         loop_length_steps: usize,
     },
     Audio(AudioClip),
+    /// A slot recorded directly in Session View (see `main.rs`'s `finish_session_recording`),
+    /// reusing `TakeFolder`/`Take`/comping wholesale rather than inventing new take storage — this
+    /// folder is owned entirely by the slot (not indexed into `Track::take_folders`, which is keyed
+    /// by Playlist `start_tick`, a concept a session slot has none of). Re-recording into an
+    /// already-`Recording` slot joins as a new take via `TakeFolder::add_take_and_activate`
+    /// (comped to the newest take, matching the Playlist recording flow's own overdub behavior).
+    /// `comp` is always a single whole-span segment here — v1 has no segment-level "quick-swipe"
+    /// comp editor for a session recording, only whole-take recall (see `SessionClip`'s "Takes ▸"
+    /// context-menu entry in `session_view_ui.rs`).
+    Recording(TakeFolder),
 }
 
 /// What a Session View slot does on its own, with no user input, once it's played through
@@ -1177,6 +1187,23 @@ impl SessionClip {
         }
     }
 
+    /// Wraps a just-finished Session View recording's `TakeFolder` into a new session clip — the
+    /// `Recording`-content counterpart of `from_audio_clip`, used by `main.rs`'s
+    /// `finish_session_recording` the first time a track/slot pair is recorded into (a
+    /// re-recording instead joins the existing folder directly — see `SessionClipContent::
+    /// Recording`'s doc comment).
+    pub fn from_recording(name: impl Into<String>, folder: TakeFolder) -> Self {
+        Self {
+            name: name.into(),
+            content: SessionClipContent::Recording(folder),
+            follow_action: FollowActionConfig::default(),
+            legato: false,
+            launch_mode: LaunchMode::default(),
+            quantize_override: None,
+            automation: Vec::new(),
+        }
+    }
+
     /// A blank, freshly-composed piano-roll session clip — the Session View counterpart of
     /// `Track::add_region` for a `PianoRoll`-kind track, used by a slot's "Compose New Region…"
     /// instead of copying already-authored Playlist content (see `from_region`). `length_steps`
@@ -1248,15 +1275,17 @@ impl SessionClip {
 
     /// This clip's loop length in ticks — the audio engine's session playhead wraps modulo this.
     /// The `Audio` variant loops its whole `effective_length_ticks` (no separate loop-range trim
-    /// in v1 — see `SessionClipContent::Audio`'s doc comment). `ticks_per_second` is the caller's
-    /// job to supply, same reasoning as `AudioClip::full_length_ticks`, to avoid this module
-    /// depending on `audio.rs`.
+    /// in v1 — see `SessionClipContent::Audio`'s doc comment). `Recording` loops its folder's own
+    /// `length_ticks` (frozen at the first take's recorded duration, same as a Playlist
+    /// `TakeFolder`). `ticks_per_second` is the caller's job to supply, same reasoning as
+    /// `AudioClip::full_length_ticks`, to avoid this module depending on `audio.rs`.
     pub fn loop_length_ticks(&self, ticks_per_second: f64) -> usize {
         match &self.content {
             SessionClipContent::Region { loop_length_steps, .. } => {
                 loop_length_steps * TICKS_PER_STEP
             }
             SessionClipContent::Audio(clip) => clip.effective_length_ticks(ticks_per_second),
+            SessionClipContent::Recording(folder) => folder.length_ticks,
         }
     }
 }
@@ -3731,12 +3760,20 @@ mod tests {
 
     /// Writes a short mono sine WAV to the system temp dir for `AudioClip::load` integration
     /// tests — the one place in this file that actually exercises the decode path, since
-    /// `AudioClip`'s other tests only ever set `buffer` directly.
+    /// `AudioClip`'s other tests only ever set `buffer` directly. Two tests calling this with the
+    /// same `sample_rate` (a real case — see `load_applies_warp_markers_to_the_decoded_buffer`/
+    /// `load_with_no_warp_markers_or_pitch_corrections_leaves_the_buffer_untouched`, both `48_000`)
+    /// would otherwise race on the same `(pid, sample_rate)` filename when `cargo test` runs them
+    /// in parallel — an atomic counter closes that gap, the same fix `write_frozen_track_wav` in
+    /// `main.rs` already applies to its own "own cache dir, timestamped filename" convention.
     fn write_test_wav(sample_rate: u32, duration_seconds: f32) -> std::path::PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "simple-daw-test-flex-{}-{}.wav",
+            "simple-daw-test-flex-{}-{}-{}.wav",
             std::process::id(),
-            sample_rate
+            sample_rate,
+            sequence
         ));
         let spec = hound::WavSpec {
             channels: 1,
@@ -4441,7 +4478,9 @@ mod tests {
                 assert_eq!(*content_length_steps, region.content_length_steps);
                 assert_eq!(*loop_length_steps, region.loop_length_steps);
             }
-            SessionClipContent::Audio(_) => panic!("expected Region content"),
+            SessionClipContent::Audio(_) | SessionClipContent::Recording(_) => {
+                panic!("expected Region content")
+            }
         }
         // Transient click state never round-trips.
         assert!(loaded.tracks[0].session_launch_requests.is_empty());
@@ -4527,7 +4566,9 @@ mod tests {
                 assert_eq!(*content_length_steps, 16);
                 assert_eq!(*loop_length_steps, 16);
             }
-            SessionClipContent::Audio(_) => panic!("expected Region content"),
+            SessionClipContent::Audio(_) | SessionClipContent::Recording(_) => {
+                panic!("expected Region content")
+            }
         }
     }
 
@@ -4541,7 +4582,9 @@ mod tests {
                 assert_eq!(*content_length_steps, 16);
                 assert_eq!(*loop_length_steps, 16);
             }
-            SessionClipContent::Audio(_) => panic!("expected Region content"),
+            SessionClipContent::Audio(_) | SessionClipContent::Recording(_) => {
+                panic!("expected Region content")
+            }
         }
     }
 

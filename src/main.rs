@@ -34,8 +34,9 @@ use metering::{MeterHandles, MeterReadings};
 use model::{
     AudioClip, AutomationLane, AutomationPoint, AutomationTarget, CurveShape, EffectParamKey, EqBandType,
     FilterMode, FilterRouting, FilterSlope, FilterType, Lane, LfoTarget, MAX_STEP_TIMING_OFFSET_TICKS,
-    ModSlot, ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, SendBus, SessionClipContent,
-    SessionQuantize, Song, StepData, SubmixBus, SynthEngine, SynthParams, SynthPreset, SynthWaveform, TICKS_PER_STEP,
+    LaunchIntent, ModSlot, ModSource, ModTarget, Note, ProjectPlugin, Region, RegionContent, SendBus,
+    SessionClip, SessionClipContent, SessionQuantize, Song, StepData, SubmixBus, SynthEngine, SynthParams,
+    SynthPreset, SynthWaveform, TICKS_PER_STEP,
     TakeFolder, Track, TrackEffectConfig, TrackKind,
     TrackOutput, TrineParams, WaveModSlot, WaveModSource, WaveModTarget, WaveParams, add_note,
     clear_overlaps, find_note_mut, remove_note,
@@ -853,6 +854,11 @@ struct SimpleDawApp {
     recording: Option<RecordingSession>,
     /// (was the last recording successfully turned into a clip, message to show)
     recording_message: Option<(bool, String)>,
+    /// The in-progress Session View slot recording, if a slot's own record-arm button is
+    /// currently engaged — see `session_view_ui::session_slot_cell_ui`'s record button. Mutually
+    /// exclusive with `recording`: only one `InputRecorder` (one input device) can run at a time,
+    /// so each recording kind's own start button is disabled while the other is active.
+    session_recording: Option<SessionRecordingSession>,
     /// Name of the output device to play through, as returned by `audio::list_output_devices`.
     /// `None` means "use the host's default output device" (see `AudioEngine::start`).
     selected_output_device: Option<String>,
@@ -873,6 +879,18 @@ struct SimpleDawApp {
 /// the same button on the next click.
 struct RecordingSession {
     track_index: usize,
+    recorder: audio_input::InputRecorder,
+    start_tick: usize,
+}
+
+/// State for an in-progress recording started from a Session View slot's own record button — the
+/// session-target counterpart of `RecordingSession`. `start_tick` is only used to compute the
+/// recorded duration in ticks (for bar-rounding, see `finish_session_recording`) — unlike
+/// `RecordingSession::start_tick`, it isn't where the result gets placed on a timeline, since a
+/// session slot has no absolute song position.
+struct SessionRecordingSession {
+    track_index: usize,
+    slot_index: usize,
     recorder: audio_input::InputRecorder,
     start_tick: usize,
 }
@@ -1037,6 +1055,7 @@ impl SimpleDawApp {
             selected_input_device: None,
             recording: None,
             recording_message: None,
+            session_recording: None,
             selected_output_device: None,
             selected_output_sample_rate: None,
             output_device_message: None,
@@ -2166,7 +2185,7 @@ fn piano_roll_contents_ui(
                 SessionClipContent::Region { loop_length_steps, .. } => {
                     loop_length_steps * TICKS_PER_STEP
                 }
-                SessionClipContent::Audio(_) => 0,
+                SessionClipContent::Audio(_) | SessionClipContent::Recording(_) => 0,
             };
             egui::ScrollArea::vertical().max_height(automation_reserved.max(60.0)).show(
                 ui,
@@ -5612,6 +5631,170 @@ fn finish_recording(
     (true, format!("Recorded {}", path.display()))
 }
 
+/// The Session View slot record button's stop-side logic — `finish_recording`'s counterpart for a
+/// session slot instead of a Playlist `start_tick`. A slot that already holds `SessionClipContent::
+/// Recording` joins the existing folder as a new take, comped in immediately (overdub-style
+/// re-record, same behavior as re-recording onto the same Playlist `start_tick`); an empty or
+/// differently-typed slot gets a fresh one. The recorded loop length is rounded up to the next
+/// whole bar (at the tempo in effect when recording started) rather than left as the raw captured
+/// duration — a session loop needs *some* bar-aligned length to advance a launch-quantized
+/// playhead against, and rounding up keeps every recorded frame rather than truncating the tail
+/// (accepting a trailing silence gap if recording was stopped a little early).
+fn finish_session_recording(
+    song: &mut Song,
+    track_index: usize,
+    slot_index: usize,
+    start_tick: usize,
+    samples: &[f32],
+    captured_sample_rate: u32,
+    engine_sample_rate: Option<u32>,
+) -> (bool, String) {
+    if samples.is_empty() {
+        return (false, "No audio captured".to_string());
+    }
+    let path = match write_recording_wav(track_index, samples, captured_sample_rate) {
+        Ok(path) => path,
+        Err(err) => return (false, err),
+    };
+    let file_path = path.to_string_lossy().to_string();
+
+    let Some(track) = song
+        .tracks
+        .get(track_index)
+        .filter(|t| t.kind == TrackKind::Audio)
+    else {
+        return (
+            false,
+            format!(
+                "Recorded {}, but its track no longer exists",
+                path.display()
+            ),
+        );
+    };
+    let existing_slot = track.session_clips.get(slot_index).and_then(|slot| slot.as_ref());
+    let has_existing_recording =
+        existing_slot.is_some_and(|clip| matches!(clip.content, SessionClipContent::Recording(_)));
+    // Refuse to land into a slot already holding `Region`/`Audio` content — recording only ever
+    // starts into an empty slot or overdubs an existing `Recording` (see `SessionClipContent::
+    // Recording`'s doc comment); silently overwriting anything else would destroy it. The UI layer
+    // (`session_view_ui::session_slot_cell_ui`'s `can_record_here`) already keeps this from being
+    // reachable through the record button, but this function shouldn't rely on that alone.
+    if existing_slot.is_some() && !has_existing_recording {
+        return (
+            false,
+            format!("Recorded {}, but slot {} already holds other content", path.display(), slot_index + 1),
+        );
+    }
+
+    let duration_seconds = samples.len() as f64 / captured_sample_rate.max(1) as f64;
+    let bar_ticks = (song.steps_per_bar() * TICKS_PER_STEP).max(1);
+    let raw_ticks = (duration_seconds * audio::ticks_per_second(song.bpm_at(start_tick)))
+        .ceil()
+        .max(1.0) as usize;
+    let length_ticks = raw_ticks.div_ceil(bar_ticks) * bar_ticks;
+
+    let track = &mut song.tracks[track_index];
+    if track.session_clips.len() <= slot_index {
+        track.session_clips.resize(slot_index + 1, None);
+    }
+    let take_index = if has_existing_recording {
+        let Some(Some(clip)) = track.session_clips.get_mut(slot_index) else {
+            return (false, format!("Recorded {}, but its slot no longer exists", path.display()));
+        };
+        let SessionClipContent::Recording(folder) = &mut clip.content else {
+            return (false, format!("Recorded {}, but its slot no longer exists", path.display()));
+        };
+        folder.add_take_and_activate(file_path)
+    } else {
+        let folder = TakeFolder::new(0, length_ticks, file_path);
+        let clip = SessionClip::from_recording(format!("Recording {}", slot_index + 1), folder);
+        track.session_clips[slot_index] = Some(clip);
+        0
+    };
+    if let Some(rate) = engine_sample_rate
+        && let Some(SessionClipContent::Recording(folder)) = track
+            .session_clips
+            .get_mut(slot_index)
+            .and_then(|slot| slot.as_mut())
+            .map(|clip| &mut clip.content)
+    {
+        folder.takes[take_index].load(rate);
+    }
+    (true, format!("Recorded {}", path.display()))
+}
+
+/// A session slot's own record button's whole click handler (`session_view_ui::
+/// session_slot_cell_ui`'s button, surfaced back here via `record_click` — see that param's doc
+/// comment on why this module owns the actual `InputRecorder` instead of `session_view_ui.rs`).
+/// A click on the slot already being recorded into stops it (`finish_session_recording`, then
+/// immediately queues a `Play` launch for the slot so the just-recorded loop starts right away,
+/// matching Ableton's own "recording stops, playback begins" handoff); a click on any other
+/// eligible slot starts a fresh capture, first sending `Stop` to every *other* slot on that same
+/// track — the confirmed design: starting a recording is itself a launch, so it follows the same
+/// per-track exclusivity any other launch does, no special exemption. A click while
+/// `session_recording` already targets a different slot is unreachable in practice (that slot's
+/// button renders disabled — see `session_slot_cell_ui`) but is still a safe no-op here regardless.
+#[allow(clippy::too_many_arguments)]
+fn handle_session_record_click(
+    song: &mut Song,
+    track_index: usize,
+    slot_index: usize,
+    session_recording: &mut Option<SessionRecordingSession>,
+    recording_message: &mut Option<(bool, String)>,
+    selected_input_device: Option<&str>,
+    engine_sample_rate: Option<u32>,
+    current_tick: usize,
+) {
+    let is_this_slot = session_recording
+        .as_ref()
+        .is_some_and(|s| s.track_index == track_index && s.slot_index == slot_index);
+    if is_this_slot {
+        let Some(session) = session_recording.take() else { return };
+        let SessionRecordingSession { track_index, slot_index, recorder, start_tick } = session;
+        let captured_sample_rate = recorder.sample_rate;
+        let samples = recorder.stop();
+        *recording_message = Some(finish_session_recording(
+            song,
+            track_index,
+            slot_index,
+            start_tick,
+            &samples,
+            captured_sample_rate,
+            engine_sample_rate,
+        ));
+        session_view_ui::send_launch_request(song, track_index, slot_index, LaunchIntent::Play);
+        return;
+    }
+    if session_recording.is_some() {
+        return;
+    }
+    let input_gain = song.tracks.get(track_index).map_or(1.0, |t| t.input_gain);
+    match audio_input::InputRecorder::start(selected_input_device, input_gain) {
+        Ok(recorder) => {
+            let other_slot_count =
+                song.tracks.get(track_index).map_or(0, |t| t.session_clips.len());
+            for other_slot_index in 0..other_slot_count {
+                if other_slot_index != slot_index {
+                    session_view_ui::send_launch_request(
+                        song,
+                        track_index,
+                        other_slot_index,
+                        LaunchIntent::Stop,
+                    );
+                }
+            }
+            *session_recording = Some(SessionRecordingSession {
+                track_index,
+                slot_index,
+                recorder,
+                start_tick: current_tick,
+            });
+            *recording_message = None;
+        }
+        Err(err) => *recording_message = Some((false, format!("{err:#}"))),
+    }
+}
+
 /// Writes a track's baked-down render (`audio::render_track_to_buffer`'s output) to a stereo WAV
 /// file, the freeze/bounce-in-place counterpart of `write_recording_wav` — same "own cache
 /// directory, timestamped filename" convention, kept separate (`frozen/` vs `recordings/`) since
@@ -6488,11 +6671,12 @@ impl eframe::App for SimpleDawApp {
                             ui.add_space(6.0);
                             let is_recording = self.recording.is_some();
                             let record_enabled = is_recording
-                                || self.record_armed_track.is_some_and(|i| {
-                                    song.tracks
-                                        .get(i)
-                                        .is_some_and(|t| t.kind == TrackKind::Audio)
-                                });
+                                || (self.session_recording.is_none()
+                                    && self.record_armed_track.is_some_and(|i| {
+                                        song.tracks
+                                            .get(i)
+                                            .is_some_and(|t| t.kind == TrackKind::Audio)
+                                    }));
                             let record_button =
                                 egui::Button::new(egui::RichText::new("⏺").size(18.0))
                                     .fill(if is_recording {
@@ -7992,6 +8176,13 @@ impl eframe::App for SimpleDawApp {
                     .fill(egui::Color32::from_rgb(30, 30, 30))
                     .inner_margin(egui::Margin::same(8))
             };
+            let mut session_record_click: Option<(usize, usize)> = None;
+            // Hides every slot's record button outright while a Playlist recording is already in
+            // progress — only one `InputRecorder` can run at a time, and this is simpler than a
+            // second "blocked" reason alongside `session_slot_cell_ui`'s existing sibling-slot one.
+            let record_armed_track = if self.recording.is_some() { None } else { self.record_armed_track };
+            let session_recording_slot =
+                self.session_recording.as_ref().map(|s| (s.track_index, s.slot_index));
             if self.session_view_detached {
                 let ctx = ui.ctx().clone();
                 let mut still_open = true;
@@ -8017,6 +8208,9 @@ impl eframe::App for SimpleDawApp {
                                     &mut self.selected_beats_track,
                                     &mut self.beats_region,
                                     &mut self.session_view_detached,
+                                    record_armed_track,
+                                    session_recording_slot,
+                                    &mut session_record_click,
                                 );
                             });
                         if ui.ctx().input(|i| i.viewport().close_requested()) {
@@ -8042,8 +8236,23 @@ impl eframe::App for SimpleDawApp {
                         &mut self.selected_beats_track,
                         &mut self.beats_region,
                         &mut self.session_view_detached,
+                        record_armed_track,
+                        session_recording_slot,
+                        &mut session_record_click,
                     );
                 });
+            }
+            if let Some((track_index, slot_index)) = session_record_click {
+                handle_session_record_click(
+                    song,
+                    track_index,
+                    slot_index,
+                    &mut self.session_recording,
+                    &mut self.recording_message,
+                    self.selected_input_device.as_deref(),
+                    self.sample_rate,
+                    self.transport.current_tick(),
+                );
             }
         }
     }
@@ -11597,7 +11806,9 @@ fn flex_editor_window_ui(
 /// slot_index)` into `Track::session_clips[slot_index]`'s `SessionClipContent::Audio` clip
 /// instead of a Playlist `Track::audio_clips` entry. Opened from that slot's right-click "Flex
 /// Time / Pitch…" context-menu entry (see `session_view_ui::session_slot_cell_ui`) — never shown
-/// for a `SessionClipContent::Region` slot, which has no `AudioClip` to edit.
+/// for a `SessionClipContent::Region`/`Recording` slot, neither of which has a plain `AudioClip`
+/// to edit (a `Recording`'s `TakeFolder` has no Flex editor of its own in v1 — see that variant's
+/// doc comment).
 #[allow(clippy::too_many_arguments)]
 fn session_flex_editor_window_ui(
     ctx: &egui::Context,
@@ -11623,7 +11834,7 @@ fn session_flex_editor_window_ui(
         .and_then(|slot| slot.as_ref())
         .and_then(|clip| match &clip.content {
             SessionClipContent::Audio(audio) => Some(audio.file_path.clone()),
-            SessionClipContent::Region { .. } => None,
+            SessionClipContent::Region { .. } | SessionClipContent::Recording(_) => None,
         })
     else {
         *editor_target = None;
@@ -13165,5 +13376,92 @@ mod tests {
         assert_eq!(folders.len(), 2);
         assert_eq!(folders[0].takes.len(), 1);
         assert_eq!(folders[1].takes.len(), 1);
+    }
+
+    #[test]
+    fn finish_session_recording_rejects_an_empty_capture() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Loop Vox", 5, TrackKind::Audio);
+        let (ok, message) = finish_session_recording(&mut song, track_index, 0, 0, &[], 48_000, Some(48_000));
+        assert!(!ok, "message: {message}");
+        assert!(song.tracks[track_index].session_clips.is_empty());
+    }
+
+    #[test]
+    fn finish_session_recording_creates_a_recording_clip_for_a_fresh_recording() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Loop Vox", 5, TrackKind::Audio);
+        let samples = vec![0.5f32; 48_000]; // 1 second at 48kHz
+        let (ok, _) = finish_session_recording(&mut song, track_index, 0, 0, &samples, 48_000, Some(48_000));
+        assert!(ok);
+
+        let clip = song.tracks[track_index].session_clips[0]
+            .as_ref()
+            .expect("slot should hold the new recording");
+        let SessionClipContent::Recording(folder) = &clip.content else {
+            panic!("expected Recording content");
+        };
+        assert_eq!(folder.takes.len(), 1);
+        assert_eq!(folder.comp.len(), 1);
+        assert_eq!(folder.comp[0].take_index, 0);
+        let bar_ticks = song.steps_per_bar() * TICKS_PER_STEP;
+        assert_eq!(folder.length_ticks % bar_ticks, 0, "loop length should be a whole number of bars");
+        assert!(folder.length_ticks > 0);
+    }
+
+    #[test]
+    fn finish_session_recording_rounds_a_short_recording_up_to_one_full_bar() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Loop Vox", 5, TrackKind::Audio);
+        let samples = vec![0.5f32; 4_800]; // 0.1s at 48kHz — much shorter than a bar at 120bpm
+        let (ok, _) = finish_session_recording(&mut song, track_index, 0, 0, &samples, 48_000, Some(48_000));
+        assert!(ok);
+        let clip = song.tracks[track_index].session_clips[0].as_ref().unwrap();
+        let SessionClipContent::Recording(folder) = &clip.content else {
+            panic!("expected Recording content");
+        };
+        let bar_ticks = song.steps_per_bar() * TICKS_PER_STEP;
+        assert_eq!(folder.length_ticks, bar_ticks);
+    }
+
+    #[test]
+    fn finish_session_recording_into_an_existing_recording_slot_joins_as_a_new_take() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Loop Vox", 5, TrackKind::Audio);
+        let samples = vec![0.5f32; 48_000];
+        finish_session_recording(&mut song, track_index, 0, 0, &samples, 48_000, Some(48_000));
+        finish_session_recording(&mut song, track_index, 0, 0, &samples, 48_000, Some(48_000));
+
+        let clip = song.tracks[track_index].session_clips[0].as_ref().unwrap();
+        let SessionClipContent::Recording(folder) = &clip.content else {
+            panic!("expected Recording content");
+        };
+        assert_eq!(folder.takes.len(), 2);
+        assert_eq!(folder.comp[0].take_index, 1, "the just-recorded take should be the one comped in");
+    }
+
+    #[test]
+    fn finish_session_recording_refuses_to_overwrite_a_slot_with_region_content() {
+        let mut song = Song::demo();
+        let track_index = song.add_track("Loop Vox", 5, TrackKind::Audio);
+        let region = Region {
+            name: "Existing".to_string(),
+            start_tick: 0,
+            content_length_steps: 4,
+            loop_length_steps: 4,
+            content: RegionContent::PianoRoll(Vec::new()),
+            fade_in_ticks: 0,
+            fade_out_ticks: 0,
+            automation: Vec::new(),
+        };
+        song.tracks[track_index].session_clips.push(Some(SessionClip::from_region(&region)));
+
+        let samples = vec![0.5f32; 48_000];
+        let (ok, message) = finish_session_recording(&mut song, track_index, 0, 0, &samples, 48_000, Some(48_000));
+        assert!(!ok, "message: {message}");
+        assert!(matches!(
+            song.tracks[track_index].session_clips[0].as_ref().unwrap().content,
+            SessionClipContent::Region { .. }
+        ));
     }
 }

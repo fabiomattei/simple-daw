@@ -59,7 +59,12 @@ fn session_quantize_label(quantize: SessionQuantize) -> &'static str {
 /// Draws the Session View panel: the Arrangement/Session play-mode switch, the quantize picker,
 /// and the clip-slot grid itself. `session_slots` is the audio thread's live queued/playing/
 /// stopped state (see `SessionSlotHandles`'s doc comment) — locked once per frame here, briefly,
-/// the same read pattern the Mixer's meters already use.
+/// the same read pattern the Mixer's meters already use. `record_armed_track`/`session_recording`
+/// mirror `main.rs`'s own `record_armed_track`/`session_recording` fields (the latter narrowed to
+/// just the `(track_index, slot_index)` it targets, since this module has no business with the
+/// live `InputRecorder` itself) — see `session_slot_cell_ui`'s doc comment for how those two drive
+/// each slot's record button, and `record_click`'s doc comment for how a click gets back to
+/// `main.rs`, which owns starting/stopping the actual capture.
 #[allow(clippy::too_many_arguments)]
 pub fn session_view_contents_ui(
     ui: &mut egui::Ui,
@@ -74,6 +79,9 @@ pub fn session_view_contents_ui(
     selected_beats_track: &mut Option<usize>,
     beats_target: &mut Option<RegionEditTarget>,
     detached: &mut bool,
+    record_armed_track: Option<usize>,
+    session_recording: Option<(usize, usize)>,
+    record_click: &mut Option<(usize, usize)>,
 ) {
     ui.horizontal(|ui| {
         let session_mode = transport.is_session_mode();
@@ -157,6 +165,9 @@ pub fn session_view_contents_ui(
                             piano_roll_target,
                             selected_beats_track,
                             beats_target,
+                            record_armed_track == Some(track_index),
+                            session_recording,
+                            record_click,
                         );
                     }
                     ui.end_row();
@@ -225,7 +236,16 @@ fn launch_scene(song: &mut Song, transport: &Transport, slot_index: usize) {
 }
 
 /// One clip slot's button: empty slots offer "Assign from Playlist" on right-click, filled slots
-/// show their name/state and launch/stop on left-click.
+/// show their name/state and launch/stop on left-click. `armed` is whether this slot's own track
+/// is the currently record-armed audio track (`main.rs`'s `record_armed_track`) — gates whether
+/// the record button renders at all. `session_recording` is `main.rs`'s own field of the same
+/// name: which `(track_index, slot_index)`, if any, is currently being captured into — `None`
+/// means no session recording is running anywhere, `Some` naming a *different* slot means this
+/// one's record button renders but disabled (only one `InputRecorder` — one input device — can run
+/// at a time). A click on the record button is only ever written to `record_click`, never acted on
+/// here — `main.rs` owns the actual `InputRecorder` lifecycle (this module has no business
+/// starting/stopping audio capture), so it reads `record_click` back after this whole grid is
+/// drawn and decides whether that's a start or a stop based on its own `session_recording` state.
 #[allow(clippy::too_many_arguments)]
 fn session_slot_cell_ui(
     ui: &mut egui::Ui,
@@ -239,7 +259,11 @@ fn session_slot_cell_ui(
     piano_roll_target: &mut Option<RegionEditTarget>,
     selected_beats_track: &mut Option<usize>,
     beats_target: &mut Option<RegionEditTarget>,
+    armed: bool,
+    session_recording: Option<(usize, usize)>,
+    record_click: &mut Option<(usize, usize)>,
 ) {
+    let recording = session_recording == Some((track_index, slot_index));
     let has_clip = song.tracks[track_index]
         .session_clips
         .get(slot_index)
@@ -267,8 +291,46 @@ fn session_slot_cell_ui(
         .map(|clip| clip.launch_mode)
         .unwrap_or_default();
 
-    let button = egui::Button::new(label).fill(fill).min_size(egui::vec2(96.0, 28.0));
-    let response = ui.add(button);
+    // Recording is only ever offered into an empty slot or one already holding a `Recording`
+    // (overdub/re-record) — never into a slot with `Region`/`Audio` content, which would silently
+    // overwrite it (see `main.rs`'s `finish_session_recording`, which assumes exactly this).
+    let can_record_here = song.tracks[track_index]
+        .session_clips
+        .get(slot_index)
+        .and_then(|slot| slot.as_ref())
+        .is_none_or(|clip| matches!(clip.content, SessionClipContent::Recording(_)));
+    let show_record_button = armed && can_record_here;
+
+    let mut response = None;
+    ui.horizontal(|ui| {
+        if show_record_button {
+            let enabled = recording || session_recording.is_none();
+            let record_button = egui::Button::new(egui::RichText::new("⏺").size(12.0))
+                .fill(if recording {
+                    crate::FL_ACCENT_ORANGE
+                } else {
+                    ui.visuals().widgets.inactive.bg_fill
+                })
+                .min_size(egui::vec2(20.0, 28.0));
+            if ui
+                .add_enabled(enabled, record_button)
+                .on_hover_text(if recording {
+                    "Stop recording into this slot"
+                } else if enabled {
+                    "Record into this slot"
+                } else {
+                    "Another slot is already recording"
+                })
+                .clicked()
+            {
+                *record_click = Some((track_index, slot_index));
+            }
+        }
+        let button_width = if show_record_button { 74.0 } else { 96.0 };
+        let button = egui::Button::new(label).fill(fill).min_size(egui::vec2(button_width, 28.0));
+        response = Some(ui.add(button));
+    });
+    let response = response.expect("ui.horizontal always runs its closure");
 
     if has_clip {
         match launch_mode {
@@ -316,6 +378,17 @@ fn session_slot_cell_ui(
             if is_audio_clip && ui.button("Flex Time / Pitch…").clicked() {
                 *flex_editor = Some((track_index, slot_index));
                 ui.close();
+            }
+            let take_count = song.tracks[track_index].session_clips[slot_index]
+                .as_ref()
+                .and_then(|clip| match &clip.content {
+                    SessionClipContent::Recording(folder) => Some(folder.takes.len()),
+                    _ => None,
+                });
+            if let Some(take_count) = take_count.filter(|count| *count > 1) {
+                ui.menu_button("Takes ▸", |ui| {
+                    takes_menu_ui(ui, song, track_index, slot_index, take_count);
+                });
             }
             let is_piano_roll_region = song.tracks[track_index].kind == TrackKind::PianoRoll
                 && song.tracks[track_index].session_clips[slot_index].as_ref().is_some_and(|clip| {
@@ -489,8 +562,11 @@ fn assign_clip(song: &mut Song, track_index: usize, slot_index: usize, clip: Ses
 
 /// Bumps `track.session_launch_requests[slot_index]`'s generation with `intent` — the click
 /// handler's whole job (see `model::SessionLaunchRequest`'s doc comment on why this is an
-/// edge-triggered counter rather than a direct state write).
-fn send_launch_request(song: &mut Song, track_index: usize, slot_index: usize, intent: LaunchIntent) {
+/// edge-triggered counter rather than a direct state write). `pub(crate)` so `main.rs`'s session
+/// recording start/stop can reuse it too: stopping any other slot on the armed track when a
+/// recording starts (exclusivity, same rule as any other launch) and auto-launching the just-
+/// finished recording once it stops, rather than duplicating this edge-triggered-counter logic.
+pub(crate) fn send_launch_request(song: &mut Song, track_index: usize, slot_index: usize, intent: LaunchIntent) {
     let requests = &mut song.tracks[track_index].session_launch_requests;
     if requests.len() <= slot_index {
         requests.resize(slot_index + 1, SessionLaunchRequest::default());
@@ -508,6 +584,29 @@ fn set_held(song: &mut Song, track_index: usize, slot_index: usize, held: bool) 
         requests.resize(slot_index + 1, SessionLaunchRequest::default());
     }
     requests[slot_index].held = held;
+}
+
+/// Contents of a `Recording`-content slot's "Takes ▸" context-menu entry — a whole-take picker,
+/// the same shape as the Playlist take-folder's own right-click take picker (`main.rs`'s
+/// `handle_take_folder_interaction`), just reached from a session slot's `TakeFolder` instead of
+/// `Track::take_folders`. No segment-level comp editor here (see `SessionClipContent::Recording`'s
+/// doc comment) — picking a take always re-comps the whole slot to it, via `TakeFolder::
+/// set_active_take`.
+fn takes_menu_ui(ui: &mut egui::Ui, song: &mut Song, track_index: usize, slot_index: usize, take_count: usize) {
+    let Some(Some(clip)) = song.tracks[track_index].session_clips.get_mut(slot_index) else { return };
+    let SessionClipContent::Recording(folder) = &mut clip.content else { return };
+    let active_take_index = folder.comp.first().map_or(0, |segment| segment.take_index);
+    for take_index in 0..take_count {
+        let label = if take_index == active_take_index {
+            format!("\u{2713} Take {}", take_index + 1)
+        } else {
+            format!("Take {}", take_index + 1)
+        };
+        if ui.button(label).clicked() {
+            folder.set_active_take(take_index);
+            ui.close();
+        }
+    }
 }
 
 /// Contents of a slot's "Launch Mode ▸" context-menu entry — see `model::LaunchMode`.
