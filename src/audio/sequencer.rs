@@ -29,15 +29,6 @@ const MIN_NOTE_GATE_SECONDS: f32 = 0.01;
 /// enough to be inaudible as a fade, long enough to smooth a hard amplitude discontinuity.
 const TAKE_FOLDER_CROSSFADE_SECONDS: f32 = 0.005;
 
-
-/// Owns each track's voice pools and the shared tick clock. `process` synthesizes one buffer's
-/// worth of mono samples *per track* (dry, unclipped — no gain/soft-clip applied here), triggering
-/// notes as tick boundaries are crossed (see `model::TICKS_PER_STEP` — step-grid lanes trigger
-/// every `TICKS_PER_STEP`-th tick, piano-roll notes trigger on their exact tick). Callers are
-/// responsible for summing tracks (optionally through per-track effects) into a master bus and
-/// applying `MASTER_GAIN`/soft-clipping — see `build_playback_stream` and `render_song_to_wav`.
-/// Shared between the real-time cpal callback and the offline WAV exporter so the two never drift
-/// apart into subtly different playback.
 /// Ticks-per-second at `bpm` — the conversion an `AudioClip`'s decoded real-time duration needs
 /// to become a tick span. Exposed (rather than kept private to `arrangement_length_ticks`) so the
 /// Playlist UI's audio-clip block width (`main.rs`) uses this exact same formula instead of a
@@ -123,6 +114,14 @@ pub fn new_capture_log_handle() -> CaptureLogHandle {
     Arc::new(Mutex::new((Vec::new(), 0)))
 }
 
+/// Owns each track's voice pools and the shared tick clock. `process` synthesizes one buffer's
+/// worth of mono samples *per track* (dry, unclipped — no gain/soft-clip applied here), triggering
+/// notes as tick boundaries are crossed (see `model::TICKS_PER_STEP` — step-grid lanes trigger
+/// every `TICKS_PER_STEP`-th tick, piano-roll notes trigger on their exact tick). Callers are
+/// responsible for summing tracks (optionally through per-track effects) into a master bus and
+/// applying `MASTER_GAIN`/soft-clipping — see `build_playback_stream` and `render_song_to_wav`.
+/// Shared between the real-time cpal callback and the offline WAV exporter so the two never drift
+/// apart into subtly different playback.
 pub(crate) struct Sequencer {
     sample_rate: f32,
     pub(crate) track_voices: Vec<TrackVoices>,
