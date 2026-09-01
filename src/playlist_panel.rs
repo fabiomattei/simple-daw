@@ -3,20 +3,22 @@
 //! `playlist_contents_ui` is the entry point (shared by the docked and detached-window
 //! renderings, see `SimpleDawApp::update`); `handle_playlist_interaction` is its drag/click/
 //! context-menu logic for Region blocks specifically (`handle_audio_clip_interaction`/
-//! `handle_take_folder_interaction`, not yet extracted, handle their own block kinds and are
-//! called from here). `draw_audio_clip_waveform` is pub(crate) since the Flex editor and Take
-//! Folder comp editor (also not yet extracted) reuse it for their own waveform drawing.
+//! `handle_take_folder_interaction`, in `audio_clip_interaction`, handle their own block kinds
+//! and are called from here). `draw_audio_clip_waveform` is pub(crate) since the Flex editor and
+//! Take Folder comp editor (also in `audio_clip_interaction`) reuse it for their own waveform
+//! drawing.
 
 use std::path::Path;
 
 use crate::audio;
+use crate::audio_clip_interaction::{AudioClipDrag, handle_audio_clip_interaction, handle_take_folder_interaction};
 use crate::model::{AudioClip, Region, Song, TICKS_PER_STEP, TrackKind};
 use crate::sample::SampleBuffer;
 use crate::transient_detection;
 use crate::{
-    AudioClipContextMenuTarget, AudioClipDrag, FL_ACCENT_GREEN, PLAYLIST_LANE_HEIGHT, RESIZE_HANDLE_PX,
-    RegionEditTarget, TakeFolderContextMenuTarget, audio_clip_length_ticks, draw_region_note_preview,
-    handle_audio_clip_interaction, handle_take_folder_interaction, tick_to_x, track_color, x_to_tick,
+    AudioClipContextMenuTarget, FL_ACCENT_GREEN, PLAYLIST_LANE_HEIGHT, RESIZE_HANDLE_PX, RegionEditTarget,
+    TakeFolderContextMenuTarget, audio_clip_length_ticks, draw_region_note_preview, tick_to_x, track_color,
+    x_to_tick,
 };
 
 /// Playlist timeline zoom range — same shape as `PIANO_ROLL_ZOOM_MIN`/`MAX`, a separate range
