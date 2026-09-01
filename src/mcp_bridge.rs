@@ -8,10 +8,8 @@ use crate::metering::MeterHandles;
 use crate::model::{self, RegionContent, Song, SynthEngine, TICKS_PER_STEP, Track, TrackEffectConfig, TrackKind, add_note};
 use crate::plugin_host::{DawHost, MasterEffectSlots, PluginGuiHandle, SendEffectSlots, SubmixEffectSlots, TrackEffectSlots};
 use crate::factory_presets::factory_presets;
-use crate::{
-    apply_loaded_effects, perform_load, perform_save, remove_track_effects, remove_track_meter,
-    resize_track_effects, resize_track_meters, sync_song_effects,
-};
+use crate::file_ops::{apply_loaded_effects, perform_load, perform_save, sync_song_effects};
+use crate::{remove_track_effects, remove_track_meter, resize_track_effects, resize_track_meters};
 use clack_host::prelude::PluginInstance;
 
 /// Bundles the pieces of `SimpleDawApp` an MCP command handler needs — mirrors `main.rs`'s
