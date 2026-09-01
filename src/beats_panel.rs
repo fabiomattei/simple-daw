@@ -11,12 +11,10 @@ use crate::model::{
     Lane, MAX_STEP_TIMING_OFFSET_TICKS, RegionContent, SessionClipContent, Song, StepData, TICKS_PER_STEP,
     TrackEffectConfig, TrackKind,
 };
+use crate::automation_panel::{AutomationDrag, automation_lanes_ui};
 use crate::device_panel::DeviceChainFocus;
 use crate::plugin_host::{MasterEffectSlots, SendEffectSlots, TrackEffectSlots};
-use crate::{
-    AutomationDrag, FL_ACCENT_ORANGE, RegionEditTarget, automation_lanes_ui, lane_sample_controls, note_name,
-    track_color,
-};
+use crate::{FL_ACCENT_ORANGE, RegionEditTarget, lane_sample_controls, note_name, track_color};
 
 /// Bundles the Beats window's shared groove/humanize controls — the same underlying
 /// `SimpleDawApp` fields the Piano Roll toolbar uses (see `PianoRollPanelUi`'s `groove_*`

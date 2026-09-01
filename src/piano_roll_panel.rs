@@ -13,10 +13,11 @@ use crate::model::{
     self, Note, Region, RegionContent, SessionClipContent, Song, TICKS_PER_STEP, TrackEffectConfig, TrackKind,
     add_note, clear_overlaps, find_note_mut, remove_note,
 };
+use crate::automation_panel::{AutomationDrag, automation_lanes_ui};
 use crate::plugin_host::{MasterEffectSlots, SendEffectSlots, TrackEffectSlots};
 use crate::{
-    AutomationDrag, FL_ACCENT_GREEN, FL_ACCENT_ORANGE, RESIZE_HANDLE_PX, RegionEditTarget, audio,
-    automation_lanes_ui, note_name, pitch_class_name, tick_to_x, track_color, x_to_tick,
+    FL_ACCENT_GREEN, FL_ACCENT_ORANGE, RESIZE_HANDLE_PX, RegionEditTarget, audio, note_name, pitch_class_name,
+    tick_to_x, track_color, x_to_tick,
 };
 
 /// Piano-roll pitch range: the full MIDI note range, since a melodic part can
