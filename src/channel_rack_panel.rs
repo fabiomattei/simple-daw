@@ -10,10 +10,10 @@ use crate::file_ops::browse_for_file;
 use crate::metering::MeterHandles;
 use crate::model::{AudioClip, Song, Track, TrackKind};
 use crate::plugin_host::{DawHost, PluginGuiHandle, TrackEffectSlots};
+use crate::device_panel::{DeviceChainFocus, EffectEditorTarget, FxChainKind, TrackFxUi, fx_chain_ui, pan_label};
 use crate::{
-    DeviceChainFocus, EffectEditorTarget, FL_ACCENT_ORANGE, FL_ACCENT_YELLOW, FxChainKind, TrackFreezeAction,
-    TrackFxUi, audio_clip_length_ticks, fx_chain_ui, pan_label, resize_track_effects, resize_track_meters,
-    track_color,
+    FL_ACCENT_ORANGE, FL_ACCENT_YELLOW, TrackFreezeAction, audio_clip_length_ticks, resize_track_effects,
+    resize_track_meters, track_color,
 };
 use clack_host::prelude::PluginInstance;
 

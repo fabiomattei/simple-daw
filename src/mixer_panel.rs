@@ -9,10 +9,10 @@ use crate::model::{SendBus, Song, SubmixBus, Track, TrackOutput};
 use crate::plugin_host::{
     DawHost, MasterEffectSlots, PluginGuiHandle, SendEffectSlots, SubmixEffectSlots, TrackEffectSlots,
 };
+use crate::device_panel::{DeviceChainFocus, EffectEditorTarget, FxChainKind, TrackFxUi, fx_chain_ui, pan_label};
 use crate::{
-    DeviceChainFocus, EffectEditorTarget, FL_ACCENT_GREEN, FL_ACCENT_ORANGE, FL_ACCENT_YELLOW, FxChainKind,
-    TrackFxUi, fx_chain_ui, pan_label, remove_track_effects, remove_track_meter, resize_track_effects,
-    resize_track_meters, track_color,
+    FL_ACCENT_GREEN, FL_ACCENT_ORANGE, FL_ACCENT_YELLOW, remove_track_effects, remove_track_meter,
+    resize_track_effects, resize_track_meters, track_color,
 };
 use clack_host::prelude::PluginInstance;
 

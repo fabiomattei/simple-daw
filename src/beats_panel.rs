@@ -11,10 +11,11 @@ use crate::model::{
     Lane, MAX_STEP_TIMING_OFFSET_TICKS, RegionContent, SessionClipContent, Song, StepData, TICKS_PER_STEP,
     TrackEffectConfig, TrackKind,
 };
+use crate::device_panel::DeviceChainFocus;
 use crate::plugin_host::{MasterEffectSlots, SendEffectSlots, TrackEffectSlots};
 use crate::{
-    AutomationDrag, DeviceChainFocus, FL_ACCENT_ORANGE, RegionEditTarget, automation_lanes_ui, lane_sample_controls,
-    note_name, track_color,
+    AutomationDrag, FL_ACCENT_ORANGE, RegionEditTarget, automation_lanes_ui, lane_sample_controls, note_name,
+    track_color,
 };
 
 /// Bundles the Beats window's shared groove/humanize controls — the same underlying
